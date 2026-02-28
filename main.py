@@ -5153,6 +5153,28 @@ async def создатьпредмет(ctx):
         "description": "", "require_roles": [], "give_roles": [], "remove_roles": [], "use_text": None,
     }
 
+    FIELD_LABELS = {
+        "key": "Ключ",
+        "price": "Цена",
+        "category": "Категория",
+        "stock": "Количество",
+        "ttl": "Время жизни",
+        "description": "Описание",
+        "require_roles": "Обязательные роли",
+        "give_roles": "Выдаёт роли",
+        "remove_roles": "Забирает роли",
+        "use_text": "Текст использования",
+    }
+
+    def categories_text():
+        lines = []
+        for cid, cname in sorted(items_data.get("categories", {}).items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 99999):
+            emoji = items_data.get("category_emojis", {}).get(str(cid), "")
+            marker = " ✅" if str(cid) == str(draft["category"]) else ""
+            emoji_part = f"{emoji} " if emoji else ""
+            lines.append(f"`{cid}` — {emoji_part}{cname}{marker}")
+        return "\n".join(lines) if lines else "—"
+
     def format_roles(role_ids):
         if not role_ids:
             return "—"
@@ -5166,10 +5188,11 @@ async def создатьпредмет(ctx):
         e = Embed(title="📝 Создание предмета", color=0x3498DB)
         ttl_text = "∞" if draft["expires_at"] is None else format_seconds_left(int(draft["expires_at"]) - int(time.time()))
         stock_text = "∞" if int(draft["stock"]) == -1 else str(draft["stock"])
-        cat_name = items_data.get("categories", {}).get(str(draft["category"]), str(draft["category"]))
+        cat_id = str(draft["category"])
+        cat_name = items_data.get("categories", {}).get(cat_id, cat_id)
         e.add_field(name="Ключ", value=draft["key"] or "—", inline=True)
         e.add_field(name="Цена", value=(fmt_money(draft["price"]) if draft["price"] else "—"), inline=True)
-        e.add_field(name="Категория", value=cat_name, inline=True)
+        e.add_field(name="Категория", value=f"№{cat_id} — {cat_name}", inline=True)
         e.add_field(name="Количество", value=stock_text, inline=True)
         e.add_field(name="Время жизни", value=ttl_text, inline=True)
         e.add_field(name="Описание", value=draft["description"] or "—", inline=False)
@@ -5177,101 +5200,154 @@ async def создатьпредмет(ctx):
         e.add_field(name="Выдаёт роли", value=format_roles(draft["give_roles"]), inline=False)
         e.add_field(name="Забирает роли", value=format_roles(draft["remove_roles"]), inline=False)
         e.add_field(name="Текст использования", value=draft["use_text"] or "✅", inline=False)
+        categories_value = categories_text()
+        if len(categories_value) > 1024:
+            categories_value = categories_value[:1021] + "..."
+        e.add_field(name="Категории (номер — название)", value=categories_value, inline=False)
+        e.set_footer(text="Выберите пункт из меню ниже, чтобы открыть форму редактирования")
         return e
 
-    class BaseModal(Modal):
-        def __init__(self):
-            super().__init__(title="Основные параметры", timeout=600)
-            self.key = TextInput(label="Ключ предмета", required=True, max_length=120, default=draft["key"])
-            self.price = TextInput(label="Цена", required=True, default=(str(draft["price"]) if draft["price"] else ""))
-            self.category = TextInput(label="Категория (номер)", required=True, default=str(draft["category"]))
-            self.stock = TextInput(label="Количество (или скип)", required=True, default=("скип" if int(draft["stock"]) == -1 else str(draft["stock"])))
-            ttl_default = "скип" if draft["expires_at"] is None else str(max(0, int(draft["expires_at"]) - int(time.time())))
-            self.ttl = TextInput(label="Время жизни в сек (или скип)", required=True, default=ttl_default)
-            for it in (self.key, self.price, self.category, self.stock, self.ttl):
-                self.add_item(it)
+    class EditFieldModal(Modal):
+        def __init__(self, field_name: str):
+            super().__init__(title=f"Редактирование: {FIELD_LABELS[field_name]}", timeout=600)
+            self.field_name = field_name
+
+            defaults = {
+                "key": draft["key"],
+                "price": str(draft["price"]) if draft["price"] else "",
+                "category": str(draft["category"]),
+                "stock": "скип" if int(draft["stock"]) == -1 else str(draft["stock"]),
+                "ttl": "скип" if draft["expires_at"] is None else str(max(0, int(draft["expires_at"]) - int(time.time()))),
+                "description": draft["description"],
+                "require_roles": " ".join(f"<@&{x}>" for x in draft["require_roles"]),
+                "give_roles": " ".join(f"<@&{x}>" for x in draft["give_roles"]),
+                "remove_roles": " ".join(f"<@&{x}>" for x in draft["remove_roles"]),
+                "use_text": draft["use_text"] or "скип",
+            }
+
+            labels = {
+                "key": "Ключ предмета",
+                "price": "Цена",
+                "category": "Категория (номер)",
+                "stock": "Количество (или скип)",
+                "ttl": "Время жизни в сек (или скип)",
+                "description": "Описание",
+                "require_roles": "Обязательные роли (или скип)",
+                "give_roles": "Выдаёт роли (или скип)",
+                "remove_roles": "Забирает роли (или скип)",
+                "use_text": "Текст использования (или скип)",
+            }
+
+            styles = {
+                "description": discord.TextStyle.paragraph,
+                "use_text": discord.TextStyle.paragraph,
+            }
+
+            self.value_input = TextInput(
+                label=labels[field_name],
+                required=True,
+                default=defaults[field_name][:1000] if isinstance(defaults[field_name], str) else str(defaults[field_name]),
+                style=styles.get(field_name, discord.TextStyle.short),
+                max_length=1000,
+            )
+            self.add_item(self.value_input)
 
         async def on_submit(self, interaction: Interaction):
+            raw = str(self.value_input.value).strip()
             try:
-                draft["key"] = str(self.key.value).strip()
-                draft["price"] = int(str(self.price.value).strip())
-                cat = str(self.category.value).strip()
-                if cat not in items_data.get("categories", {}):
-                    raise ValueError("Категория не существует")
-                draft["category"] = cat
-                raw_stock = str(self.stock.value).strip().lower()
-                draft["stock"] = -1 if raw_stock == "скип" else int(raw_stock)
-                raw_ttl = str(self.ttl.value).strip().lower()
-                draft["expires_at"] = None if raw_ttl == "скип" else int(time.time()) + int(raw_ttl)
+                if self.field_name == "key":
+                    draft["key"] = raw
+                elif self.field_name == "price":
+                    draft["price"] = int(raw)
+                elif self.field_name == "category":
+                    if raw not in items_data.get("categories", {}):
+                        raise ValueError("Категория не существует")
+                    draft["category"] = raw
+                elif self.field_name == "stock":
+                    draft["stock"] = -1 if raw.lower() == "скип" else int(raw)
+                elif self.field_name == "ttl":
+                    draft["expires_at"] = None if raw.lower() == "скип" else int(time.time()) + int(raw)
+                elif self.field_name == "description":
+                    draft["description"] = raw
+                elif self.field_name == "require_roles":
+                    draft["require_roles"] = parse_role_mentions(raw or "скип")
+                elif self.field_name == "give_roles":
+                    draft["give_roles"] = parse_role_mentions(raw or "скип")
+                elif self.field_name == "remove_roles":
+                    draft["remove_roles"] = parse_role_mentions(raw or "скип")
+                elif self.field_name == "use_text":
+                    draft["use_text"] = None if raw.lower() == "скип" else (raw or None)
             except Exception as e:
                 await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
                 return
             await interaction.response.edit_message(embed=build_embed(), view=view)
 
-    class ExtraModal(Modal):
+    class EditSelect(Select):
         def __init__(self):
-            super().__init__(title="Описание и роли", timeout=600)
-            self.description = TextInput(label="Описание", required=True, style=discord.TextStyle.paragraph, default=draft["description"][:1000])
-            self.roles = TextInput(label="Роли (req|give|remove) через ;", required=False, default=f"{' '.join(f'<@&{x}>' for x in draft['require_roles'])};{' '.join(f'<@&{x}>' for x in draft['give_roles'])};{' '.join(f'<@&{x}>' for x in draft['remove_roles'])}")
-            self.use_text = TextInput(label="Текст использования (или скип)", required=False, default=(draft["use_text"] or "скип"))
-            self.add_item(self.description)
-            self.add_item(self.roles)
-            self.add_item(self.use_text)
+            options = [
+                SelectOption(label="Ключ", value="key", emoji="🏷️"),
+                SelectOption(label="Цена", value="price", emoji="💵"),
+                SelectOption(label="Категория", value="category", emoji="🧩"),
+                SelectOption(label="Количество", value="stock", emoji="📦"),
+                SelectOption(label="Время жизни", value="ttl", emoji="⏱️"),
+                SelectOption(label="Описание", value="description", emoji="📝"),
+                SelectOption(label="Обязательные роли", value="require_roles", emoji="🔒"),
+                SelectOption(label="Выдаёт роли", value="give_roles", emoji="✅"),
+                SelectOption(label="Забирает роли", value="remove_roles", emoji="❌"),
+                SelectOption(label="Текст использования", value="use_text", emoji="💬"),
+                SelectOption(label="Сохранить предмет", value="save", emoji="💾"),
+                SelectOption(label="Отмена", value="cancel", emoji="🛑"),
+            ]
+            super().__init__(placeholder="Выберите пункт для редактирования", min_values=1, max_values=1, options=options)
 
-        async def on_submit(self, interaction: Interaction):
-            draft["description"] = str(self.description.value).strip()
-            raw = str(self.roles.value or "").strip()
-            parts = [p.strip() for p in raw.split(";")]
-            while len(parts) < 3:
-                parts.append("")
-            draft["require_roles"] = parse_role_mentions(parts[0] or "скип")
-            draft["give_roles"] = parse_role_mentions(parts[1] or "скип")
-            draft["remove_roles"] = parse_role_mentions(parts[2] or "скип")
-            txt = str(self.use_text.value or "").strip()
-            draft["use_text"] = None if txt.lower() == "скип" else (txt or None)
-            await interaction.response.edit_message(embed=build_embed(), view=view)
+        async def callback(self, interaction: Interaction):
+            selected = self.values[0]
+            if selected == "save":
+                key = draft["key"].strip()
+                if not key or int(draft["price"]) <= 0:
+                    await interaction.response.send_message("❌ Заполните ключ и цену (>0).", ephemeral=True)
+                    return
+                if key in items_data.get("items", {}):
+                    await interaction.response.send_message("❌ Предмет с таким ключом уже существует.", ephemeral=True)
+                    return
+                items_data.setdefault("items", {})[key] = {
+                    "key": key,
+                    "price": int(draft["price"]),
+                    "description": draft["description"],
+                    "category": str(draft["category"]),
+                    "stock": int(draft["stock"]),
+                    "expires_at": draft["expires_at"],
+                    "require_roles": draft["require_roles"],
+                    "give_roles": draft["give_roles"],
+                    "remove_roles": draft["remove_roles"],
+                    "use_text": draft["use_text"],
+                    "created_at": int(time.time()),
+                }
+                save_items()
+                await interaction.response.edit_message(
+                    embed=Embed(title="✅ Предмет создан", description=f"Предмет **{key}** успешно сохранён.", color=0x00FF00),
+                    view=None,
+                )
+                view.stop()
+                return
+
+            if selected == "cancel":
+                await interaction.response.edit_message(embed=Embed(title="❎ Создание отменено", color=0xAAAAAA), view=None)
+                view.stop()
+                return
+
+            await interaction.response.send_modal(EditFieldModal(selected))
 
     class CreateItemView(View):
         def __init__(self):
             super().__init__(timeout=900)
+            self.add_item(EditSelect())
 
         async def interaction_check(self, interaction: Interaction) -> bool:
             if interaction.user.id != ctx.author.id:
                 await interaction.response.send_message("❌ Только автор команды может настраивать.", ephemeral=True)
                 return False
             return True
-
-        @discord.ui.button(label="Основные данные", style=ButtonStyle.primary)
-        async def base(self, interaction: Interaction, button: Button):
-            await interaction.response.send_modal(BaseModal())
-
-        @discord.ui.button(label="Описание/роли", style=ButtonStyle.primary)
-        async def extra(self, interaction: Interaction, button: Button):
-            await interaction.response.send_modal(ExtraModal())
-
-        @discord.ui.button(label="✅ Сохранить", style=ButtonStyle.success)
-        async def save(self, interaction: Interaction, button: Button):
-            key = draft["key"].strip()
-            if not key or int(draft["price"]) <= 0:
-                await interaction.response.send_message("❌ Заполните ключ и цену (>0).", ephemeral=True)
-                return
-            if key in items_data.get("items", {}):
-                await interaction.response.send_message("❌ Предмет с таким ключом уже существует.", ephemeral=True)
-                return
-            items_data.setdefault("items", {})[key] = {
-                "key": key, "price": int(draft["price"]), "description": draft["description"], "category": str(draft["category"]),
-                "stock": int(draft["stock"]), "expires_at": draft["expires_at"], "require_roles": draft["require_roles"],
-                "give_roles": draft["give_roles"], "remove_roles": draft["remove_roles"], "use_text": draft["use_text"],
-                "created_at": int(time.time()),
-            }
-            save_items()
-            await interaction.response.edit_message(embed=Embed(title="✅ Предмет создан", description=f"Предмет **{key}** успешно сохранён.", color=0x00FF00), view=None)
-            self.stop()
-
-        @discord.ui.button(label="❌ Отмена", style=ButtonStyle.secondary)
-        async def cancel(self, interaction: Interaction, button: Button):
-            await interaction.response.edit_message(embed=Embed(title="❎ Создание отменено", color=0xAAAAAA), view=None)
-            self.stop()
 
     view = CreateItemView()
     await ctx.send(embed=build_embed(), view=view)
