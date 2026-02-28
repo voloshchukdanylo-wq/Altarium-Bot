@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import time
 import asyncio
 from threading import Thread
@@ -37,6 +38,10 @@ INVESTMENTS_FILE = os.path.join(DATA_DIR, "investments.json")
 MODERATION_FILE = os.path.join(DATA_DIR, "moderation.json")
 RATINGS_FILE = os.path.join(DATA_DIR, "ratings.json")
 WIPE_BACKUP_TTL = 3600
+
+AUTOMOD_MIN_ACCOUNT_AGE_DAYS = 30
+AUTOMOD_LINK_WINDOW_SECONDS = 240
+AUTOMOD_LINK_MIN_CHANNELS = 2
 
 # ================== KEEP ALIVE ==================
 app = Flask(__name__)
@@ -158,6 +163,8 @@ ratings_data.setdefault("channel_id", None)
 ratings_data.setdefault("targets", [])
 ratings_data.setdefault("last_vote", {})
 ratings_data.setdefault("votes", {})
+persistent_views_registered = False
+automod_link_tracker = {}
 country_owners.setdefault("country_to_user", {})
 country_owners.setdefault("user_to_country", {})
 sphere_requests.setdefault("result_channel_id", None)
@@ -408,6 +415,7 @@ def ensure_player_state(user_id: str):
             "war_mode": False,
             "last_happiness_tick": int(time.time()),
             "last_mobilization_cost_tick": int(time.time()),
+            "posts_count": 0,
         },
     )
     state.setdefault("shield_until", 0)
@@ -418,6 +426,7 @@ def ensure_player_state(user_id: str):
     state.setdefault("war_mode", False)
     state.setdefault("last_happiness_tick", int(time.time()))
     state.setdefault("last_mobilization_cost_tick", int(time.time()))
+    state.setdefault("posts_count", 0)
     return state
 
 
@@ -629,6 +638,8 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     players.pop(user_id, None)
     passive_flows.setdefault("users", {}).pop(user_id, None)
     seasons_data.setdefault("user_progress", {}).pop(user_id, None)
+    state = ensure_player_state(user_id)
+    state["posts_count"] = 0
     player_state.setdefault("users", {}).pop(user_id, None)
     investments.setdefault("users", {}).pop(user_id, None)
     old_country = country_owners.setdefault("user_to_country", {}).pop(user_id, None)
@@ -786,8 +797,13 @@ async def check_custom_command_denies(ctx):
 
 @bot.event
 async def on_ready():
+    global persistent_views_registered
+
     print(f"Бот запущен как {bot.user}")
     ensure_investment_items()
+    if not persistent_views_registered:
+        bot.add_view(RatingsPanelView())
+        persistent_views_registered = True
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
     status_until = settings.get("status_until")
@@ -806,9 +822,48 @@ async def on_ready():
         auto_role_income_loop.start()
 
 
+def extract_message_urls(text: str) -> list[str]:
+    if not text:
+        return []
+    raw_links = re.findall(r"https?://[^\s<>()]+", text, flags=re.IGNORECASE)
+    cleaned = []
+    for url in raw_links:
+        normalized = url.strip().rstrip('.,!?;:)')
+        if normalized:
+            cleaned.append(normalized)
+    return list(dict.fromkeys(cleaned))
+
+
+def track_link_spam(user_id: int, channel_id: int, message_id: int, url: str, ts: int):
+    key = (int(user_id), str(url).lower())
+    events = automod_link_tracker.setdefault(key, [])
+    events.append({"channel_id": int(channel_id), "message_id": int(message_id), "ts": int(ts)})
+    min_ts = int(ts) - AUTOMOD_LINK_WINDOW_SECONDS
+    filtered = [ev for ev in events if int(ev.get("ts", 0)) >= min_ts]
+    automod_link_tracker[key] = filtered
+    channels = {int(ev.get("channel_id", 0)) for ev in filtered}
+    return filtered, channels
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id != ALLOWED_GUILD:
+        return
+
+    account_age_days = (discord.utils.utcnow() - member.created_at).days
+    if account_age_days < AUTOMOD_MIN_ACCOUNT_AGE_DAYS:
+        reason = f"Автокик: возраст аккаунта {account_age_days}д (< {AUTOMOD_MIN_ACCOUNT_AGE_DAYS}д)"
+        try:
+            await member.kick(reason=reason)
+        except Exception:
+            pass
+
+        log_embed = Embed(title="🚫 Автокик по возрасту аккаунта", color=0xE74C3C)
+        log_embed.add_field(name="Участник", value=f"{member} (`{member.id}`)", inline=False)
+        log_embed.add_field(name="Возраст аккаунта", value=f"{account_age_days} дн.", inline=True)
+        log_embed.add_field(name="Порог", value=f"{AUTOMOD_MIN_ACCOUNT_AGE_DAYS} дн.", inline=True)
+        log_embed.add_field(name="Причина", value=reason, inline=False)
+        await send_mod_log(member.guild, log_embed)
         return
 
     channel_id = settings.get("invite_channel")
@@ -869,6 +924,53 @@ async def on_message(message: discord.Message):
         return
 
     if message.guild.id == ALLOWED_GUILD:
+        st = ensure_player_state(str(message.author.id))
+        st["posts_count"] = int(st.get("posts_count", 0)) + 1
+
+        urls = extract_message_urls(message.content or "")
+        now_ts = int(time.time())
+        if urls:
+            for url in urls:
+                events, channels = track_link_spam(message.author.id, message.channel.id, message.id, url, now_ts)
+                if len(channels) >= AUTOMOD_LINK_MIN_CHANNELS:
+                    # удалить все зафиксированные сообщения с этой ссылкой в окне
+                    deleted = 0
+                    for ev in events:
+                        ch = message.guild.get_channel(int(ev.get("channel_id", 0)))
+                        if not ch:
+                            continue
+                        try:
+                            msg_obj = await ch.fetch_message(int(ev.get("message_id", 0)))
+                        except Exception:
+                            continue
+                        try:
+                            await msg_obj.delete()
+                            deleted += 1
+                        except Exception:
+                            pass
+
+                    reason = f"Автобан за ссылочный спам: {url}"
+                    source_jump = message.jump_url
+                    try:
+                        await message.author.ban(reason=reason, delete_message_days=0)
+                    except Exception:
+                        pass
+
+                    log_embed = Embed(title="⛔ Автобан за ссылочный спам", color=0xFF0000)
+                    log_embed.add_field(name="Нарушитель", value=f"{message.author} (`{message.author.id}`)", inline=False)
+                    log_embed.add_field(name="Ссылка", value=url[:1024], inline=False)
+                    log_embed.add_field(name="Каналов за окно", value=str(len(channels)), inline=True)
+                    log_embed.add_field(name="Удалено сообщений", value=str(deleted), inline=True)
+                    source_text = (message.content or "(без текста)")[:1000]
+                    log_embed.add_field(name="Источник", value=source_jump, inline=False)
+                    log_embed.add_field(name="Исходное сообщение", value=source_text, inline=False)
+                    log_embed.add_field(name="Причина", value=reason, inline=False)
+                    await send_mod_log(message.guild, log_embed)
+
+                    automod_link_tracker.pop((int(message.author.id), str(url).lower()), None)
+                    save_player_state()
+                    return
+
         news_channel_id = settings.get("news_channel")
         if news_channel_id and message.channel.id == int(news_channel_id):
             if len((message.content or "").strip()) < 150:
@@ -890,9 +992,9 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
             else:
-                st = ensure_player_state(str(message.author.id))
                 st["news_published"] = int(st.get("news_published", 0)) + 1
-                save_player_state()
+
+        save_player_state()
 
     await bot.process_commands(message)
 
@@ -3080,6 +3182,10 @@ class RatingModal(Modal):
 
     async def on_submit(self, interaction: Interaction):
         target = interaction.guild.get_member(int(self.target_id)) if interaction.guild else None
+        if target and interaction.user.id == target.id:
+            await interaction.response.send_message("❌ Нельзя ставить оценку самому себе.", ephemeral=True)
+            return
+
         if not target:
             await interaction.response.send_message("❌ Администратор не найден.", ephemeral=True)
             return
@@ -3145,7 +3251,7 @@ class RatingsPanelView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Оценить администратора", style=ButtonStyle.primary)
+    @discord.ui.button(label="Оценить администратора", style=ButtonStyle.primary, custom_id="ratings:open")
     async def open(self, interaction: Interaction, button: Button):
         view = View(timeout=120)
         view.add_item(RatingSelect(interaction.guild))
@@ -3436,21 +3542,84 @@ async def регроли(ctx):
 
 @bot.command(name="вайпроли")
 @commands.has_permissions(administrator=True)
-async def вайпроли(ctx, *, roles_csv: str):
-    role_ids = []
-    for token in roles_csv.split(","):
-        raw = token.strip()
-        if not raw:
-            continue
-        try:
-            role = await commands.RoleConverter().convert(ctx, raw)
-            role_ids.append(str(role.id))
-        except Exception:
-            continue
-    reg_settings["wipe_roles"] = list(dict.fromkeys(role_ids))
-    save_reg_settings()
-    mentions = [ctx.guild.get_role(int(rid)).mention for rid in reg_settings["wipe_roles"] if ctx.guild.get_role(int(rid))]
-    await ctx.send(embed=Embed(title="✅ Вайп-роли обновлены", description=(", ".join(mentions) if mentions else "Список пуст."), color=0x00FF00))
+async def вайпроли(ctx, *, roles_csv: str = None):
+    async def parse_roles(raw_csv: str):
+        role_ids = []
+        for token in raw_csv.split(","):
+            raw = token.strip()
+            if not raw:
+                continue
+            try:
+                role = await commands.RoleConverter().convert(ctx, raw)
+                role_ids.append(str(role.id))
+            except Exception:
+                continue
+        return list(dict.fromkeys(role_ids))
+
+    def current_mentions():
+        return [ctx.guild.get_role(int(rid)).mention for rid in reg_settings.get("wipe_roles", []) if str(rid).isdigit() and ctx.guild.get_role(int(rid))]
+
+    # Совместимость со старым форматом: !вайпроли <роли>
+    if roles_csv is not None:
+        reg_settings["wipe_roles"] = await parse_roles(roles_csv)
+        save_reg_settings()
+        mentions = current_mentions()
+        await ctx.send(embed=Embed(title="✅ Вайп-роли обновлены", description=(", ".join(mentions) if mentions else "Список пуст."), color=0x00FF00))
+        return
+
+    class WipeRolesView(View):
+        def __init__(self, author_id: int):
+            super().__init__(timeout=180)
+            self.author_id = author_id
+
+        async def interaction_check(self, interaction: Interaction) -> bool:
+            if interaction.user.id != self.author_id:
+                await interaction.response.send_message("❌ Только автор команды может менять настройки.", ephemeral=True)
+                return False
+            return True
+
+        @discord.ui.button(label="Обновить вайп-роли", style=ButtonStyle.danger)
+        async def set_roles(self, interaction: Interaction, button: Button):
+            await interaction.response.send_message(
+                embed=Embed(title="📝 Ввод ролей", description="Укажите роли через запятую (упоминания).", color=0x3498DB),
+                ephemeral=True,
+            )
+
+            def check(m):
+                return m.author.id == self.author_id and m.channel.id == interaction.channel_id
+
+            try:
+                msg = await bot.wait_for("message", check=check, timeout=180)
+            except Exception:
+                await interaction.followup.send("⏰ Время ожидания истекло.", ephemeral=True)
+                return
+
+            reg_settings["wipe_roles"] = await parse_roles(msg.content)
+            save_reg_settings()
+            mentions = current_mentions()
+            await interaction.followup.send(
+                embed=Embed(title="✅ Вайп-роли обновлены", description=(", ".join(mentions) if mentions else "Список пуст."), color=0x00FF00),
+                ephemeral=True,
+            )
+
+        @discord.ui.button(label="Очистить", style=ButtonStyle.secondary)
+        async def clear_roles(self, interaction: Interaction, button: Button):
+            reg_settings["wipe_roles"] = []
+            save_reg_settings()
+            await interaction.response.send_message(
+                embed=Embed(title="✅ Вайп-роли очищены", description="Список пуст.", color=0x00FF00),
+                ephemeral=True,
+            )
+
+    mentions = current_mentions()
+    await ctx.send(
+        embed=Embed(
+            title="⚙️ Настройка !вайпроли",
+            description=f"**Снимать при вайпе:** {', '.join(mentions) if mentions else '—'}",
+            color=0x3498DB,
+        ),
+        view=WipeRolesView(ctx.author.id),
+    )
 
 
 @bot.command(name="счастьестоп")
@@ -4386,11 +4555,30 @@ async def доходсписок(ctx):
     await ctx.send(embed=Embed(title="💰 Роли дохода", description="\n".join(lines) or "Нет ролей.", color=0x3498DB))
 
 
+class TopModeSelect(Select):
+    def __init__(self, owner: "TopView"):
+        self.owner = owner
+        options = [
+            SelectOption(label="Топ по экономике", value="economy", emoji="💰"),
+            SelectOption(label="Топ по населению", value="population", emoji="👥"),
+            SelectOption(label="Топ по армии", value="army", emoji="🪖"),
+            SelectOption(label="Топ по постам", value="posts", emoji="📰"),
+        ]
+        super().__init__(placeholder="Выберите тип топа", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: Interaction):
+        self.owner.mode = self.values[0]
+        self.owner.page = 0
+        await self.owner.refresh(interaction)
+
+
 class TopView(View):
     def __init__(self):
         super().__init__(timeout=180)
         self.mode = "economy"
         self.page = 0
+        self.mode_select = TopModeSelect(self)
+        self.add_item(self.mode_select)
 
     def _dataset(self):
         if self.mode == "population":
@@ -4399,6 +4587,9 @@ class TopView(View):
         if self.mode == "army":
             users = player_state.get("users", {})
             return sorted(((uid, int((users.get(uid) or {}).get("soldiers", 0))) for uid in users.keys()), key=lambda x: x[1], reverse=True), "🪖 Топ по армии"
+        if self.mode == "posts":
+            users = player_state.get("users", {})
+            return sorted(((uid, int((users.get(uid) or {}).get("posts_count", 0))) for uid in users.keys()), key=lambda x: x[1], reverse=True), "📰 Топ по постам"
         data = []
         for uid, user in balances.items():
             if uid == "валюта" or not isinstance(user, dict):
@@ -4421,31 +4612,31 @@ class TopView(View):
             desc += f"{idx}. <@{uid}> — {fmt_num(val)} {suffix}\n".rstrip() + "\n"
         em = Embed(title=title, description=desc, color=0x3498DB)
         em.set_footer(text=f"Страница {self.page + 1}/{len(pages)}")
+
+        mode_map = {
+            "economy": "Топ по экономике",
+            "population": "Топ по населению",
+            "army": "Топ по армии",
+            "posts": "Топ по постам",
+        }
+        current = mode_map.get(self.mode, "")
+        for option in self.mode_select.options:
+            option.default = option.label == current
+
         return em
 
-    async def _refresh(self, interaction: Interaction):
-        self.switch_mode.label = {
-            "economy": "Топ по населению",
-            "population": "Топ по армии",
-            "army": "Топ по экономике",
-        }[self.mode]
+    async def refresh(self, interaction: Interaction):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="⬅️", style=discord.ButtonStyle.gray)
     async def back(self, interaction: Interaction, button: Button):
         self.page -= 1
-        await self._refresh(interaction)
+        await self.refresh(interaction)
 
     @discord.ui.button(label="➡️", style=discord.ButtonStyle.gray)
     async def forward(self, interaction: Interaction, button: Button):
         self.page += 1
-        await self._refresh(interaction)
-
-    @discord.ui.button(label="Топ по населению", style=discord.ButtonStyle.blurple)
-    async def switch_mode(self, interaction: Interaction, button: Button):
-        self.page = 0
-        self.mode = {"economy": "population", "population": "army", "army": "economy"}[self.mode]
-        await self._refresh(interaction)
+        await self.refresh(interaction)
 
 
 @bot.command()
@@ -5153,6 +5344,28 @@ async def создатьпредмет(ctx):
         "description": "", "require_roles": [], "give_roles": [], "remove_roles": [], "use_text": None,
     }
 
+    FIELD_LABELS = {
+        "key": "Ключ",
+        "price": "Цена",
+        "category": "Категория",
+        "stock": "Количество",
+        "ttl": "Время жизни",
+        "description": "Описание",
+        "require_roles": "Обязательные роли",
+        "give_roles": "Выдаёт роли",
+        "remove_roles": "Забирает роли",
+        "use_text": "Текст использования",
+    }
+
+    def categories_text():
+        lines = []
+        for cid, cname in sorted(items_data.get("categories", {}).items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 99999):
+            emoji = items_data.get("category_emojis", {}).get(str(cid), "")
+            marker = " ✅" if str(cid) == str(draft["category"]) else ""
+            emoji_part = f"{emoji} " if emoji else ""
+            lines.append(f"`{cid}` — {emoji_part}{cname}{marker}")
+        return "\n".join(lines) if lines else "—"
+
     def format_roles(role_ids):
         if not role_ids:
             return "—"
@@ -5166,10 +5379,11 @@ async def создатьпредмет(ctx):
         e = Embed(title="📝 Создание предмета", color=0x3498DB)
         ttl_text = "∞" if draft["expires_at"] is None else format_seconds_left(int(draft["expires_at"]) - int(time.time()))
         stock_text = "∞" if int(draft["stock"]) == -1 else str(draft["stock"])
-        cat_name = items_data.get("categories", {}).get(str(draft["category"]), str(draft["category"]))
+        cat_id = str(draft["category"])
+        cat_name = items_data.get("categories", {}).get(cat_id, cat_id)
         e.add_field(name="Ключ", value=draft["key"] or "—", inline=True)
         e.add_field(name="Цена", value=(fmt_money(draft["price"]) if draft["price"] else "—"), inline=True)
-        e.add_field(name="Категория", value=cat_name, inline=True)
+        e.add_field(name="Категория", value=f"№{cat_id} — {cat_name}", inline=True)
         e.add_field(name="Количество", value=stock_text, inline=True)
         e.add_field(name="Время жизни", value=ttl_text, inline=True)
         e.add_field(name="Описание", value=draft["description"] or "—", inline=False)
@@ -5177,101 +5391,154 @@ async def создатьпредмет(ctx):
         e.add_field(name="Выдаёт роли", value=format_roles(draft["give_roles"]), inline=False)
         e.add_field(name="Забирает роли", value=format_roles(draft["remove_roles"]), inline=False)
         e.add_field(name="Текст использования", value=draft["use_text"] or "✅", inline=False)
+        categories_value = categories_text()
+        if len(categories_value) > 1024:
+            categories_value = categories_value[:1021] + "..."
+        e.add_field(name="Категории (номер — название)", value=categories_value, inline=False)
+        e.set_footer(text="Выберите пункт из меню ниже, чтобы открыть форму редактирования")
         return e
 
-    class BaseModal(Modal):
-        def __init__(self):
-            super().__init__(title="Основные параметры", timeout=600)
-            self.key = TextInput(label="Ключ предмета", required=True, max_length=120, default=draft["key"])
-            self.price = TextInput(label="Цена", required=True, default=(str(draft["price"]) if draft["price"] else ""))
-            self.category = TextInput(label="Категория (номер)", required=True, default=str(draft["category"]))
-            self.stock = TextInput(label="Количество (или скип)", required=True, default=("скип" if int(draft["stock"]) == -1 else str(draft["stock"])))
-            ttl_default = "скип" if draft["expires_at"] is None else str(max(0, int(draft["expires_at"]) - int(time.time())))
-            self.ttl = TextInput(label="Время жизни в сек (или скип)", required=True, default=ttl_default)
-            for it in (self.key, self.price, self.category, self.stock, self.ttl):
-                self.add_item(it)
+    class EditFieldModal(Modal):
+        def __init__(self, field_name: str):
+            super().__init__(title=f"Редактирование: {FIELD_LABELS[field_name]}", timeout=600)
+            self.field_name = field_name
+
+            defaults = {
+                "key": draft["key"],
+                "price": str(draft["price"]) if draft["price"] else "",
+                "category": str(draft["category"]),
+                "stock": "скип" if int(draft["stock"]) == -1 else str(draft["stock"]),
+                "ttl": "скип" if draft["expires_at"] is None else str(max(0, int(draft["expires_at"]) - int(time.time()))),
+                "description": draft["description"],
+                "require_roles": " ".join(f"<@&{x}>" for x in draft["require_roles"]),
+                "give_roles": " ".join(f"<@&{x}>" for x in draft["give_roles"]),
+                "remove_roles": " ".join(f"<@&{x}>" for x in draft["remove_roles"]),
+                "use_text": draft["use_text"] or "скип",
+            }
+
+            labels = {
+                "key": "Ключ предмета",
+                "price": "Цена",
+                "category": "Категория (номер)",
+                "stock": "Количество (или скип)",
+                "ttl": "Время жизни в сек (или скип)",
+                "description": "Описание",
+                "require_roles": "Обязательные роли (или скип)",
+                "give_roles": "Выдаёт роли (или скип)",
+                "remove_roles": "Забирает роли (или скип)",
+                "use_text": "Текст использования (или скип)",
+            }
+
+            styles = {
+                "description": discord.TextStyle.paragraph,
+                "use_text": discord.TextStyle.paragraph,
+            }
+
+            self.value_input = TextInput(
+                label=labels[field_name],
+                required=True,
+                default=defaults[field_name][:1000] if isinstance(defaults[field_name], str) else str(defaults[field_name]),
+                style=styles.get(field_name, discord.TextStyle.short),
+                max_length=1000,
+            )
+            self.add_item(self.value_input)
 
         async def on_submit(self, interaction: Interaction):
+            raw = str(self.value_input.value).strip()
             try:
-                draft["key"] = str(self.key.value).strip()
-                draft["price"] = int(str(self.price.value).strip())
-                cat = str(self.category.value).strip()
-                if cat not in items_data.get("categories", {}):
-                    raise ValueError("Категория не существует")
-                draft["category"] = cat
-                raw_stock = str(self.stock.value).strip().lower()
-                draft["stock"] = -1 if raw_stock == "скип" else int(raw_stock)
-                raw_ttl = str(self.ttl.value).strip().lower()
-                draft["expires_at"] = None if raw_ttl == "скип" else int(time.time()) + int(raw_ttl)
+                if self.field_name == "key":
+                    draft["key"] = raw
+                elif self.field_name == "price":
+                    draft["price"] = int(raw)
+                elif self.field_name == "category":
+                    if raw not in items_data.get("categories", {}):
+                        raise ValueError("Категория не существует")
+                    draft["category"] = raw
+                elif self.field_name == "stock":
+                    draft["stock"] = -1 if raw.lower() == "скип" else int(raw)
+                elif self.field_name == "ttl":
+                    draft["expires_at"] = None if raw.lower() == "скип" else int(time.time()) + int(raw)
+                elif self.field_name == "description":
+                    draft["description"] = raw
+                elif self.field_name == "require_roles":
+                    draft["require_roles"] = parse_role_mentions(raw or "скип")
+                elif self.field_name == "give_roles":
+                    draft["give_roles"] = parse_role_mentions(raw or "скип")
+                elif self.field_name == "remove_roles":
+                    draft["remove_roles"] = parse_role_mentions(raw or "скип")
+                elif self.field_name == "use_text":
+                    draft["use_text"] = None if raw.lower() == "скип" else (raw or None)
             except Exception as e:
                 await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
                 return
             await interaction.response.edit_message(embed=build_embed(), view=view)
 
-    class ExtraModal(Modal):
+    class EditSelect(Select):
         def __init__(self):
-            super().__init__(title="Описание и роли", timeout=600)
-            self.description = TextInput(label="Описание", required=True, style=discord.TextStyle.paragraph, default=draft["description"][:1000])
-            self.roles = TextInput(label="Роли (req|give|remove) через ;", required=False, default=f"{' '.join(f'<@&{x}>' for x in draft['require_roles'])};{' '.join(f'<@&{x}>' for x in draft['give_roles'])};{' '.join(f'<@&{x}>' for x in draft['remove_roles'])}")
-            self.use_text = TextInput(label="Текст использования (или скип)", required=False, default=(draft["use_text"] or "скип"))
-            self.add_item(self.description)
-            self.add_item(self.roles)
-            self.add_item(self.use_text)
+            options = [
+                SelectOption(label="Ключ", value="key", emoji="🏷️"),
+                SelectOption(label="Цена", value="price", emoji="💵"),
+                SelectOption(label="Категория", value="category", emoji="🧩"),
+                SelectOption(label="Количество", value="stock", emoji="📦"),
+                SelectOption(label="Время жизни", value="ttl", emoji="⏱️"),
+                SelectOption(label="Описание", value="description", emoji="📝"),
+                SelectOption(label="Обязательные роли", value="require_roles", emoji="🔒"),
+                SelectOption(label="Выдаёт роли", value="give_roles", emoji="✅"),
+                SelectOption(label="Забирает роли", value="remove_roles", emoji="❌"),
+                SelectOption(label="Текст использования", value="use_text", emoji="💬"),
+                SelectOption(label="Сохранить предмет", value="save", emoji="💾"),
+                SelectOption(label="Отмена", value="cancel", emoji="🛑"),
+            ]
+            super().__init__(placeholder="Выберите пункт для редактирования", min_values=1, max_values=1, options=options)
 
-        async def on_submit(self, interaction: Interaction):
-            draft["description"] = str(self.description.value).strip()
-            raw = str(self.roles.value or "").strip()
-            parts = [p.strip() for p in raw.split(";")]
-            while len(parts) < 3:
-                parts.append("")
-            draft["require_roles"] = parse_role_mentions(parts[0] or "скип")
-            draft["give_roles"] = parse_role_mentions(parts[1] or "скип")
-            draft["remove_roles"] = parse_role_mentions(parts[2] or "скип")
-            txt = str(self.use_text.value or "").strip()
-            draft["use_text"] = None if txt.lower() == "скип" else (txt or None)
-            await interaction.response.edit_message(embed=build_embed(), view=view)
+        async def callback(self, interaction: Interaction):
+            selected = self.values[0]
+            if selected == "save":
+                key = draft["key"].strip()
+                if not key or int(draft["price"]) <= 0:
+                    await interaction.response.send_message("❌ Заполните ключ и цену (>0).", ephemeral=True)
+                    return
+                if key in items_data.get("items", {}):
+                    await interaction.response.send_message("❌ Предмет с таким ключом уже существует.", ephemeral=True)
+                    return
+                items_data.setdefault("items", {})[key] = {
+                    "key": key,
+                    "price": int(draft["price"]),
+                    "description": draft["description"],
+                    "category": str(draft["category"]),
+                    "stock": int(draft["stock"]),
+                    "expires_at": draft["expires_at"],
+                    "require_roles": draft["require_roles"],
+                    "give_roles": draft["give_roles"],
+                    "remove_roles": draft["remove_roles"],
+                    "use_text": draft["use_text"],
+                    "created_at": int(time.time()),
+                }
+                save_items()
+                await interaction.response.edit_message(
+                    embed=Embed(title="✅ Предмет создан", description=f"Предмет **{key}** успешно сохранён.", color=0x00FF00),
+                    view=None,
+                )
+                view.stop()
+                return
+
+            if selected == "cancel":
+                await interaction.response.edit_message(embed=Embed(title="❎ Создание отменено", color=0xAAAAAA), view=None)
+                view.stop()
+                return
+
+            await interaction.response.send_modal(EditFieldModal(selected))
 
     class CreateItemView(View):
         def __init__(self):
             super().__init__(timeout=900)
+            self.add_item(EditSelect())
 
         async def interaction_check(self, interaction: Interaction) -> bool:
             if interaction.user.id != ctx.author.id:
                 await interaction.response.send_message("❌ Только автор команды может настраивать.", ephemeral=True)
                 return False
             return True
-
-        @discord.ui.button(label="Основные данные", style=ButtonStyle.primary)
-        async def base(self, interaction: Interaction, button: Button):
-            await interaction.response.send_modal(BaseModal())
-
-        @discord.ui.button(label="Описание/роли", style=ButtonStyle.primary)
-        async def extra(self, interaction: Interaction, button: Button):
-            await interaction.response.send_modal(ExtraModal())
-
-        @discord.ui.button(label="✅ Сохранить", style=ButtonStyle.success)
-        async def save(self, interaction: Interaction, button: Button):
-            key = draft["key"].strip()
-            if not key or int(draft["price"]) <= 0:
-                await interaction.response.send_message("❌ Заполните ключ и цену (>0).", ephemeral=True)
-                return
-            if key in items_data.get("items", {}):
-                await interaction.response.send_message("❌ Предмет с таким ключом уже существует.", ephemeral=True)
-                return
-            items_data.setdefault("items", {})[key] = {
-                "key": key, "price": int(draft["price"]), "description": draft["description"], "category": str(draft["category"]),
-                "stock": int(draft["stock"]), "expires_at": draft["expires_at"], "require_roles": draft["require_roles"],
-                "give_roles": draft["give_roles"], "remove_roles": draft["remove_roles"], "use_text": draft["use_text"],
-                "created_at": int(time.time()),
-            }
-            save_items()
-            await interaction.response.edit_message(embed=Embed(title="✅ Предмет создан", description=f"Предмет **{key}** успешно сохранён.", color=0x00FF00), view=None)
-            self.stop()
-
-        @discord.ui.button(label="❌ Отмена", style=ButtonStyle.secondary)
-        async def cancel(self, interaction: Interaction, button: Button):
-            await interaction.response.edit_message(embed=Embed(title="❎ Создание отменено", color=0xAAAAAA), view=None)
-            self.stop()
 
     view = CreateItemView()
     await ctx.send(embed=build_embed(), view=view)
@@ -6074,7 +6341,7 @@ async def wipe_all(ctx):
                 except Exception:
                     pass
 
-            await interaction.response.edit_message(embed=Embed(title="💥 ГЛОБАЛЬНЫЙ ВАЙП ВЫПОЛНЕН", description="Обнулены балансы, инвентари, население, пассивные операции и прогресс сфер.", color=0x00FF00), view=None)
+            await interaction.response.edit_message(embed=Embed(title="💥 ГЛОБАЛЬНЫЙ ВАЙП ВЫПОЛНЕН", description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер и счётчик постов.", color=0x00FF00), view=None)
             self.stop()
 
         @discord.ui.button(label="❌ Отмена", style=ButtonStyle.secondary)
@@ -6188,6 +6455,8 @@ async def wipe_player(ctx, member: discord.Member):
             players.pop(user_id, None)
             passive_flows.setdefault("users", {}).pop(user_id, None)
             seasons_data.setdefault("user_progress", {}).pop(user_id, None)
+            state = ensure_player_state(user_id)
+            state["posts_count"] = 0
             player_state.setdefault("users", {}).pop(user_id, None)
             investments.setdefault("users", {}).pop(user_id, None)
             old_country = country_owners.setdefault("user_to_country", {}).pop(user_id, None)
