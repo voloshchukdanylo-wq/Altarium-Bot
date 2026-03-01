@@ -109,6 +109,7 @@ settings = load_json(
         "sell_role_id": None,
         "economy_log_channel": None,
         "news_channel": None,
+        "message_log_channel": None,
         "coin_currency": "Alta-коин",
         "status_text": None,
         "status_emoji": None,
@@ -150,6 +151,7 @@ settings.setdefault("transfer_role_id", None)
 settings.setdefault("sell_role_id", None)
 settings.setdefault("economy_log_channel", None)
 settings.setdefault("news_channel", None)
+settings.setdefault("message_log_channel", None)
 settings.setdefault("coin_currency", "Alta-коин")
 settings.setdefault("status_text", None)
 settings.setdefault("status_emoji", None)
@@ -918,6 +920,74 @@ async def on_member_remove(member: discord.Member):
         pass
 
 
+async def send_message_log_embed(guild: discord.Guild, embed: Embed):
+    channel_id = settings.get("message_log_channel")
+    if not channel_id:
+        return
+    channel = guild.get_channel(int(channel_id)) if guild else None
+    if channel:
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            pass
+
+
+async def resolve_message_deleter(guild: discord.Guild, message: discord.Message):
+    if not guild or not guild.me.guild_permissions.view_audit_log:
+        return None
+    try:
+        async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.message_delete):
+            if not entry.target or int(entry.target.id) != int(message.author.id):
+                continue
+
+            extra_channel = getattr(entry.extra, "channel", None)
+            extra_channel_id = extra_channel.id if extra_channel else getattr(entry.extra, "channel_id", None)
+            if extra_channel_id is None or int(extra_channel_id) != int(message.channel.id):
+                continue
+
+            if abs((discord.utils.utcnow() - entry.created_at).total_seconds()) > 15:
+                continue
+            return entry.user
+    except Exception:
+        return None
+    return None
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    if message.guild.id != ALLOWED_GUILD:
+        return
+
+    deleted_by = await resolve_message_deleter(message.guild, message)
+    embed = Embed(title="🗑️ Удалено сообщение", color=0xE67E22)
+    embed.add_field(name="Автор", value=f"{message.author.mention} (`{message.author.id}`)", inline=False)
+    embed.add_field(name="Канал", value=message.channel.mention, inline=True)
+    embed.add_field(name="Удалил", value=(deleted_by.mention if deleted_by else "Не удалось определить"), inline=True)
+    content = (message.content or "(без текста)")[:1000]
+    embed.add_field(name="Содержимое", value=content, inline=False)
+    await send_message_log_embed(message.guild, embed)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if not before.guild or before.author.bot:
+        return
+    if before.guild.id != ALLOWED_GUILD:
+        return
+    if (before.content or "") == (after.content or ""):
+        return
+
+    embed = Embed(title="✏️ Изменено сообщение", color=0x3498DB)
+    embed.add_field(name="Автор", value=f"{before.author.mention} (`{before.author.id}`)", inline=False)
+    embed.add_field(name="Канал", value=before.channel.mention, inline=True)
+    embed.add_field(name="Ссылка", value=f"[Перейти к сообщению]({after.jump_url})", inline=True)
+    embed.add_field(name="Было", value=((before.content or "(без текста)")[:1000]), inline=False)
+    embed.add_field(name="Стало", value=((after.content or "(без текста)")[:1000]), inline=False)
+    await send_message_log_embed(before.guild, embed)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -1116,6 +1186,7 @@ async def on_command_error(ctx, error):
             "редактироватьпредмет": "!редактироватьпредмет Панцер цена",
             "предметинфо": "!предметинфо Панцер",
             "логэко": "!логэко #канал",
+            "логсооканал": "!логсооканал #канал",
         }
         example = examples.get(ctx.command.qualified_name)
         details = f"**Синтаксис:**\n`{usage}`"
@@ -1163,7 +1234,7 @@ async def хелп(ctx):
         "Магазин / Инвентарь": {"категориядобавить", "категорияудалить", "создатьпредмет", "редактироватьпредмет", "предметинфо", "магазин", "купить", "пополнитьпредмет", "удалитьпредмет", "инвентарь", "использовать", "выдать", "изъять", "инвестировать", "продать", "продатьпредмет", "продатьроль"},
         "Сезоны / Сферы": {"создатьсезон", "списоксезонов", "установитьсезон", "удалитьсезон", "создатьсферу", "редактсферу", "удалитьсферу", "сферы", "заявкиканал", "результатзаявокканал", "принять", "отклонить"},
         "Тикеты / Переговоры": {"сеттикет", "тикетотправить", "тикетотправиить", "тикетроль", "тикетнероль", "тикетроли", "удалитьтикет", "тайнканал"},
-        "Модерация": {"мут", "размут", "бан", "разбан", "кик", "варн", "снятьварн", "варнпредел", "наказания", "модерлогканал", "рассылка"},
+        "Модерация": {"мут", "размут", "бан", "разбан", "кик", "варн", "снятьварн", "варнпредел", "наказания", "модерлогканал", "логсооканал", "рассылка"},
         "Регистрация / Страны": {"создатьстат", "удалитьстат", "статы", "рег", "регроли", "занятстраны", "свободстраны", "счастьевыдать", "счастьестоп", "мобилизировать", "распустить", "население", "солдаты"},
         "Пассивные операции": {"пасдоход", "пасрасход", "пасдоходубрать", "пасрасходубрать"},
         "Права": {"разрешить", "запретить", "разрешения"},
@@ -1485,6 +1556,14 @@ async def логэко(ctx, channel: discord.TextChannel):
             color=0x00FF00,
         )
     )
+
+
+@bot.command(name="логсооканал")
+@commands.has_permissions(administrator=True)
+async def логсооканал(ctx, channel: discord.TextChannel):
+    settings["message_log_channel"] = channel.id
+    save_json(SETTINGS_FILE, settings)
+    await ctx.send(embed=Embed(title="✅ Канал логов сообщений установлен", description=f"Канал логов сообщений: {channel.mention}", color=0x00FF00))
 
 
 @bot.command(name="новостиканал")
