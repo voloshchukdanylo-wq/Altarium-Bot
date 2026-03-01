@@ -925,7 +925,6 @@ async def on_message(message: discord.Message):
 
     if message.guild.id == ALLOWED_GUILD:
         st = ensure_player_state(str(message.author.id))
-        st["posts_count"] = int(st.get("posts_count", 0)) + 1
 
         urls = extract_message_urls(message.content or "")
         now_ts = int(time.time())
@@ -973,7 +972,8 @@ async def on_message(message: discord.Message):
 
         news_channel_id = settings.get("news_channel")
         if news_channel_id and message.channel.id == int(news_channel_id):
-            if len((message.content or "").strip()) < 150:
+            post_text = (message.content or "").strip()
+            if len(post_text) < 150:
                 original = message.content or ""
                 try:
                     await message.delete()
@@ -993,6 +993,7 @@ async def on_message(message: discord.Message):
                     pass
             else:
                 st["news_published"] = int(st.get("news_published", 0)) + 1
+                st["posts_count"] = int(st.get("posts_count", 0)) + 1
 
         save_player_state()
 
@@ -3192,10 +3193,6 @@ class RatingModal(Modal):
 
         now_ts = int(time.time())
         voter_id = str(interaction.user.id)
-        last_vote = int(ratings_data.setdefault("last_vote", {}).get(voter_id, 0))
-        if now_ts - last_vote < 4 * 3600:
-            await interaction.response.send_message(f"⏳ Повторная оценка доступна через {format_seconds_left(4*3600 - (now_ts - last_vote))}.", ephemeral=True)
-            return
 
         try:
             score = int(str(self.score_input.value).strip())
@@ -3205,20 +3202,27 @@ class RatingModal(Modal):
             await interaction.response.send_message("❌ Оценка должна быть числом от 1 до 10.", ephemeral=True)
             return
 
-        ratings_data.setdefault("last_vote", {})[voter_id] = now_ts
         target_votes = ratings_data.setdefault("votes", {}).setdefault(str(target.id), [])
-        target_votes.append({
+        existing_vote = next((v for v in target_votes if str(v.get("from")) == voter_id), None)
+        action_text = "обновлена" if existing_vote else "отправлена"
+
+        payload = {
             "from": voter_id,
             "score": score,
             "comment": str(self.comment_input.value),
             "role_text": str(self.role_input.value),
             "time": now_ts,
-        })
+        }
+        if existing_vote:
+            existing_vote.update(payload)
+        else:
+            target_votes.append(payload)
+
         save_ratings_data()
 
         channel = interaction.guild.get_channel(int(ratings_data.get("channel_id"))) if ratings_data.get("channel_id") else None
         if channel:
-            embed = Embed(title="📝 Новая оценка", color=0x3498DB)
+            embed = Embed(title=("✏️ Оценка обновлена" if existing_vote else "📝 Новая оценка"), color=0x3498DB)
             embed.add_field(name="Оценка от", value=interaction.user.mention, inline=False)
             embed.add_field(name="Назначение", value=str(self.role_input.value), inline=False)
             embed.add_field(name="Оценка", value=f"{score}/10", inline=True)
@@ -3228,7 +3232,7 @@ class RatingModal(Modal):
             except Exception:
                 pass
 
-        await interaction.response.send_message("✅ Оценка отправлена.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Оценка {action_text}.", ephemeral=True)
 
 
 class RatingSelect(Select):
@@ -4538,8 +4542,10 @@ async def доходсписок(ctx):
     for rid, data in roles_cfg.items():
         role = ctx.guild.get_role(int(rid))
         if role:
+            amount_view = fmt_num(int(data.get("amount", 0)))
+            cooldown_view = fmt_num(int(data.get("cooldown", 0)))
             lines.append(
-                f"{role.mention} — {data['amount']} ({currency} / %), кулдаун {data['cooldown']}с, авто: {data.get('auto', True)}"
+                f"{role.mention} — {amount_view} ({currency} / %), кулдаун {cooldown_view}с, авто: {data.get('auto', True)}"
             )
 
 
@@ -4549,8 +4555,10 @@ async def доходсписок(ctx):
         for rid, data in freeze_cfg.items():
             role = ctx.guild.get_role(int(rid))
             if role:
+                freeze_value = fmt_num(int(data.get("value", 0)))
+                freeze_cd = fmt_num(int(data.get("cooldown", 0)))
                 lines.append(
-                    f"{role.mention} — заморозка {data.get('value', 0)}, кулдаун {data.get('cooldown', 0)}с"
+                    f"{role.mention} — заморозка {freeze_value}, кулдаун {freeze_cd}с"
                 )
     await ctx.send(embed=Embed(title="💰 Роли дохода", description="\n".join(lines) or "Нет ролей.", color=0x3498DB))
 
@@ -4643,6 +4651,26 @@ class TopView(View):
 async def топ(ctx):
     view = TopView()
     await ctx.send(embed=view.build_embed(), view=view)
+
+
+@bot.command(name="постыочистить")
+@commands.has_permissions(administrator=True)
+async def постыочистить(ctx):
+    users = player_state.setdefault("users", {})
+    changed = 0
+    for st in users.values():
+        if int(st.get("posts_count", 0)) != 0:
+            changed += 1
+        st["posts_count"] = 0
+
+    save_player_state()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Счётчик постов очищен",
+            description=f"Обнулён счётчик постов у **{changed}** участников. Сообщения не удалялись.",
+            color=0x00FF00,
+        )
+    )
 
 
 @bot.command()
