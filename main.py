@@ -3396,76 +3396,201 @@ class VerdictTextModal(Modal):
         await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
 
 
-class VerdictSimpleOpModal(Modal):
-    def __init__(self, req_id: str, op_type: str):
+class VerdictMoneyModal(Modal):
+    def __init__(self, req_id: str, mode: str):
         self.req_id = str(req_id)
-        self.op_type = op_type
-        titles = {
-            "desc": "Изменить описание игрока",
-            "money_add": "Начислить деньги",
-            "money_sub": "Снять деньги",
-            "rep": "Изменить репутацию",
-            "happy": "Изменить счастье",
-            "passive_income": "Добавить пасдоход",
-            "passive_expense": "Добавить пасрасход",
-        }
-        super().__init__(title=titles.get(op_type, "Операция"), timeout=300)
-        self.member = TextInput(label="Игрок (ID или @mention)", required=True)
-        self.value = TextInput(label="Значение", required=True)
-        self.extra = TextInput(label="Описание/параметры", required=False, style=discord.TextStyle.paragraph)
-        self.add_item(self.member)
-        self.add_item(self.value)
-        self.add_item(self.extra)
+        self.mode = mode
+        title = "Начислить деньги" if mode == "add" else "Снять деньги с баланса"
+        super().__init__(title=title, timeout=300)
+        self.amount = TextInput(label="Сумма", required=True, placeholder="Например: 50000")
+        self.reason = TextInput(label="Описание операции", required=False, default="по вердикту")
+        self.add_item(self.amount)
+        self.add_item(self.reason)
 
     async def on_submit(self, interaction: Interaction):
         req = verdicts_data.get("requests", {}).get(self.req_id)
         if not req:
             await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
             return
-        member = parse_member_ref(interaction.guild, self.member.value)
-        if not member:
-            await interaction.response.send_message("❌ Игрок не найден (нужен ID или mention).", ephemeral=True)
-            return
 
-        draft = req.setdefault("draft", {})
-        ops = draft.setdefault("ops", [])
-        extra = str(self.extra.value or "").strip()
+        uid = str(req.get("author_id"))
+        member = interaction.guild.get_member(int(uid)) if interaction.guild and str(uid).isdigit() else None
+        mention = member.mention if member else f"<@{uid}>"
 
         try:
-            if self.op_type in ("money_add", "money_sub"):
-                amount = int(float(str(self.value.value).replace(",", ".")))
-                signed = amount if self.op_type == "money_add" else -amount
-                ops.append({"kind": "money", "member_id": str(member.id), "amount": signed, "label": f"{'Начислить' if signed>=0 else 'Снять'} {fmt_num(abs(signed))} {currency} для {member.mention}"})
-            elif self.op_type == "desc":
-                text = str(self.value.value).strip()
-                ops.append({"kind": "description", "member_id": str(member.id), "text": text, "label": f"Изменить описание {member.mention}"})
-            elif self.op_type == "rep":
-                rep = int(float(str(self.value.value).replace(",", ".")))
-                ops.append({"kind": "reputation", "member_id": str(member.id), "value": rep, "label": f"Репутация {member.mention} -> {rep}"})
-            elif self.op_type == "happy":
-                happy = int(float(str(self.value.value).replace(",", ".")))
-                ops.append({"kind": "happiness", "member_id": str(member.id), "value": max(0, min(100, happy)), "label": f"Счастье {member.mention} -> {max(0, min(100, happy))}%"})
-            elif self.op_type in ("passive_income", "passive_expense"):
-                amount = int(float(str(self.value.value).replace(",", ".")))
-                parts = [x.strip() for x in extra.split(";")] if extra else []
-                cooldown = parse_interval(parts[0]) if len(parts) > 0 and parts[0] else 86400
-                ttl = None if len(parts) < 2 or not parts[1] or parts[1].lower() == "скип" else int(time.time()) + parse_interval(parts[1])
-                desc = parts[2] if len(parts) > 2 and parts[2] else "по вердикту"
-                flow_type = "income" if self.op_type == "passive_income" else "expense"
-                ops.append({
-                    "kind": "passive",
-                    "member_id": str(member.id),
-                    "flow_type": flow_type,
-                    "amount": amount,
-                    "cooldown": cooldown,
-                    "expires_at": ttl,
-                    "description": desc,
-                    "label": f"Добавить пас{'доход' if flow_type=='income' else 'расход'} {fmt_num(amount)} для {member.mention}",
-                })
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+            amount = int(float(str(self.amount.value).replace(",", ".")))
+        except Exception:
+            await interaction.response.send_message("❌ Сумма должна быть числом.", ephemeral=True)
             return
 
+        signed = amount if self.mode == "add" else -amount
+        label_action = "Начислить" if signed >= 0 else "Снять"
+        desc = str(self.reason.value or "по вердикту").strip() or "по вердикту"
+
+        req.setdefault("draft", {}).setdefault("ops", []).append({
+            "kind": "money",
+            "member_id": uid,
+            "amount": signed,
+            "reason": desc,
+            "label": f"{label_action} {fmt_num(abs(signed))} {currency} для {mention} ({desc})",
+        })
+        save_verdicts_data()
+
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+
+
+class VerdictDescriptionModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = verdicts_data.get("requests", {}).get(self.req_id, {})
+        uid = str(req.get("author_id", ""))
+        current = ensure_player_state(uid).get("admin_description", "") if uid else ""
+        super().__init__(title="Изменить описание игрока", timeout=300)
+        self.text = TextInput(label="Новое описание", style=discord.TextStyle.paragraph, required=True, default=str(current)[:1000], max_length=1000)
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        uid = str(req.get("author_id"))
+        member = interaction.guild.get_member(int(uid)) if interaction.guild and str(uid).isdigit() else None
+        mention = member.mention if member else f"<@{uid}>"
+
+        text = str(self.text.value or "").strip()
+        req.setdefault("draft", {}).setdefault("ops", []).append({
+            "kind": "description",
+            "member_id": uid,
+            "text": text,
+            "label": f"Изменить описание {mention}",
+        })
+        save_verdicts_data()
+
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+
+
+class VerdictReputationModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = verdicts_data.get("requests", {}).get(self.req_id, {})
+        uid = str(req.get("author_id", ""))
+        current = int(ensure_player_state(uid).get("reputation", 0)) if uid else 0
+        super().__init__(title="Изменить репутацию", timeout=300)
+        self.value = TextInput(label="Новая репутация", required=True, default=str(current))
+        self.reason = TextInput(label="Комментарий", required=False, default="по вердикту")
+        self.add_item(self.value)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        uid = str(req.get("author_id"))
+        member = interaction.guild.get_member(int(uid)) if interaction.guild and str(uid).isdigit() else None
+        mention = member.mention if member else f"<@{uid}>"
+        try:
+            val = int(float(str(self.value.value).replace(",", ".")))
+        except Exception:
+            await interaction.response.send_message("❌ Репутация должна быть числом.", ephemeral=True)
+            return
+
+        req.setdefault("draft", {}).setdefault("ops", []).append({
+            "kind": "reputation",
+            "member_id": uid,
+            "value": val,
+            "label": f"Репутация {mention} -> {val}",
+        })
+        save_verdicts_data()
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+
+
+class VerdictHappinessModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = verdicts_data.get("requests", {}).get(self.req_id, {})
+        uid = str(req.get("author_id", ""))
+        current = int(ensure_player_state(uid).get("happiness", 50)) if uid else 50
+        super().__init__(title="Изменить уровень счастья", timeout=300)
+        self.value = TextInput(label="Новый уровень счастья (0-100)", required=True, default=str(current))
+        self.reason = TextInput(label="Комментарий", required=False, default="по вердикту")
+        self.add_item(self.value)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        uid = str(req.get("author_id"))
+        member = interaction.guild.get_member(int(uid)) if interaction.guild and str(uid).isdigit() else None
+        mention = member.mention if member else f"<@{uid}>"
+        try:
+            val = int(float(str(self.value.value).replace(",", ".")))
+        except Exception:
+            await interaction.response.send_message("❌ Счастье должно быть числом.", ephemeral=True)
+            return
+
+        val = max(0, min(100, val))
+        req.setdefault("draft", {}).setdefault("ops", []).append({
+            "kind": "happiness",
+            "member_id": uid,
+            "value": val,
+            "label": f"Счастье {mention} -> {val}%",
+        })
+        save_verdicts_data()
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+
+
+class VerdictPassiveModal(Modal):
+    def __init__(self, req_id: str, flow_type: str):
+        self.req_id = str(req_id)
+        self.flow_type = flow_type
+        title = "Добавить пасдоход" if flow_type == "income" else "Добавить пасрасход"
+        super().__init__(title=title, timeout=300)
+        self.amount = TextInput(label="Сумма операции", required=True, placeholder="Например: 5000")
+        self.cooldown = TextInput(label="Кулдаун (например: 24ч, 30м)", required=True, default="24ч")
+        self.description = TextInput(label="Описание", required=False, default="по вердикту")
+        self.ttl = TextInput(label="Срок действия (например: 7д или скип)", required=False, default="скип")
+        self.add_item(self.amount)
+        self.add_item(self.cooldown)
+        self.add_item(self.description)
+        self.add_item(self.ttl)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        uid = str(req.get("author_id"))
+        member = interaction.guild.get_member(int(uid)) if interaction.guild and str(uid).isdigit() else None
+        mention = member.mention if member else f"<@{uid}>"
+
+        try:
+            amount = int(float(str(self.amount.value).replace(",", ".")))
+            cooldown = parse_interval(str(self.cooldown.value).strip())
+            ttl_raw = str(self.ttl.value or "скип").strip().lower()
+            expires_at = None if ttl_raw in ("", "скип") else int(time.time()) + parse_interval(ttl_raw)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Ошибка параметров: {e}", ephemeral=True)
+            return
+
+        desc = str(self.description.value or "по вердикту").strip() or "по вердикту"
+        req.setdefault("draft", {}).setdefault("ops", []).append({
+            "kind": "passive",
+            "member_id": uid,
+            "flow_type": self.flow_type,
+            "amount": amount,
+            "cooldown": cooldown,
+            "expires_at": expires_at,
+            "description": desc,
+            "label": f"Добавить пас{'доход' if self.flow_type=='income' else 'расход'} {fmt_num(amount)} для {mention}",
+        })
         save_verdicts_data()
         pages = build_verdict_pages(req)
         await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
@@ -3544,7 +3669,27 @@ class VerdictReviewSelect(Select):
             await interaction.response.edit_message(embed=Embed(title="✅ Вердикт отправлен", description=f"Заявка #{self.req_id} завершена.", color=0x00FF00), view=None)
             return
 
-        await interaction.response.send_modal(VerdictSimpleOpModal(self.req_id, choice))
+        if choice == "desc":
+            await interaction.response.send_modal(VerdictDescriptionModal(self.req_id))
+            return
+        if choice == "money_add":
+            await interaction.response.send_modal(VerdictMoneyModal(self.req_id, "add"))
+            return
+        if choice == "money_sub":
+            await interaction.response.send_modal(VerdictMoneyModal(self.req_id, "sub"))
+            return
+        if choice == "rep":
+            await interaction.response.send_modal(VerdictReputationModal(self.req_id))
+            return
+        if choice == "happy":
+            await interaction.response.send_modal(VerdictHappinessModal(self.req_id))
+            return
+        if choice == "passive_income":
+            await interaction.response.send_modal(VerdictPassiveModal(self.req_id, "income"))
+            return
+        if choice == "passive_expense":
+            await interaction.response.send_modal(VerdictPassiveModal(self.req_id, "expense"))
+            return
 
 
 class VerdictReviewView(View):
