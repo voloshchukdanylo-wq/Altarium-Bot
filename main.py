@@ -37,6 +37,7 @@ PLAYER_STATE_FILE = os.path.join(DATA_DIR, "player_state.json")
 INVESTMENTS_FILE = os.path.join(DATA_DIR, "investments.json")
 MODERATION_FILE = os.path.join(DATA_DIR, "moderation.json")
 RATINGS_FILE = os.path.join(DATA_DIR, "ratings.json")
+VERDICTS_FILE = os.path.join(DATA_DIR, "verdicts.json")
 WIPE_BACKUP_TTL = 3600
 
 AUTOMOD_MIN_ACCOUNT_AGE_DAYS = 30
@@ -140,6 +141,7 @@ player_state = load_json(PLAYER_STATE_FILE, {"users": {}})
 investments = load_json(INVESTMENTS_FILE, {"users": {}})
 moderation_data = load_json(MODERATION_FILE, {"log_channel": None, "warns": {}, "warn_limit": {"count": 3, "action": "мут 1ч"}})
 ratings_data = load_json(RATINGS_FILE, {"channel_id": None, "targets": [], "last_vote": {}, "votes": {}})
+verdicts_data = load_json(VERDICTS_FILE, {"panel_channel": None, "requests_channel": None, "result_channel": None, "requests": {}, "next_id": 1})
 
 role_income.setdefault("freeze_roles", {})
 role_income.setdefault("freeze_last_claim", {})
@@ -165,6 +167,11 @@ ratings_data.setdefault("channel_id", None)
 ratings_data.setdefault("targets", [])
 ratings_data.setdefault("last_vote", {})
 ratings_data.setdefault("votes", {})
+verdicts_data.setdefault("panel_channel", None)
+verdicts_data.setdefault("requests_channel", None)
+verdicts_data.setdefault("result_channel", None)
+verdicts_data.setdefault("requests", {})
+verdicts_data.setdefault("next_id", 1)
 persistent_views_registered = False
 automod_link_tracker = {}
 country_owners.setdefault("country_to_user", {})
@@ -404,6 +411,10 @@ def save_ratings_data():
     save_json(RATINGS_FILE, ratings_data)
 
 
+def save_verdicts_data():
+    save_json(VERDICTS_FILE, verdicts_data)
+
+
 def ensure_player_state(user_id: str):
     users = player_state.setdefault("users", {})
     state = users.setdefault(
@@ -418,6 +429,7 @@ def ensure_player_state(user_id: str):
             "last_happiness_tick": int(time.time()),
             "last_mobilization_cost_tick": int(time.time()),
             "posts_count": 0,
+            "reputation": 0,
         },
     )
     state.setdefault("shield_until", 0)
@@ -429,6 +441,7 @@ def ensure_player_state(user_id: str):
     state.setdefault("last_happiness_tick", int(time.time()))
     state.setdefault("last_mobilization_cost_tick", int(time.time()))
     state.setdefault("posts_count", 0)
+    state.setdefault("reputation", 0)
     return state
 
 
@@ -805,6 +818,7 @@ async def on_ready():
     ensure_investment_items()
     if not persistent_views_registered:
         bot.add_view(RatingsPanelView())
+        bot.add_view(VerdictPanelView())
         persistent_views_registered = True
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
@@ -1187,6 +1201,9 @@ async def on_command_error(ctx, error):
             "предметинфо": "!предметинфо Панцер",
             "логэко": "!логэко #канал",
             "логсооканал": "!логсооканал #канал",
+            "вердиктканал": "!вердиктканал #канал",
+            "вердзаявкиканал": "!вердзаявкиканал #канал",
+            "итогвердиктканал": "!итогвердиктканал #канал",
         }
         example = examples.get(ctx.command.qualified_name)
         details = f"**Синтаксис:**\n`{usage}`"
@@ -1234,7 +1251,7 @@ async def хелп(ctx):
         "Магазин / Инвентарь": {"категориядобавить", "категорияудалить", "создатьпредмет", "редактироватьпредмет", "предметинфо", "магазин", "купить", "пополнитьпредмет", "удалитьпредмет", "инвентарь", "использовать", "выдать", "изъять", "инвестировать", "продать", "продатьпредмет", "продатьроль"},
         "Сезоны / Сферы": {"создатьсезон", "списоксезонов", "установитьсезон", "удалитьсезон", "создатьсферу", "редактсферу", "удалитьсферу", "сферы", "заявкиканал", "результатзаявокканал", "принять", "отклонить"},
         "Тикеты / Переговоры": {"сеттикет", "тикетотправить", "тикетотправиить", "тикетроль", "тикетнероль", "тикетроли", "удалитьтикет", "тайнканал"},
-        "Модерация": {"мут", "размут", "бан", "разбан", "кик", "варн", "снятьварн", "варнпредел", "наказания", "модерлогканал", "логсооканал", "рассылка"},
+        "Модерация": {"мут", "размут", "бан", "разбан", "кик", "варн", "снятьварн", "варнпредел", "наказания", "модерлогканал", "логсооканал", "вердиктканал", "вердзаявкиканал", "итогвердиктканал", "рассылка"},
         "Регистрация / Страны": {"создатьстат", "удалитьстат", "статы", "рег", "регроли", "занятстраны", "свободстраны", "счастьевыдать", "счастьестоп", "мобилизировать", "распустить", "население", "солдаты"},
         "Пассивные операции": {"пасдоход", "пасрасход", "пасдоходубрать", "пасрасходубрать"},
         "Права": {"разрешить", "запретить", "разрешения"},
@@ -3247,6 +3264,343 @@ async def тайнканал(ctx, channel: discord.TextChannel):
     )
     await channel.send(embed=embed, view=panel)
     await ctx.send(embed=Embed(title="✅ Готово", description=f"Панель переговоров отправлена в {channel.mention}", color=0x00FF00))
+
+
+
+def verdict_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("вердикты")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+def build_verdict_pages(req: dict) -> list[Embed]:
+    draft = req.get("draft", {})
+    ops = draft.get("ops", [])
+    lines = [
+        f"**Заявка:** #{req.get('id')}",
+        f"**Автор запроса:** <@{req.get('author_id')}>",
+        f"**Ссылка:** {req.get('message_link')}",
+        f"**Текст вердикта:**\n{draft.get('verdict_text') or '—'}",
+        "",
+        "**Операции:**",
+    ]
+    if ops:
+        for idx, op in enumerate(ops, start=1):
+            lines.append(f"{idx}. {op.get('label', 'операция')}")
+    else:
+        lines.append("—")
+
+    chunks = chunk_lines_for_embed(lines, limit=3900)
+    pages = []
+    for i, chunk in enumerate(chunks, start=1):
+        em = Embed(title="📋 Предпросмотр вердикта", description=chunk, color=0x3498DB)
+        em.set_footer(text=f"Страница {i}/{len(chunks)}")
+        pages.append(em)
+    return pages or [Embed(title="📋 Предпросмотр вердикта", description="Пусто", color=0x3498DB)]
+
+
+class VerdictPagesView(View):
+    def __init__(self, pages: list[Embed], user_id: int):
+        super().__init__(timeout=180)
+        self.pages = pages
+        self.user_id = user_id
+        self.index = 0
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Это меню не для вас.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⬅️", style=ButtonStyle.secondary)
+    async def back(self, interaction: Interaction, button: Button):
+        self.index = (self.index - 1) % len(self.pages)
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="➡️", style=ButtonStyle.secondary)
+    async def next(self, interaction: Interaction, button: Button):
+        self.index = (self.index + 1) % len(self.pages)
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+
+def parse_member_ref(guild: discord.Guild, raw: str):
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    value = value.replace("<@", "").replace("!", "").replace(">", "")
+    if value.isdigit():
+        return guild.get_member(int(value))
+    return None
+
+
+class VerdictRequestModal(Modal):
+    def __init__(self):
+        super().__init__(title="Запрос вердикта", timeout=300)
+        self.link_input = TextInput(label="Ссылка на сообщение", required=True, placeholder="https://discord.com/channels/...")
+        self.add_item(self.link_input)
+
+    async def on_submit(self, interaction: Interaction):
+        req_id = int(verdicts_data.get("next_id", 1))
+        verdicts_data["next_id"] = req_id + 1
+        verdicts_data.setdefault("requests", {})[str(req_id)] = {
+            "id": req_id,
+            "author_id": str(interaction.user.id),
+            "message_link": str(self.link_input.value).strip(),
+            "status": "pending",
+            "created_at": int(time.time()),
+            "draft": {"verdict_text": "", "ops": []},
+        }
+        save_verdicts_data()
+
+        req_channel_id = verdicts_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id and interaction.guild else None
+        if not req_channel:
+            await interaction.response.send_message("❌ Канал заявок вердиктов не настроен (`!вердзаявкиканал`).", ephemeral=True)
+            return
+
+        embed = Embed(title=f"📨 Заявка на вердикт #{req_id}", color=0x3498DB)
+        embed.add_field(name="От", value=interaction.user.mention, inline=False)
+        embed.add_field(name="Ссылка", value=str(self.link_input.value).strip(), inline=False)
+        content = verdict_ping_roles_line(interaction.guild) or None
+        msg = await req_channel.send(content=content, embed=embed, view=VerdictReviewView(str(req_id)))
+        verdicts_data["requests"][str(req_id)]["request_message_id"] = msg.id
+        verdicts_data["requests"][str(req_id)]["request_channel_id"] = req_channel.id
+        save_verdicts_data()
+
+        await interaction.response.send_message("✅ Заявка отправлена.", ephemeral=True)
+
+
+class VerdictTextModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = verdicts_data.get("requests", {}).get(self.req_id, {})
+        current = req.get("draft", {}).get("verdict_text", "")
+        super().__init__(title="Текст вердикта", timeout=300)
+        self.text = TextInput(label="Текст", style=discord.TextStyle.paragraph, required=True, default=current[:1000], max_length=1000)
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req.setdefault("draft", {}).setdefault("ops", [])
+        req["draft"]["verdict_text"] = str(self.text.value).strip()
+        save_verdicts_data()
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+
+
+class VerdictSimpleOpModal(Modal):
+    def __init__(self, req_id: str, op_type: str):
+        self.req_id = str(req_id)
+        self.op_type = op_type
+        titles = {
+            "desc": "Изменить описание игрока",
+            "money_add": "Начислить деньги",
+            "money_sub": "Снять деньги",
+            "rep": "Изменить репутацию",
+            "happy": "Изменить счастье",
+            "passive_income": "Добавить пасдоход",
+            "passive_expense": "Добавить пасрасход",
+        }
+        super().__init__(title=titles.get(op_type, "Операция"), timeout=300)
+        self.member = TextInput(label="Игрок (ID или @mention)", required=True)
+        self.value = TextInput(label="Значение", required=True)
+        self.extra = TextInput(label="Описание/параметры", required=False, style=discord.TextStyle.paragraph)
+        self.add_item(self.member)
+        self.add_item(self.value)
+        self.add_item(self.extra)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        member = parse_member_ref(interaction.guild, self.member.value)
+        if not member:
+            await interaction.response.send_message("❌ Игрок не найден (нужен ID или mention).", ephemeral=True)
+            return
+
+        draft = req.setdefault("draft", {})
+        ops = draft.setdefault("ops", [])
+        extra = str(self.extra.value or "").strip()
+
+        try:
+            if self.op_type in ("money_add", "money_sub"):
+                amount = int(float(str(self.value.value).replace(",", ".")))
+                signed = amount if self.op_type == "money_add" else -amount
+                ops.append({"kind": "money", "member_id": str(member.id), "amount": signed, "label": f"{'Начислить' if signed>=0 else 'Снять'} {fmt_num(abs(signed))} {currency} для {member.mention}"})
+            elif self.op_type == "desc":
+                text = str(self.value.value).strip()
+                ops.append({"kind": "description", "member_id": str(member.id), "text": text, "label": f"Изменить описание {member.mention}"})
+            elif self.op_type == "rep":
+                rep = int(float(str(self.value.value).replace(",", ".")))
+                ops.append({"kind": "reputation", "member_id": str(member.id), "value": rep, "label": f"Репутация {member.mention} -> {rep}"})
+            elif self.op_type == "happy":
+                happy = int(float(str(self.value.value).replace(",", ".")))
+                ops.append({"kind": "happiness", "member_id": str(member.id), "value": max(0, min(100, happy)), "label": f"Счастье {member.mention} -> {max(0, min(100, happy))}%"})
+            elif self.op_type in ("passive_income", "passive_expense"):
+                amount = int(float(str(self.value.value).replace(",", ".")))
+                parts = [x.strip() for x in extra.split(";")] if extra else []
+                cooldown = parse_interval(parts[0]) if len(parts) > 0 and parts[0] else 86400
+                ttl = None if len(parts) < 2 or not parts[1] or parts[1].lower() == "скип" else int(time.time()) + parse_interval(parts[1])
+                desc = parts[2] if len(parts) > 2 and parts[2] else "по вердикту"
+                flow_type = "income" if self.op_type == "passive_income" else "expense"
+                ops.append({
+                    "kind": "passive",
+                    "member_id": str(member.id),
+                    "flow_type": flow_type,
+                    "amount": amount,
+                    "cooldown": cooldown,
+                    "expires_at": ttl,
+                    "description": desc,
+                    "label": f"Добавить пас{'доход' if flow_type=='income' else 'расход'} {fmt_num(amount)} для {member.mention}",
+                })
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+            return
+
+        save_verdicts_data()
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+
+
+class VerdictReviewSelect(Select):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        options = [
+            SelectOption(label="Текст вердикта", value="text", emoji="📝"),
+            SelectOption(label="Отклонить вердикт", value="reject", emoji="❌"),
+            SelectOption(label="Изменить описание игрока", value="desc", emoji="🧾"),
+            SelectOption(label="Добавить пасрасход", value="passive_expense", emoji="📉"),
+            SelectOption(label="Добавить пасдоход", value="passive_income", emoji="📈"),
+            SelectOption(label="Снять деньги с баланса", value="money_sub", emoji="💸"),
+            SelectOption(label="Начислить деньги", value="money_add", emoji="💰"),
+            SelectOption(label="Изменить репутацию", value="rep", emoji="⭐"),
+            SelectOption(label="Изменить уровень счастья", value="happy", emoji="🙂"),
+            SelectOption(label="Предпросмотр", value="preview", emoji="👀"),
+            SelectOption(label="Отправить итог", value="finalize", emoji="✅"),
+        ]
+        super().__init__(placeholder="Выберите действие по вердикту", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        choice = self.values[0]
+        if choice == "text":
+            await interaction.response.send_modal(VerdictTextModal(self.req_id))
+            return
+        if choice == "reject":
+            req["status"] = "rejected"
+            save_verdicts_data()
+            await interaction.response.edit_message(embed=Embed(title="❌ Вердикт отклонён", description=f"Заявка #{self.req_id} отклонена.", color=0xAA0000), view=None)
+            return
+        if choice == "preview":
+            pages = build_verdict_pages(req)
+            await interaction.response.send_message(embed=pages[0], view=VerdictPagesView(pages, interaction.user.id), ephemeral=True)
+            return
+        if choice == "finalize":
+            draft = req.get("draft", {})
+            ops = draft.get("ops", [])
+            for op in ops:
+                kind = op.get("kind")
+                uid = str(op.get("member_id"))
+                if kind == "money":
+                    ensure_user(uid)["наличка"] += int(op.get("amount", 0))
+                elif kind == "description":
+                    ensure_player_state(uid)["admin_description"] = str(op.get("text", ""))
+                elif kind == "reputation":
+                    ensure_player_state(uid)["reputation"] = int(op.get("value", 0))
+                elif kind == "happiness":
+                    ensure_player_state(uid)["happiness"] = max(0, min(100, int(op.get("value", 50))))
+                elif kind == "passive":
+                    get_passive_entries(uid).append({
+                        "type": op.get("flow_type", "income"),
+                        "amount": int(op.get("amount", 0)),
+                        "cooldown": int(op.get("cooldown", 86400)),
+                        "last_ts": 0,
+                        "description": op.get("description", "по вердикту"),
+                        "expires_at": op.get("expires_at"),
+                    })
+
+            save_json(BALANCES_FILE, balances)
+            save_player_state()
+            save_passive_flows()
+            req["status"] = "finalized"
+            save_verdicts_data()
+
+            result_channel = interaction.guild.get_channel(int(verdicts_data.get("result_channel"))) if verdicts_data.get("result_channel") else None
+            if result_channel:
+                pages = build_verdict_pages(req)
+                await result_channel.send(embed=pages[0])
+            await interaction.response.edit_message(embed=Embed(title="✅ Вердикт отправлен", description=f"Заявка #{self.req_id} завершена.", color=0x00FF00), view=None)
+            return
+
+        await interaction.response.send_modal(VerdictSimpleOpModal(self.req_id, choice))
+
+
+class VerdictReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+        self.add_item(VerdictReviewSelect(self.req_id))
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
+        if has_custom_command_access(interaction.user, "вердикты"):
+            return True
+        await interaction.response.send_message("❌ Нет доступа к вердиктам.", ephemeral=True)
+        return False
+
+
+class VerdictPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Попросить вердикт", style=ButtonStyle.primary, custom_id="verdict:request")
+    async def ask(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(VerdictRequestModal())
+
+
+@bot.command(name="вердикты")
+async def вердикты(ctx):
+    await ctx.send(embed=Embed(title="ℹ️ Вердикты", description="Служебная команда для настройки прав. Используйте `!разрешить @роль вердикты`.", color=0x3498DB))
+
+
+@bot.command(name="вердиктканал")
+@commands.has_permissions(administrator=True)
+async def вердиктканал(ctx, channel: discord.TextChannel):
+    verdicts_data["panel_channel"] = channel.id
+    save_verdicts_data()
+    embed = Embed(title="⚖️ Вердикты", description="Нажмите кнопку ниже, чтобы попросить вердикт.", color=0x3498DB)
+    await channel.send(embed=embed, view=VerdictPanelView())
+    await ctx.send(embed=Embed(title="✅ Канал вердиктов установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="вердзаявкиканал")
+@commands.has_permissions(administrator=True)
+async def вердзаявкиканал(ctx, channel: discord.TextChannel):
+    verdicts_data["requests_channel"] = channel.id
+    save_verdicts_data()
+    await ctx.send(embed=Embed(title="✅ Канал заявок вердиктов установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="итогвердиктканал")
+@commands.has_permissions(administrator=True)
+async def итогвердиктканал(ctx, channel: discord.TextChannel):
+    verdicts_data["result_channel"] = channel.id
+    save_verdicts_data()
+    await ctx.send(embed=Embed(title="✅ Канал итогов вердиктов установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
 
 
 class RatingModal(Modal):
@@ -6410,6 +6764,11 @@ async def wipe_all(ctx):
 
         @discord.ui.button(label="✅ Подтвердить", style=ButtonStyle.danger)
         async def confirm(self, interaction: Interaction, button: Button):
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+
             for uid, data in list(balances.items()):
                 if uid == "валюта" or not isinstance(data, dict):
                     continue
@@ -6448,12 +6807,21 @@ async def wipe_all(ctx):
                 except Exception:
                     pass
 
-            await interaction.response.edit_message(embed=Embed(title="💥 ГЛОБАЛЬНЫЙ ВАЙП ВЫПОЛНЕН", description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер и счётчик постов.", color=0x00FF00), view=None)
+            try:
+                await interaction.message.edit(embed=Embed(title="💥 ГЛОБАЛЬНЫЙ ВАЙП ВЫПОЛНЕН", description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер и счётчик постов.", color=0x00FF00), view=None)
+            except Exception:
+                pass
             self.stop()
 
         @discord.ui.button(label="❌ Отмена", style=ButtonStyle.secondary)
         async def cancel(self, interaction: Interaction, button: Button):
-            await interaction.response.edit_message(embed=Embed(title="❎ ВАЙП ОТМЕНЁН", color=0xAAAAAA), view=None)
+            try:
+                await interaction.response.edit_message(embed=Embed(title="❎ ВАЙП ОТМЕНЁН", color=0xAAAAAA), view=None)
+            except Exception:
+                try:
+                    await interaction.message.edit(embed=Embed(title="❎ ВАЙП ОТМЕНЁН", color=0xAAAAAA), view=None)
+                except Exception:
+                    pass
             self.stop()
 
     await ctx.send(
@@ -6535,6 +6903,11 @@ async def wipe_player(ctx, member: discord.Member):
 
         @discord.ui.button(label="✅ Подтвердить", style=ButtonStyle.danger)
         async def confirm(self, interaction: Interaction, button: Button):
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+
             backup = load_json(WIPE_BACKUP_FILE, {"players": {}})
             backup.setdefault("players", {})[user_id] = {
                 "time": int(time.time()),
@@ -6592,7 +6965,10 @@ async def wipe_player(ctx, member: discord.Member):
             except Exception:
                 pass
 
-            await interaction.response.edit_message(embed=Embed(title="🔥 ВАЙП ИГРОКА ВЫПОЛНЕН", description=f"Данные {member.mention}, пассивные операции и прогресс сфер обнулены.", color=0xFF0000), view=None)
+            try:
+                await interaction.message.edit(embed=Embed(title="🔥 ВАЙП ИГРОКА ВЫПОЛНЕН", description=f"Данные {member.mention}, пассивные операции и прогресс сфер обнулены.", color=0xFF0000), view=None)
+            except Exception:
+                pass
             self.stop()
 
         @discord.ui.button(label="❌ Отмена", style=ButtonStyle.secondary)
@@ -7039,6 +7415,7 @@ async def профиль(ctx, member: discord.Member = None):
     shield_left = max(0, int(state.get("shield_until", 0)) - now_ts)
     happiness = int(state.get("happiness", 50))
     soldiers = int(state.get("soldiers", 0))
+    reputation = int(state.get("reputation", 0))
     news_count = int(state.get("news_published", 0))
     coins_value = int(user.get("коины", 0))
 
@@ -7051,6 +7428,7 @@ async def профиль(ctx, member: discord.Member = None):
     embed.add_field(name="🛡️ Щит", value=(format_seconds_left(shield_left) if shield_left > 0 else "нет"), inline=True)
     embed.add_field(name="🙂 Счастье", value=f"{happiness}%", inline=True)
     embed.add_field(name="🪖 Войска", value=str(soldiers), inline=True)
+    embed.add_field(name="⭐ Репутация", value=str(reputation), inline=True)
 
     class PlayerEconomyView(View):
         def __init__(self, target_member: discord.Member):
