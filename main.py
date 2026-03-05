@@ -39,6 +39,7 @@ INVESTMENTS_FILE = os.path.join(DATA_DIR, "investments.json")
 MODERATION_FILE = os.path.join(DATA_DIR, "moderation.json")
 RATINGS_FILE = os.path.join(DATA_DIR, "ratings.json")
 VERDICTS_FILE = os.path.join(DATA_DIR, "verdicts.json")
+PARTNERSHIP_FILE = os.path.join(DATA_DIR, "partnerships.json")
 WIPE_BACKUP_TTL = 3600
 
 AUTOMOD_MIN_ACCOUNT_AGE_DAYS = 30
@@ -180,6 +181,16 @@ verdicts_data = load_json(
         "next_id": 1,
     },
 )
+partnership_data = load_json(
+    PARTNERSHIP_FILE,
+    {
+        "panel_channel": None,
+        "requests_channel": None,
+        "result_channel": None,
+        "requests": {},
+        "next_id": 1,
+    },
+)
 
 role_income.setdefault("freeze_roles", {})
 role_income.setdefault("freeze_last_claim", {})
@@ -210,6 +221,11 @@ verdicts_data.setdefault("requests_channel", None)
 verdicts_data.setdefault("result_channel", None)
 verdicts_data.setdefault("requests", {})
 verdicts_data.setdefault("next_id", 1)
+partnership_data.setdefault("next_id", 1)
+partnership_data.setdefault("requests", {})
+partnership_data.setdefault("result_channel", None)
+partnership_data.setdefault("requests_channel", None)
+partnership_data.setdefault("panel_channel", None)
 persistent_views_registered = False
 automod_link_tracker = {}
 country_owners.setdefault("country_to_user", {})
@@ -459,6 +475,10 @@ def save_ratings_data():
 
 def save_verdicts_data():
     save_json(VERDICTS_FILE, verdicts_data)
+
+
+def save_partnership_data():
+    save_json(PARTNERSHIP_FILE, partnership_data)
 
 
 def ensure_player_state(user_id: str):
@@ -1063,6 +1083,7 @@ async def on_ready():
     if not persistent_views_registered:
         bot.add_view(RatingsPanelView())
         bot.add_view(VerdictPanelView())
+        bot.add_view(PartnershipPanelView())
         persistent_views_registered = True
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
@@ -1505,6 +1526,9 @@ async def on_command_error(ctx, error):
             "вердиктканал": "!вердиктканал #канал",
             "вердзаявкиканал": "!вердзаявкиканал #канал",
             "итогвердиктканал": "!итогвердиктканал #канал",
+            "податьпартнеркуканал": "!податьпартнеркуканал #канал",
+            "заявкипартнерокканал": "!заявкипартнерокканал #канал",
+            "партнеркиканал": "!партнеркиканал #канал",
         }
         example = examples.get(ctx.command.qualified_name)
         details = f"**Синтаксис:**\n`{usage}`"
@@ -1640,6 +1664,10 @@ async def хелп(ctx):
             "вердиктканал",
             "вердзаявкиканал",
             "итогвердиктканал",
+            "податьпартнеркуканал",
+            "заявкипартнерокканал",
+            "партнеркиканал",
+            "партнерства",
             "рассылка",
         },
         "Регистрация / Страны": {
@@ -1704,6 +1732,10 @@ async def хелп(ctx):
         "купить": "Покупка товара из магазина.",
         "инвентарь": "Инвентарь игрока.",
         "серверныйинвентарь": "Подарочные серверные предметы с таймером.",
+        "партнерства": "Служебная команда для выдачи прав на модерацию партнерок.",
+        "податьпартнеркуканал": "Отправляет панель с кнопкой подачи партнерки в выбранный канал.",
+        "заявкипартнерокканал": "Устанавливает канал, куда отправляются заявки партнерок.",
+        "партнеркиканал": "Устанавливает канал публикации принятых партнерок.",
         "рег": "Регистрация игрока в стране/сезоне.",
         "регроли": "Настройка ролей для команды !рег.",
         "вайп": "Глобальный сброс игровых данных.",
@@ -5441,6 +5473,354 @@ async def итогвердиктканал(ctx, channel: discord.TextChannel):
     await ctx.send(
         embed=Embed(
             title="✅ Канал итогов вердиктов установлен",
+            description=f"Канал: {channel.mention}",
+            color=0x00FF00,
+        )
+    )
+
+
+def partnership_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("партнерства")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+def build_partnership_request_embed(req: dict, status_text: str | None = None, color=0x3498DB):
+    text = status_text or req.get("status_text") or "⏳ На рассмотрении"
+    em = Embed(title=f"🤝 Заявка на партнерство #{req.get('id')}", color=color)
+    em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
+    em.add_field(name="Жанр сервера", value=req.get("genre") or "—", inline=False)
+    em.add_field(name="Описание сервера", value=req.get("description") or "—", inline=False)
+    em.add_field(name="Статус", value=text, inline=False)
+    screenshot_url = req.get("screenshot_url")
+    if screenshot_url:
+        em.set_image(url=screenshot_url)
+    return em
+
+
+async def _edit_partnership_request_message(guild: discord.Guild, req: dict, status_text: str, color: discord.Color):
+    channel_id = req.get("request_channel_id")
+    message_id = req.get("request_message_id")
+    if not channel_id or not message_id:
+        return
+    ch = guild.get_channel(int(channel_id)) if guild else None
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(message_id))
+        em = build_partnership_request_embed(req, status_text=status_text, color=color.value)
+        await msg.edit(embed=em, view=None)
+    except Exception:
+        pass
+
+
+class PartnershipRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения партнерства", timeout=300)
+        self.reason = TextInput(
+            label="Причина",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = partnership_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        reason = str(self.reason.value).strip()
+        req["status"] = "rejected"
+        req["reject_reason"] = reason
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"❌ Отклонено\nМодератор: {interaction.user.mention}\nПричина: {reason}"
+        save_partnership_data()
+
+        await _edit_partnership_request_message(
+            interaction.guild,
+            req,
+            req["status_text"],
+            discord.Color.red(),
+        )
+
+        try:
+            member = interaction.guild.get_member(int(req.get("author_id"))) if interaction.guild and str(req.get("author_id", "")).isdigit() else None
+            if member:
+                await member.send(
+                    embed=Embed(
+                        title="❌ Партнерство отклонено",
+                        description=f"Ваша заявка #{self.req_id} отклонена.\n**Причина:** {reason}",
+                        color=0xFF0000,
+                    )
+                )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            embed=Embed(
+                title="❌ Заявка отклонена",
+                description=f"Заявка #{self.req_id} отклонена.",
+                color=0xAA0000,
+            ),
+            view=None,
+        )
+
+
+class PartnershipReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
+        if has_custom_command_access(interaction.user, "партнерства"):
+            return True
+        await interaction.response.send_message(
+            "❌ Нет доступа к заявкам партнерства.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="✅ Принять", style=ButtonStyle.success, custom_id="partner:approve")
+    async def approve(self, interaction: Interaction, button: Button):
+        req = partnership_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        if req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+
+        req["status"] = "approved"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"✅ Принято\nМодератор: {interaction.user.mention}"
+        save_partnership_data()
+
+        await _edit_partnership_request_message(
+            interaction.guild,
+            req,
+            req["status_text"],
+            discord.Color.green(),
+        )
+
+        result_channel_id = partnership_data.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            post = Embed(
+                title="🤝 Новая партнерка",
+                description=req.get("description") or "—",
+                color=0x2ECC71,
+            )
+            post.add_field(name="Жанр сервера", value=req.get("genre") or "—", inline=False)
+            post.add_field(name="От кого", value=f"<@{req.get('author_id')}>", inline=False)
+            await result_channel.send(embed=post)
+
+        try:
+            member = interaction.guild.get_member(int(req.get("author_id"))) if interaction.guild and str(req.get("author_id", "")).isdigit() else None
+            if member:
+                await member.send(
+                    embed=Embed(
+                        title="✅ Партнерство принято",
+                        description=f"Ваша заявка #{self.req_id} принята.",
+                        color=0x00FF00,
+                    )
+                )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            embed=Embed(
+                title="✅ Заявка принята",
+                description=f"Заявка #{self.req_id} принята и опубликована в партнерках.",
+                color=0x00FF00,
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="partner:reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        req = partnership_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        if req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PartnershipRejectModal(self.req_id))
+
+
+class PartnershipRequestModal(Modal):
+    def __init__(self):
+        super().__init__(title="Заявка на партнерство", timeout=600)
+        self.genre = TextInput(label="Жанр сервера", required=True, max_length=120)
+        self.description = TextInput(
+            label="Описание сервера",
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.add_item(self.genre)
+        self.add_item(self.description)
+
+    async def on_submit(self, interaction: Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Команда доступна только на сервере.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "✅ Форма принята. Проверьте ЛС с ботом и отправьте скриншот опубликованной нашей партнерки.",
+            ephemeral=True,
+        )
+
+        dm = await interaction.user.create_dm()
+        await dm.send(
+            embed=Embed(
+                title="📩 Нужен скриншот",
+                description=(
+                    "Отправьте **одним сообщением** скриншот опубликованной нашей партнерки.\n"
+                    "Время ожидания: 10 минут."
+                ),
+                color=0x3498DB,
+            )
+        )
+
+        def check_dm(msg: discord.Message):
+            return (
+                msg.author.id == interaction.user.id
+                and isinstance(msg.channel, discord.DMChannel)
+                and len(msg.attachments) > 0
+            )
+
+        try:
+            dm_msg = await bot.wait_for("message", check=check_dm, timeout=600)
+        except Exception:
+            await interaction.followup.send(
+                "⏰ Время ожидания скриншота истекло. Подайте заявку заново.",
+                ephemeral=True,
+            )
+            return
+
+        req_id = int(partnership_data.get("next_id", 1))
+        partnership_data["next_id"] = req_id + 1
+        screenshot_url = dm_msg.attachments[0].url
+        req = {
+            "id": req_id,
+            "author_id": str(interaction.user.id),
+            "genre": str(self.genre.value).strip(),
+            "description": str(self.description.value).strip(),
+            "screenshot_url": screenshot_url,
+            "status": "pending",
+            "status_text": "⏳ На рассмотрении",
+            "created_at": int(time.time()),
+        }
+        partnership_data.setdefault("requests", {})[str(req_id)] = req
+        save_partnership_data()
+
+        req_channel_id = partnership_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if not req_channel:
+            await interaction.followup.send(
+                "❌ Канал заявок партнерок не настроен (`!заявкипартнерокканал`).",
+                ephemeral=True,
+            )
+            return
+
+        content = partnership_ping_roles_line(interaction.guild) or None
+        msg = await req_channel.send(
+            content=content,
+            embed=build_partnership_request_embed(req),
+            view=PartnershipReviewView(str(req_id)),
+        )
+        req["request_message_id"] = msg.id
+        req["request_channel_id"] = req_channel.id
+        save_partnership_data()
+
+        await interaction.followup.send(
+            f"✅ Заявка #{req_id} отправлена в канал модерации партнерок.",
+            ephemeral=True,
+        )
+
+
+class PartnershipPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Подать партнерку",
+        style=ButtonStyle.primary,
+        custom_id="partnership:request",
+    )
+    async def request(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(PartnershipRequestModal())
+
+
+@bot.command(name="партнерства")
+async def партнерства(ctx):
+    await ctx.send(
+        embed=Embed(
+            title="ℹ️ Партнерства",
+            description="Служебная команда для настройки прав. Используйте `!разрешить @роль партнерства`.",
+            color=0x3498DB,
+        )
+    )
+
+
+@bot.command(name="податьпартнеркуканал")
+@commands.has_permissions(administrator=True)
+async def податьпартнеркуканал(ctx, channel: discord.TextChannel):
+    partnership_data["panel_channel"] = channel.id
+    save_partnership_data()
+    panel_embed = Embed(
+        title="🤝 Быстрая партнерка",
+        description=(
+            "Нажмите кнопку ниже, чтобы подать заявку на партнерство.\n\n"
+            "**Условия:**\n"
+            "• Укажите жанр и описание сервера в форме.\n"
+            "• После формы отправьте в ЛС боту скрин опубликованной нашей партнерки.\n"
+            "• Заявка уйдёт на модерацию."
+        ),
+        color=0x3498DB,
+    )
+    await channel.send(embed=panel_embed, view=PartnershipPanelView())
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал подачи партнерки установлен",
+            description=f"Канал: {channel.mention}",
+            color=0x00FF00,
+        )
+    )
+
+
+@bot.command(name="заявкипартнерокканал")
+@commands.has_permissions(administrator=True)
+async def заявкипартнерокканал(ctx, channel: discord.TextChannel):
+    partnership_data["requests_channel"] = channel.id
+    save_partnership_data()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал заявок партнерок установлен",
+            description=f"Канал: {channel.mention}",
+            color=0x00FF00,
+        )
+    )
+
+
+@bot.command(name="партнеркиканал")
+@commands.has_permissions(administrator=True)
+async def партнеркиканал(ctx, channel: discord.TextChannel):
+    partnership_data["result_channel"] = channel.id
+    save_partnership_data()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал партнерок установлен",
             description=f"Канал: {channel.mention}",
             color=0x00FF00,
         )
