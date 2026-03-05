@@ -22,6 +22,7 @@ ROLE_INCOME_FILE = os.path.join(DATA_DIR, "role_income.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 ITEMS_FILE = os.path.join(DATA_DIR, "items.json")
 INVENTORY_FILE = os.path.join(DATA_DIR, "inventory.json")
+SERVER_INVENTORY_FILE = os.path.join(DATA_DIR, "server_inventory.json")
 POPULATION_FILE = os.path.join(DATA_DIR, "population.json")
 COUNTRY_STATS_FILE = os.path.join(DATA_DIR, "country_stats.json")
 PLAYER_STATS_FILE = os.path.join(DATA_DIR, "player_stats.json")
@@ -126,6 +127,7 @@ items_data = load_json(
     },
 )
 inventory = load_json(INVENTORY_FILE, {})
+server_inventory = load_json(SERVER_INVENTORY_FILE, {"users": {}})
 country_stats = load_json(COUNTRY_STATS_FILE, {})
 country_owners = load_json(COUNTRY_OWNERS_FILE, {"country_to_user": {}, "user_to_country": {}})
 passive_flows = load_json(PASSIVE_FLOW_FILE, {"users": {}})
@@ -181,6 +183,7 @@ reg_settings.setdefault("roles_add", reg_settings.get("roles", []))
 reg_settings.setdefault("roles_remove", [])
 reg_settings.setdefault("wipe_roles", [])
 reg_settings.setdefault("wipe_role_exclusions", [])
+server_inventory.setdefault("users", {})
 
 items_data.setdefault("categories", {}).setdefault("1", "Гражданские")
 items_data.setdefault("categories", {}).setdefault("2", "Военные")
@@ -213,6 +216,10 @@ def save_items():
 
 def save_inventory():
     save_json(INVENTORY_FILE, inventory)
+
+
+def save_server_inventory():
+    save_json(SERVER_INVENTORY_FILE, server_inventory)
 
 
 def parse_role_mentions(raw: str):
@@ -749,6 +756,81 @@ def ensure_investment_items():
         save_items()
 
 
+def ensure_alta_box_item():
+    key = "Альта бокс"
+    if key in items_data.setdefault("items", {}):
+        items_data["items"][key].setdefault("can_buy", False)
+        items_data["items"][key]["category"] = "3"
+        return
+
+    items_data["items"][key] = {
+        "key": key,
+        "price": 0,
+        "description": (
+            "Подарочный серверный бокс. Выдаётся только администрацией и только на время.\n"
+            "Награды (выпадает 1):\n"
+            "• Бронь сверхдержавы — 15%\n"
+            "• Бронь державы — 15%\n"
+            "• Стартовый баланс 15.000.000 — 15%\n"
+            "• Бонус с реферальной программы +100% на 24ч — 15%\n"
+            "• 150 Альта-коинов — 15%\n"
+            "• 2 бесплатные сферы на старте — 15%\n"
+            "• Стартовый баланс 10.000.000 — 10%"
+        ),
+        "category": "3",
+        "stock": -1,
+        "expires_at": None,
+        "require_roles": [],
+        "give_roles": [],
+        "remove_roles": [],
+        "use_text": None,
+        "can_buy": False,
+        "created_at": int(time.time()),
+    }
+    save_items()
+
+
+def _cleanup_expired_server_items(user_id: str):
+    user_slots = server_inventory.setdefault("users", {}).get(str(user_id), {})
+    now_ts = int(time.time())
+    changed = False
+    for key in list(user_slots.keys()):
+        entry = user_slots.get(key, {})
+        expires_at = entry.get("expires_at")
+        qty = int(entry.get("qty", 0))
+        if qty <= 0 or (expires_at is not None and int(expires_at) <= now_ts):
+            user_slots.pop(key, None)
+            changed = True
+    if changed:
+        if not user_slots:
+            server_inventory.setdefault("users", {}).pop(str(user_id), None)
+        save_server_inventory()
+
+
+def get_server_item_qty(user_id: str, item_key: str) -> int:
+    _cleanup_expired_server_items(user_id)
+    entry = server_inventory.setdefault("users", {}).get(str(user_id), {}).get(item_key, {})
+    return int(entry.get("qty", 0))
+
+
+def consume_server_item(user_id: str, item_key: str, qty: int) -> bool:
+    _cleanup_expired_server_items(user_id)
+    user_slots = server_inventory.setdefault("users", {}).get(str(user_id), {})
+    entry = user_slots.get(item_key)
+    if not entry:
+        return False
+    current = int(entry.get("qty", 0))
+    if current < qty:
+        return False
+    entry["qty"] = current - qty
+    if entry["qty"] <= 0:
+        user_slots.pop(item_key, None)
+    if not user_slots:
+        server_inventory.setdefault("users", {}).pop(str(user_id), None)
+    save_server_inventory()
+    return True
+
+
 def resolve_item_key(query: str):
     items = list(items_data.get("items", {}).keys())
     if not items:
@@ -852,6 +934,7 @@ async def on_ready():
 
     print(f"Бот запущен как {bot.user}")
     ensure_investment_items()
+    ensure_alta_box_item()
     if not persistent_views_registered:
         bot.add_view(RatingsPanelView())
         bot.add_view(VerdictPanelView())
@@ -1225,6 +1308,7 @@ async def on_command_error(ctx, error):
             "статы": "!статы",
             "удалитьстат": "!удалитьстат \"Германская Империя\"",
             "инвентарь": "!инвентарь @Игрок",
+            "серверныйинвентарь": "!серверныйинвентарь @Игрок",
             "хелп": "!хелп",
             "инвайтканал": "!инвайтканал #канал",
             "грабеж": "!грабеж @игрок",
@@ -1284,7 +1368,7 @@ async def хелп(ctx):
     categories = {
         "База": {"пинг", "привет", "хелп", "меню", "баланс", "профиль", "статистика", "топ"},
         "Экономика": {"работа", "депозит", "снять", "валюта", "коллект", "доходсписок", "начислить", "забрать", "доходдобавить", "доходудалить", "заморозкароль", "заморозкарольудалить", "заморозкавывести", "кдгод", "автоколлектканал", "грабеж", "грабежсейвроль", "передать", "передатьроль", "логэко"},
-        "Магазин / Инвентарь": {"категориядобавить", "категорияудалить", "создатьпредмет", "редактироватьпредмет", "предметинфо", "магазин", "купить", "пополнитьпредмет", "удалитьпредмет", "инвентарь", "использовать", "выдать", "изъять", "инвестировать", "продать", "продатьпредмет", "продатьроль"},
+        "Магазин / Инвентарь": {"категориядобавить", "категорияудалить", "создатьпредмет", "редактироватьпредмет", "предметинфо", "магазин", "купить", "пополнитьпредмет", "удалитьпредмет", "инвентарь", "серверныйинвентарь", "использовать", "выдать", "изъять", "инвестировать", "продать", "продатьпредмет", "продатьроль"},
         "Сезоны / Сферы": {"создатьсезон", "списоксезонов", "установитьсезон", "удалитьсезон", "создатьсферу", "редактсферу", "удалитьсферу", "сферы", "заявкиканал", "результатзаявокканал", "принять", "отклонить"},
         "Тикеты / Переговоры": {"сеттикет", "тикетотправить", "тикетотправиить", "тикетроль", "тикетнероль", "тикетроли", "удалитьтикет", "тайнканал"},
         "Модерация": {"мут", "размут", "бан", "разбан", "кик", "варн", "снятьварн", "варнпредел", "наказания", "модерлогканал", "логсооканал", "вердиктканал", "вердзаявкиканал", "итогвердиктканал", "рассылка"},
@@ -1311,7 +1395,7 @@ async def хелп(ctx):
         "пинг": "Проверка отклика бота.",
         "привет": "Короткое приветственное сообщение.",
         "хелп": "Открывает это меню помощи.",
-        "меню": "Открывает быстрое меню игрока (магазин, инвентарь, профиль, сферы, вердикт, работа+коллект).",
+        "меню": "Открывает быстрое меню игрока (магазин, инвентарь, серверный инвентарь, профиль, сферы, вердикт, работа+коллект).",
         "баланс": "Показывает баланс игрока/роли.",
         "профиль": "Профиль игрока и его показатели.",
         "статистика": "Статистика сервера/игрока.",
@@ -1330,6 +1414,7 @@ async def хелп(ctx):
         "магазин": "Просмотр магазина по категориям.",
         "купить": "Покупка товара из магазина.",
         "инвентарь": "Инвентарь игрока.",
+        "серверныйинвентарь": "Подарочные серверные предметы с таймером.",
         "рег": "Регистрация игрока в стране/сезоне.",
         "регроли": "Настройка ролей для команды !рег.",
         "вайп": "Глобальный сброс игровых данных.",
@@ -1464,6 +1549,7 @@ async def меню(ctx):
             options = [
                 SelectOption(label="Магазин", value="shop", emoji="🛒", description="Открыть магазин предметов"),
                 SelectOption(label="Инвентарь", value="inventory", emoji="🎒", description="Показать ваш инвентарь"),
+                SelectOption(label="Серверный инвентарь", value="server_inventory", emoji="📦", description="Подарочные серверные предметы"),
                 SelectOption(label="Профиль", value="profile", emoji="👤", description="Открыть профиль игрока"),
                 SelectOption(label="Магазин сфер", value="spheres", emoji="🌐", description="Открыть список сфер"),
                 SelectOption(label="Попросить вердикт", value="verdict", emoji="⚖️", description="Отправить заявку на вердикт"),
@@ -1486,6 +1572,8 @@ async def меню(ctx):
                 await инвентарь(ctx)
             elif selected == "profile":
                 await профиль(ctx)
+            elif selected == "server_inventory":
+                await серверныйинвентарь(ctx)
             elif selected == "spheres":
                 await сферы(ctx)
             elif selected == "collect":
@@ -3495,12 +3583,49 @@ def verdict_ping_roles_line(guild: discord.Guild):
     return " ".join(mentions).strip()
 
 
+async def _edit_verdict_request_message(guild: discord.Guild, req: dict, status_text: str, color: discord.Color):
+    channel_id = req.get("request_channel_id")
+    message_id = req.get("request_message_id")
+    if not channel_id or not message_id:
+        return
+    ch = guild.get_channel(int(channel_id)) if guild else None
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(message_id))
+        em = msg.embeds[0] if msg.embeds else Embed(title=f"📨 Заявка на вердикт #{req.get('id')}", color=color)
+        em.color = color
+        if em.fields:
+            em.set_field_at(0, name="От", value=f"<@{req.get('author_id')}>", inline=False)
+            if len(em.fields) > 1:
+                em.set_field_at(1, name="Ссылка", value=str(req.get("message_link") or "—"), inline=False)
+            if len(em.fields) > 2:
+                em.set_field_at(2, name="Статус", value=status_text, inline=False)
+            else:
+                em.add_field(name="Статус", value=status_text, inline=False)
+        else:
+            em.add_field(name="От", value=f"<@{req.get('author_id')}>", inline=False)
+            em.add_field(name="Ссылка", value=str(req.get("message_link") or "—"), inline=False)
+            em.add_field(name="Статус", value=status_text, inline=False)
+        await msg.edit(embed=em, view=None)
+    except Exception:
+        pass
+
+
 def build_verdict_pages(req: dict) -> list[Embed]:
     draft = req.get("draft", {})
     ops = draft.get("ops", [])
+    processed_by = req.get("processed_by")
+    status_map = {
+        "pending": "⏳ На рассмотрении",
+        "rejected": "❌ Отклонено",
+        "finalized": "✅ Принято",
+    }
     lines = [
         f"**Заявка:** #{req.get('id')}",
         f"**Автор запроса:** <@{req.get('author_id')}>",
+        f"**Статус:** {status_map.get(req.get('status'), req.get('status') or '—')}",
+        f"**Рассмотрел:** <@{processed_by}>" if processed_by else "**Рассмотрел:** —",
         f"**Ссылка:** {req.get('message_link')}",
         f"**Текст вердикта:**\n{draft.get('verdict_text') or '—'}",
         "",
@@ -3583,6 +3708,7 @@ class VerdictRequestModal(Modal):
         embed = Embed(title=f"📨 Заявка на вердикт #{req_id}", color=0x3498DB)
         embed.add_field(name="От", value=interaction.user.mention, inline=False)
         embed.add_field(name="Ссылка", value=str(self.link_input.value).strip(), inline=False)
+        embed.add_field(name="Статус", value="⏳ На рассмотрении", inline=False)
         content = verdict_ping_roles_line(interaction.guild) or None
         msg = await req_channel.send(content=content, embed=embed, view=VerdictReviewView(str(req_id)))
         verdicts_data["requests"][str(req_id)]["request_message_id"] = msg.id
@@ -3829,7 +3955,10 @@ class VerdictRejectReasonModal(Modal):
         reason = str(self.reason.value).strip()
         req["status"] = "rejected"
         req["reject_reason"] = reason
+        req["processed_by"] = str(interaction.user.id)
         save_verdicts_data()
+
+        await _edit_verdict_request_message(interaction.guild, req, f"❌ Отклонено\nКуратор: {interaction.user.mention}\nПричина: {reason}", discord.Color.red())
 
         result_channel = interaction.guild.get_channel(int(verdicts_data.get("result_channel"))) if verdicts_data.get("result_channel") else None
         if result_channel:
@@ -3915,7 +4044,10 @@ class VerdictReviewSelect(Select):
             save_player_state()
             save_passive_flows()
             req["status"] = "finalized"
+            req["processed_by"] = str(interaction.user.id)
             save_verdicts_data()
+
+            await _edit_verdict_request_message(interaction.guild, req, f"✅ Принято\nКуратор: {interaction.user.mention}", discord.Color.green())
 
             result_channel = interaction.guild.get_channel(int(verdicts_data.get("result_channel"))) if verdicts_data.get("result_channel") else None
             if result_channel:
@@ -6449,7 +6581,7 @@ async def магазин(ctx):
         items_list = [
             item
             for item in items_data["items"].values()
-            if item["category"] == selected_key and (item["expires_at"] is None or item["expires_at"] > int(time.time()))
+            if item["category"] == selected_key and bool(item.get("can_buy", True)) and (item["expires_at"] is None or item["expires_at"] > int(time.time()))
         ]
 
         if not items_list:
@@ -6536,6 +6668,14 @@ async def купить(ctx, количество: int, *, item_key: str):
             return
 
     item = items_data["items"].get(selected_key)
+
+    if not item:
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Предмет не найден в магазине.", color=0xFF0000))
+        return
+
+    if not bool(item.get("can_buy", True)):
+        await ctx.send(embed=Embed(title="❌ Нельзя купить", description=f"Предмет **{selected_key}** нельзя купить в магазине. Он выдаётся только администрацией.", color=0xFF0000))
+        return
 
     if количество <= 0:
         await ctx.send(embed=Embed(title="❌ Ошибка", description="Количество должно быть больше нуля.", color=0xFF0000))
@@ -6947,12 +7087,36 @@ async def редактироватьпредмет(ctx, *, item_query: str):
 
 
 @bot.command()
+async def серверныйинвентарь(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    user_id = str(member.id)
+    _cleanup_expired_server_items(user_id)
+    entries = server_inventory.setdefault("users", {}).get(user_id, {})
+
+    if not entries:
+        await ctx.send(embed=Embed(title="📦 Серверный инвентарь пуст", description=f"У {member.mention} нет активных подарочных предметов.", color=0xFFA500))
+        return
+
+    now_ts = int(time.time())
+    lines = []
+    for key, entry in entries.items():
+        qty = int(entry.get("qty", 0))
+        expires_at = entry.get("expires_at")
+        ttl_txt = "без срока" if expires_at is None else format_seconds_left(int(expires_at) - now_ts)
+        lines.append(f"**{key}** — {qty} шт. | ⏳ {ttl_txt}")
+
+    await ctx.send(embed=Embed(title=f"📦 Серверный инвентарь — {member.display_name}", description="\n".join(lines), color=0x3498DB))
+
+
+@bot.command()
 async def инвентарь(ctx, member: discord.Member = None):
     member = member or ctx.author
     user_id = str(member.id)
     user_items = inventory.get(user_id, {})
+    _cleanup_expired_server_items(user_id)
+    gifted_items = server_inventory.setdefault("users", {}).get(user_id, {})
 
-    if not user_items:
+    if not user_items and not gifted_items:
         await ctx.send(embed=Embed(title="🎒 Инвентарь пуст", description=f"У {member.mention} пока нет предметов.", color=0xFFA500))
         return
 
@@ -6971,11 +7135,18 @@ async def инвентарь(ctx, member: discord.Member = None):
         selected_key = select.values[0]
         category_name = categories[selected_key]
 
-        category_items = [
-            (key, amount)
-            for key, amount in user_items.items()
-            if key in items_data["items"] and items_data["items"][key]["category"] == selected_key
-        ]
+        category_items = []
+        for key, amount in user_items.items():
+            if key in items_data["items"] and items_data["items"][key]["category"] == selected_key:
+                category_items.append((key, int(amount), "regular", None))
+
+        if selected_key == "3":
+            now_ts = int(time.time())
+            for key, entry in gifted_items.items():
+                qty = int(entry.get("qty", 0))
+                expires_at = entry.get("expires_at")
+                ttl_txt = "без срока" if expires_at is None else format_seconds_left(int(expires_at) - now_ts)
+                category_items.append((key, qty, "gift", ttl_txt))
 
         if not category_items:
             await interaction.response.send_message(
@@ -6985,10 +7156,14 @@ async def инвентарь(ctx, member: discord.Member = None):
             return
 
         desc = ""
-        for key, amount in category_items:
+        for key, amount, source_kind, ttl_txt in category_items:
             info = items_data["items"].get(key)
-            if info:
-                desc += f"**{key}** — {amount} шт.\n{info['description']}\n\n"
+            if not info:
+                continue
+            extra = ""
+            if source_kind == "gift":
+                extra = f" *(серверный подарок, ⏳ {ttl_txt})*"
+            desc += f"**{key}** — {amount} шт.{extra}\n{info['description']}\n\n"
 
         await interaction.response.send_message(embed=Embed(title=f"🎒 {category_name}", description=desc, color=0x3498DB), ephemeral=True)
 
@@ -7000,7 +7175,18 @@ async def инвентарь(ctx, member: discord.Member = None):
 
 
 @bot.command()
-async def использовать(ctx, количество: int, *, item_key: str):
+async def использовать(ctx, *args):
+    if not args:
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Использование: `!использовать <кол-во> <предмет>` или `!использовать <предмет>`.", color=0xFF0000))
+        return
+
+    количество = 1
+    if str(args[0]).isdigit() and len(args) >= 2:
+        количество = int(args[0])
+        item_key = " ".join(args[1:]).strip()
+    else:
+        item_key = " ".join(args).strip()
+
     user_id = str(ctx.author.id)
     user_items = inventory.get(user_id, {})
 
@@ -7012,7 +7198,41 @@ async def использовать(ctx, количество: int, *, item_key: 
     if not selected_key:
         return
 
-    if selected_key not in user_items or user_items[selected_key] < количество:
+    if selected_key.lower() == "альта бокс":
+        if количество != 1:
+            await ctx.send(embed=Embed(title="❌ Ошибка", description="`Альта бокс` можно открывать только по 1 за раз.", color=0xFF0000))
+            return
+        if get_server_item_qty(user_id, selected_key) < 1:
+            await ctx.send(embed=Embed(title="❌ Ошибка", description="У вас нет активного `Альта бокса` в серверном инвентаре.", color=0xFF0000))
+            return
+
+        await ctx.send(embed=Embed(title="🎁 Альта бокс", description="Открываем бокс... Интрижка 5 секунд ⏳", color=0xF1C40F))
+        await asyncio.sleep(5)
+
+        rewards = [
+            ("Бронь сверхдержавы", 15),
+            ("Бронь державы", 15),
+            ("Стартовый баланс 15.000.000", 15),
+            ("Бонус с реферальной программы +100% на 24ч", 15),
+            ("150 Альта-коинов", 15),
+            ("2 бесплатные сферы на старте", 15),
+            ("Стартовый баланс 10.000.000", 10),
+        ]
+        picked = random.choices([r[0] for r in rewards], weights=[r[1] for r in rewards], k=1)[0]
+        consume_server_item(user_id, selected_key, 1)
+        await ctx.send(
+            embed=Embed(
+                title="🌈 Альта бокс открыт!",
+                description=(
+                    f"{ctx.author.mention}, вы выбили: **{picked}**\n\n"
+                    "⚠️ Бот ничего не начисляет автоматически — это текстовая награда для ручного использования."
+                ),
+                color=0x9B59B6,
+            )
+        )
+        return
+
+    if selected_key not in user_items or int(user_items[selected_key]) < количество:
         await ctx.send(embed=Embed(title="❌ Ошибка", description=f"У вас нет **{количество} × {selected_key}**.", color=0xFF0000))
         return
 
@@ -7096,27 +7316,107 @@ async def pick_item_key_by_query(ctx, item_query: str):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def выдать(ctx, member: discord.Member, количество: int, *, item_key: str):
-    if количество <= 0:
-        await ctx.send(embed=Embed(title="❌ Ошибка", description="Количество должно быть больше нуля.", color=0xFF0000))
+async def выдать(ctx, target: str, количество_или_предмет: str, *rest: str):
+    # Старый формат: !выдать @Игрок 2 Предмет
+    # Новый формат (подарки сервера): !выдать "игроки/роль/игрок" "альта бокс" "1д"
+    if str(количество_или_предмет).isdigit() and rest:
+        количество = int(количество_или_предмет)
+        if количество <= 0:
+            await ctx.send(embed=Embed(title="❌ Ошибка", description="Количество должно быть больше нуля.", color=0xFF0000))
+            return
+
+        member = parse_member_ref(ctx.guild, target)
+        if not member:
+            await ctx.send(embed=Embed(title="❌ Ошибка", description="Для количественной выдачи укажите одного игрока (упоминание/ID).", color=0xFF0000))
+            return
+
+        item_key = " ".join(rest).strip()
+        selected_key = await pick_item_key_by_query(ctx, item_key)
+        if not selected_key:
+            return
+
+        user_id = str(member.id)
+        inventory.setdefault(user_id, {})
+        inventory[user_id][selected_key] = int(inventory[user_id].get(selected_key, 0)) + количество
+        save_inventory()
+
+        await ctx.send(
+            embed=Embed(
+                title="✅ Предмет выдан",
+                description=f"**Администратор:** {ctx.author.mention}\n**Получатель:** {member.mention}\n**Предмет:** {selected_key}\n**Количество:** {количество}",
+                color=0x00FF00,
+            )
+        )
         return
 
+    item_key = str(количество_или_предмет).strip()
+    ttl_raw = " ".join(rest).strip()
     selected_key = await pick_item_key_by_query(ctx, item_key)
     if not selected_key:
         return
 
-    user_id = str(member.id)
-    inventory.setdefault(user_id, {})
-    inventory[user_id][selected_key] = inventory[user_id].get(selected_key, 0) + количество
-    save_inventory()
+    if selected_key.lower() != "альта бокс":
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Формат без количества поддерживается только для `Альта бокс`.", color=0xFF0000))
+        return
+
+    if not ttl_raw:
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Укажите время использования (например: `1д`, `12ч`, `3600с`).", color=0xFF0000))
+        return
+
+    try:
+        ttl_seconds = parse_interval(ttl_raw)
+        if ttl_seconds <= 0:
+            raise ValueError
+    except Exception:
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Некорректное время. Пример: `1д`, `12ч`, `30м`.", color=0xFF0000))
+        return
+
+    targets = []
+    target_clean = target.strip()
+    role_match = re.match(r"^<@&(\d+)>$", target_clean)
+    if target_clean.lower() == "игроки":
+        targets = [m for m in ctx.guild.members if not m.bot]
+    elif role_match:
+        role = ctx.guild.get_role(int(role_match.group(1)))
+        if role:
+            targets = [m for m in role.members if not m.bot]
+    else:
+        member = parse_member_ref(ctx.guild, target_clean)
+        if member and not member.bot:
+            targets = [member]
+
+    if not targets:
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Не удалось определить получателей. Используйте `игроки`, упоминание роли или игрока.", color=0xFF0000))
+        return
+
+    expires_at = int(time.time()) + ttl_seconds
+    changed = 0
+    for member in targets:
+        uid = str(member.id)
+        user_slots = server_inventory.setdefault("users", {}).setdefault(uid, {})
+        slot = user_slots.get(selected_key, {"qty": 0, "expires_at": expires_at, "issued_by": str(ctx.author.id)})
+        slot["qty"] = int(slot.get("qty", 0)) + 1
+        slot["expires_at"] = max(int(slot.get("expires_at", expires_at)), expires_at)
+        slot["issued_by"] = str(ctx.author.id)
+        user_slots[selected_key] = slot
+        changed += 1
+
+    if changed > 0:
+        save_server_inventory()
 
     await ctx.send(
         embed=Embed(
-            title="✅ Предмет выдан",
-            description=f"**Администратор:** {ctx.author.mention}\n**Получатель:** {member.mention}\n**Предмет:** {selected_key}\n**Количество:** {количество}",
+            title="✅ Альта боксы выданы",
+            description=(
+                f"**Администратор:** {ctx.author.mention}\n"
+                f"**Предмет:** {selected_key}\n"
+                f"**Получателей:** {changed}\n"
+                f"**Срок использования:** {format_interval(ttl_seconds)}"
+            ),
             color=0x00FF00,
         )
     )
+
 
 
 @bot.command()
