@@ -9854,7 +9854,8 @@ async def использовать(ctx, *args):
 
         server_qty = get_server_item_qty(user_id, selected_key)
         regular_qty = int(user_items.get(selected_key, 0))
-        if server_qty < 1 and regular_qty < 1:
+        total_qty = server_qty + regular_qty
+        if total_qty < 1:
             await ctx.send(
                 embed=Embed(
                     title="❌ Ошибка",
