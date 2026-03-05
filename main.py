@@ -9892,7 +9892,12 @@ async def использовать(ctx, *args):
             [r[0] for r in rewards], weights=[r[1] for r in rewards], k=1
         )[0]
         if server_qty >= 1:
-            consume_server_item(user_id, selected_key, 1)
+            consumed = consume_server_item(user_id, selected_key, 1)
+            if not consumed and regular_qty > 0:
+                user_items[selected_key] = max(0, regular_qty - 1)
+                if user_items[selected_key] <= 0:
+                    del user_items[selected_key]
+                save_inventory()
         else:
             user_items[selected_key] = max(0, regular_qty - 1)
             if user_items[selected_key] <= 0:
