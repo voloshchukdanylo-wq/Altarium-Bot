@@ -41,6 +41,7 @@ MODERATION_FILE = os.path.join(DATA_DIR, "moderation.json")
 RATINGS_FILE = os.path.join(DATA_DIR, "ratings.json")
 VERDICTS_FILE = os.path.join(DATA_DIR, "verdicts.json")
 PARTNERSHIP_FILE = os.path.join(DATA_DIR, "partnerships.json")
+COMPANIES_FILE = os.path.join(DATA_DIR, "companies.json")
 WIPE_BACKUP_TTL = 3600
 
 AUTOMOD_MIN_ACCOUNT_AGE_DAYS = 30
@@ -209,6 +210,17 @@ partnership_data = load_json(
         "next_id": 1,
     },
 )
+companies_data = load_json(
+    COMPANIES_FILE,
+    {
+        "companies": {},
+        "requests": {},
+        "next_company_id": 1,
+        "next_request_id": 1,
+        "requests_channel": None,
+        "result_channel": None,
+    },
+)
 
 role_income.setdefault("freeze_roles", {})
 role_income.setdefault("freeze_last_claim", {})
@@ -267,6 +279,12 @@ investments["rp_year"].setdefault("year", None)
 investments["rp_year"].setdefault("cooldown", 86400)
 investments["rp_year"].setdefault("next_tick_at", None)
 investments.setdefault("users", {})
+companies_data.setdefault("companies", {})
+companies_data.setdefault("requests", {})
+companies_data.setdefault("next_company_id", 1)
+companies_data.setdefault("next_request_id", 1)
+companies_data.setdefault("requests_channel", None)
+companies_data.setdefault("result_channel", None)
 
 items_data.setdefault("categories", {}).setdefault("1", "Гражданские")
 items_data.setdefault("categories", {}).setdefault("2", "Военные")
@@ -583,6 +601,81 @@ async def restore_member_roles_after_wipe(
         await member.remove_roles(*roles_to_remove, reason=reason)
     if roles_to_add:
         await member.add_roles(*roles_to_add, reason=reason)
+
+
+def save_companies_data():
+    save_json(COMPANIES_FILE, companies_data)
+
+
+def is_registered_player(user_id: str) -> bool:
+    return str(user_id) in country_owners.setdefault("user_to_country", {})
+
+
+def calculate_company_level(income_amount: str, income_cooldown: int) -> tuple[str, int]:
+    try:
+        base_amount = 10_000_000
+        income_value = max(0, parse_money_value(str(income_amount), base_amount))
+    except Exception:
+        income_value = 0
+    cd = max(60, int(income_cooldown or 3600))
+    income_per_hour = int((income_value * 3600) / cd)
+
+    levels = [
+        ("Стартап", 100_000, 370_000, 3600),
+        ("Микро бизнес", 370_000, 750_000, 3600),
+        ("Малый бизнес", 750_000, 1_200_000, 7200),
+        ("Средний бизнес", 1_200_000, 8_300_000, 7200),
+        ("Крупная компания", 8_300_000, 25_700_000, 7200),
+        ("Корпорация", 25_700_000, 38_000_000, 21600),
+        ("Транснациональная компания", 38_000_000, 50_000_000, 43200),
+        ("Конгломерат", 50_000_000, None, 86400),
+    ]
+    selected = levels[0]
+    for lvl in levels:
+        lo, hi = lvl[1], lvl[2]
+        if income_per_hour >= lo and (hi is None or income_per_hour < hi):
+            selected = lvl
+    return selected[0], selected[3]
+
+
+def update_company_derived_fields(company: dict):
+    name, recommended_cd = calculate_company_level(company.get("income_amount", "100000"), int(company.get("income_cooldown", 3600)))
+    company["level"] = name
+    company.setdefault("advert_level", 1)
+    company.setdefault("income_cooldown", recommended_cd)
+    company.setdefault("expense_amount", "0")
+    company.setdefault("expense_cooldown", 86400)
+    company.setdefault("min_value", int(company.get("first_invest", 0) or 0))
+    company.setdefault("last_income_at", int(time.time()))
+    company.setdefault("last_expense_at", int(time.time()))
+
+
+def company_estimated_price(company: dict) -> int:
+    min_value = int(company.get("min_value", 0) or 0)
+    first_invest = int(company.get("first_invest", 0) or 0)
+    ad_bonus = int(company.get("advert_level", 1)) * 500_000
+    return max(min_value, first_invest) + ad_bonus
+
+
+def build_company_embed(company: dict, idx: int, total: int):
+    update_company_derived_fields(company)
+    est_price = company_estimated_price(company)
+    em = Embed(
+        title=f"🏢 Компания {idx}/{total}",
+        color=0x2ECC71,
+        description=(
+            f"**Название компании:** {company.get('name', '—')}\n"
+            f"**Специализация:** {company.get('specialization', '—')}\n"
+            f"**Дата основания:** {company.get('founded_year', '—')}\n"
+            f"**Уровень компании:** {company.get('level', '—')}\n"
+            f"**Уровень рекламы:** {company.get('advert_level', 1)}"
+        ),
+    )
+    em.add_field(name="Траты", value=f"{company.get('expense_amount', '0')} / {format_interval(int(company.get('expense_cooldown', 86400)))}", inline=True)
+    em.add_field(name="Доходы", value=f"{company.get('income_amount', '0')} / {format_interval(int(company.get('income_cooldown', 3600)))}", inline=True)
+    em.add_field(name="Оценка цены компании", value=f"{est_price:,}", inline=False)
+    em.add_field(name="Владелец", value=f"<@{company.get('owner_id')}>", inline=False)
+    return em
 
 
 def save_player_state():
@@ -1978,6 +2071,12 @@ async def меню(ctx):
                     description="Подать заявку на инвестицию",
                 ),
                 SelectOption(
+                    label="Компании",
+                    value="companies",
+                    emoji="🏢",
+                    description="Управление компаниями",
+                ),
+                SelectOption(
                     label="Собрать: работа + коллект",
                     value="collect",
                     emoji="💰",
@@ -1999,6 +2098,11 @@ async def меню(ctx):
                 return
             if selected == "investments":
                 await interaction.response.send_modal(InvestmentRequestModal())
+                return
+            if selected == "companies":
+                await show_companies_menu(ctx, interaction.user)
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True)
                 return
 
             await interaction.response.defer(ephemeral=True)
@@ -6180,6 +6284,571 @@ async def итогинвестицийканал(ctx, channel: discord.TextChann
     await ctx.send(embed=Embed(title="✅ Канал итогов инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
 
 
+
+
+def company_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("компании")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+def build_company_request_embed(req: dict, color=0x3498DB):
+    em = Embed(title=f"🏢 Заявка компании #{req.get('id')} ({req.get('type')})", color=color)
+    em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
+    em.add_field(name="Статус", value=req.get("status_text", "⏳ На рассмотрении"), inline=False)
+    payload = req.get("payload", {})
+    for key, value in payload.items():
+        em.add_field(name=str(key), value=str(value), inline=False)
+    return em
+
+
+class CompanyCreateModal(Modal):
+    def __init__(self):
+        super().__init__(title="Создание компании", timeout=600)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.company_name = TextInput(label="Название компании", required=True, max_length=120)
+        self.specialization = TextInput(label="Специализация", required=True, max_length=200)
+        self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100)
+        self.add_item(self.post_url)
+        self.add_item(self.company_name)
+        self.add_item(self.specialization)
+        self.add_item(self.first_invest)
+
+    async def on_submit(self, interaction: Interaction):
+        if not is_registered_player(str(interaction.user.id)):
+            await interaction.response.send_message("❌ Компании доступны только зарегистрированным игрокам (`!рег`).", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "create",
+            "author_id": str(interaction.user.id),
+            "status": "pending",
+            "status_text": "⏳ На рассмотрении",
+            "payload": {
+                "Ссылка на пост": str(self.post_url.value).strip(),
+                "Название": str(self.company_name.value).strip(),
+                "Специализация": str(self.specialization.value).strip(),
+                "Первый вклад": str(self.first_invest.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        ch_id = companies_data.get("requests_channel")
+        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
+        if not ch:
+            await interaction.response.send_message("❌ Канал заявок компаний не настроен (`!заявкикомпаний`).", ephemeral=True)
+            return
+
+        content = company_ping_roles_line(interaction.guild) or None
+        msg = await ch.send(content=content, embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
+        req["request_channel_id"] = msg.channel.id
+        req["request_message_id"] = msg.id
+        save_companies_data()
+        await interaction.response.send_message(f"✅ Заявка #{req_id} отправлена.", ephemeral=True)
+
+
+class CompanyBuyModal(Modal):
+    def __init__(self):
+        super().__init__(title="Купить компанию", timeout=600)
+        self.company_id = TextInput(label="ID компании", required=True, max_length=20)
+        self.post_url = TextInput(label="Пост", required=True, max_length=400)
+        self.offer = TextInput(label="Сколько денег предлагаете", required=True, max_length=100)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        for item in (self.company_id, self.post_url, self.offer, self.reason):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        buyer_id = str(interaction.user.id)
+        if not is_registered_player(buyer_id):
+            await interaction.response.send_message("❌ Купить компанию могут только зарегистрированные игроки.", ephemeral=True)
+            return
+
+        company = companies_data.setdefault("companies", {}).get(str(self.company_id.value).strip())
+        if not company:
+            await interaction.response.send_message("❌ Компания с таким ID не найдена.", ephemeral=True)
+            return
+        if str(company.get("owner_id")) == buyer_id:
+            await interaction.response.send_message("❌ Вы уже владелец этой компании.", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "buy",
+            "author_id": buyer_id,
+            "owner_id": str(company.get("owner_id")),
+            "company_id": str(self.company_id.value).strip(),
+            "status": "pending_owner",
+            "status_text": "⏳ Ожидает решения владельца",
+            "payload": {
+                "Пост": str(self.post_url.value).strip(),
+                "Предложение": str(self.offer.value).strip(),
+                "Причина": str(self.reason.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        owner = interaction.guild.get_member(int(req["owner_id"])) if interaction.guild else None
+        if owner:
+            try:
+                await owner.send(
+                    content=f"📩 Новое предложение о покупке вашей компании **{company.get('name')}** от {interaction.user.mention}",
+                    embed=build_company_request_embed(req),
+                    view=CompanyOwnerDecisionView(str(req_id)),
+                )
+            except Exception:
+                pass
+
+        await interaction.response.send_message("✅ Предложение отправлено владельцу компании в ЛС.", ephemeral=True)
+
+
+class CompanySellModal(Modal):
+    def __init__(self):
+        super().__init__(title="Продать компанию", timeout=600)
+        self.company_id = TextInput(label="ID компании", required=True, max_length=20)
+        self.buyer_id = TextInput(label="ID покупателя", required=True, max_length=30)
+        self.post_url = TextInput(label="Пост", required=True, max_length=400)
+        self.price = TextInput(label="Цена продажи", required=True, max_length=100)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        for item in (self.company_id, self.buyer_id, self.post_url, self.price, self.reason):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        owner_id = str(interaction.user.id)
+        company = companies_data.setdefault("companies", {}).get(str(self.company_id.value).strip())
+        if not company or str(company.get("owner_id")) != owner_id:
+            await interaction.response.send_message("❌ Вы не владелец указанной компании.", ephemeral=True)
+            return
+
+        buyer_id = str(self.buyer_id.value).strip().replace("<@", "").replace(">", "").replace("!", "")
+        if not buyer_id.isdigit() or not is_registered_player(buyer_id):
+            await interaction.response.send_message("❌ Покупатель должен быть зарегистрированным игроком (ID).", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "sell",
+            "author_id": owner_id,
+            "buyer_id": buyer_id,
+            "company_id": str(self.company_id.value).strip(),
+            "status": "pending_moderation",
+            "status_text": "⏳ На рассмотрении модерации",
+            "payload": {
+                "Пост": str(self.post_url.value).strip(),
+                "Цена": str(self.price.value).strip(),
+                "Причина": str(self.reason.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        req_channel_id = companies_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if req_channel:
+            content = f"<@{owner_id}> <@{buyer_id}> " + (company_ping_roles_line(interaction.guild) or "")
+            msg = await req_channel.send(content=content.strip(), embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
+            req["request_channel_id"] = msg.channel.id
+            req["request_message_id"] = msg.id
+            save_companies_data()
+
+        await interaction.response.send_message("✅ Заявка на продажу отправлена в канал компаний.", ephemeral=True)
+
+
+class CompanyUpgradeModal(Modal):
+    def __init__(self):
+        super().__init__(title="Улучшить компанию", timeout=600)
+        self.company_id = TextInput(label="ID компании", required=True, max_length=20)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.invest = TextInput(label="Вклад денег", required=True, max_length=100)
+        for item in (self.company_id, self.post_url, self.invest):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        owner_id = str(interaction.user.id)
+        cid = str(self.company_id.value).strip()
+        company = companies_data.setdefault("companies", {}).get(cid)
+        if not company or str(company.get("owner_id")) != owner_id:
+            await interaction.response.send_message("❌ Вы не владелец указанной компании.", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "upgrade",
+            "author_id": owner_id,
+            "company_id": cid,
+            "status": "pending_moderation",
+            "status_text": "⏳ На рассмотрении модерации",
+            "payload": {
+                "Ссылка на пост": str(self.post_url.value).strip(),
+                "Вклад": str(self.invest.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        req_channel_id = companies_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if req_channel:
+            content = company_ping_roles_line(interaction.guild) or None
+            msg = await req_channel.send(content=content, embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
+            req["request_channel_id"] = msg.channel.id
+            req["request_message_id"] = msg.id
+            save_companies_data()
+
+        await interaction.response.send_message("✅ Заявка на улучшение отправлена.", ephemeral=True)
+
+
+class CompanyOwnerRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения предложения", timeout=300)
+        self.reason = TextInput(label="Причина", required=True, style=discord.TextStyle.paragraph, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req["status"] = "rejected_by_owner"
+        req["status_text"] = f"❌ Отклонено владельцем. Причина: {self.reason.value}"
+        req["owner_reason"] = str(self.reason.value).strip()
+        save_companies_data()
+        await interaction.response.send_message("✅ Предложение отклонено.", ephemeral=True)
+
+
+class CompanyOwnerDecisionView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    @discord.ui.button(label="✅ Принять", style=ButtonStyle.success, custom_id="company:owner_accept")
+    async def accept(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        if str(req.get("owner_id")) != str(interaction.user.id):
+            await interaction.response.send_message("❌ Только владелец может принять.", ephemeral=True)
+            return
+
+        req["status"] = "pending_moderation"
+        req["status_text"] = f"⏳ Владелец согласовал. Ожидает модерацию\nПартнер: {interaction.user.mention}"
+
+        req_channel_id = companies_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if req_channel:
+            content = f"<@{req.get('author_id')}> <@{req.get('owner_id')}> " + (company_ping_roles_line(interaction.guild) or "")
+            msg = await req_channel.send(content=content.strip(), embed=build_company_request_embed(req), view=CompanyReviewView(self.req_id))
+            req["request_channel_id"] = msg.channel.id
+            req["request_message_id"] = msg.id
+
+        save_companies_data()
+        await interaction.response.send_message("✅ Отправлено на модерацию компаний.", ephemeral=True)
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:owner_reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req or str(req.get("owner_id")) != str(interaction.user.id):
+            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CompanyOwnerRejectModal(self.req_id))
+
+
+class CompanyApplyChangesModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Изменения компании", timeout=600)
+        self.expense_amount = TextInput(label="1. Сменить сумму затрат", required=False, max_length=100, default="скип")
+        self.expense_cd = TextInput(label="2. Сменить кулдаун затрат", required=False, max_length=100, default="скип")
+        self.income_amount = TextInput(label="3. Сменить сумму дохода", required=False, max_length=100, default="скип")
+        self.income_cd = TextInput(label="4. Сменить кулдаун дохода", required=False, max_length=100, default="скип")
+        self.min_value = TextInput(label="5. Сменить минимальную стоимость", required=False, max_length=100, default="скип")
+        for i in (self.expense_amount, self.expense_cd, self.income_amount, self.income_cd, self.min_value):
+            self.add_item(i)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        change_lines = []
+        req["review_changes"] = req.get("review_changes", {})
+        def _val(x):
+            return str(x.value).strip()
+
+        if _val(self.expense_amount).lower() != "скип":
+            req["review_changes"]["expense_amount"] = _val(self.expense_amount)
+            change_lines.append(f"Затраты: {_val(self.expense_amount)}")
+        if _val(self.expense_cd).lower() != "скип":
+            req["review_changes"]["expense_cooldown"] = _val(self.expense_cd)
+            change_lines.append(f"КД затрат: {_val(self.expense_cd)}")
+        if _val(self.income_amount).lower() != "скип":
+            req["review_changes"]["income_amount"] = _val(self.income_amount)
+            change_lines.append(f"Доход: {_val(self.income_amount)}")
+        if _val(self.income_cd).lower() != "скип":
+            req["review_changes"]["income_cooldown"] = _val(self.income_cd)
+            change_lines.append(f"КД дохода: {_val(self.income_cd)}")
+        if _val(self.min_value).lower() != "скип":
+            req["review_changes"]["min_value"] = _val(self.min_value)
+            change_lines.append(f"Минимальная стоимость: {_val(self.min_value)}")
+
+        req["status_text"] = "📝 Изменения подготовлены:\n" + ("\n".join(change_lines) if change_lines else "нет")
+        req["processed_by"] = str(interaction.user.id)
+        save_companies_data()
+        await interaction.response.send_message("✅ Изменения сохранены. Нажмите 'Подтвердить изменения'.", ephemeral=True)
+
+
+class CompanyRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения заявки компании", timeout=300)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req["status"] = "rejected"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.mention}\nПричина: {self.reason.value}"
+        save_companies_data()
+
+        result_channel_id = companies_data.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            await result_channel.send(content=f"<@{req.get('author_id')}>", embed=build_company_request_embed(req, color=0xE74C3C))
+        await interaction.response.edit_message(embed=build_company_request_embed(req, color=0xE74C3C), view=None)
+
+
+class CompanyReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator or has_custom_command_access(interaction.user, "компании"):
+            return True
+        await interaction.response.send_message("❌ Нет доступа к заявкам компаний.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="🛠 Подготовить изменения", style=ButtonStyle.primary, custom_id="company:prepare")
+    async def prepare(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(CompanyApplyChangesModal(self.req_id))
+
+    @discord.ui.button(label="✅ Подтвердить изменения", style=ButtonStyle.success, custom_id="company:approve")
+    async def approve(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        req_type = req.get("type")
+        payload = req.get("payload", {})
+        author_id = str(req.get("author_id"))
+        summary = []
+
+        if req_type == "create":
+            company_id = str(int(companies_data.get("next_company_id", 1)))
+            companies_data["next_company_id"] = int(company_id) + 1
+            founded = investments.get("rp_year", {}).get("year") or "—"
+            first_invest = parse_money_value(str(payload.get("Первый вклад", "0")), ensure_user(author_id).get("наличка", 0))
+            company = {
+                "id": company_id,
+                "owner_id": author_id,
+                "name": payload.get("Название", "Компания"),
+                "specialization": payload.get("Специализация", "—"),
+                "founded_year": founded,
+                "first_invest": int(first_invest),
+                "advert_level": 1,
+                "income_amount": str(max(100000, int(first_invest * 0.05) if first_invest > 0 else 100000)),
+                "income_cooldown": 3600,
+                "expense_amount": "0",
+                "expense_cooldown": 86400,
+                "min_value": int(first_invest),
+                "last_income_at": int(time.time()),
+                "last_expense_at": int(time.time()),
+                "created_at": int(time.time()),
+            }
+            update_company_derived_fields(company)
+            companies_data.setdefault("companies", {})[company_id] = company
+            summary.append(f"Создана компания ID {company_id}: {company.get('name')}")
+
+        elif req_type in ("buy", "sell"):
+            company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
+            if not company:
+                await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+                return
+
+            buyer_id = str(req.get("author_id")) if req_type == "buy" else str(req.get("buyer_id"))
+            seller_id = str(req.get("owner_id")) if req_type == "buy" else str(req.get("author_id"))
+            raw_price = payload.get("Предложение") if req_type == "buy" else payload.get("Цена")
+            price = parse_money_value(str(raw_price), ensure_user(buyer_id).get("наличка", 0))
+            if ensure_user(buyer_id).get("наличка", 0) < price:
+                await interaction.response.send_message("❌ У покупателя недостаточно средств.", ephemeral=True)
+                return
+            ensure_user(buyer_id)["наличка"] -= int(price)
+            ensure_user(seller_id)["наличка"] += int(price)
+            company["owner_id"] = buyer_id
+            update_company_derived_fields(company)
+            summary.append(f"Передана компания {company.get('name')} от <@{seller_id}> к <@{buyer_id}> за {price:,}")
+            save_json(BALANCES_FILE, balances)
+
+        elif req_type == "upgrade":
+            company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
+            if not company:
+                await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+                return
+            changes = req.get("review_changes", {})
+            if "expense_amount" in changes:
+                company["expense_amount"] = changes["expense_amount"]
+            if "expense_cooldown" in changes:
+                company["expense_cooldown"] = max(60, parse_interval(str(changes["expense_cooldown"])))
+            if "income_amount" in changes:
+                company["income_amount"] = changes["income_amount"]
+            if "income_cooldown" in changes:
+                company["income_cooldown"] = max(60, parse_interval(str(changes["income_cooldown"])))
+            if "min_value" in changes:
+                company["min_value"] = parse_money_value(str(changes["min_value"]), ensure_user(author_id).get("наличка", 0))
+            update_company_derived_fields(company)
+            summary.append("Обновлены параметры компании: " + (", ".join(changes.keys()) if changes else "без изменений"))
+
+        req["status"] = "approved"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.mention}"
+        req["summary"] = "\n".join(summary)
+        save_companies_data()
+
+        result_channel_id = companies_data.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            em = build_company_request_embed(req, color=0x2ECC71)
+            if summary:
+                em.add_field(name="Что поменялось", value="\n".join(summary), inline=False)
+            pings = [f"<@{req.get('author_id')}>"]
+            if req.get("owner_id"):
+                pings.append(f"<@{req.get('owner_id')}>")
+            if req.get("buyer_id"):
+                pings.append(f"<@{req.get('buyer_id')}>")
+            await result_channel.send(content=" ".join(sorted(set(pings))), embed=em)
+
+        await interaction.response.edit_message(embed=build_company_request_embed(req, color=0x2ECC71), view=None)
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(CompanyRejectModal(self.req_id))
+
+
+class CompanyActionsSelect(Select):
+    def __init__(self):
+        options = [
+            SelectOption(label="Создать новую компанию", value="create", emoji="🆕"),
+            SelectOption(label="Купить компанию", value="buy", emoji="🛒"),
+            SelectOption(label="Продать компанию", value="sell", emoji="💼"),
+            SelectOption(label="Улучшить компанию", value="upgrade", emoji="🛠"),
+        ]
+        super().__init__(placeholder="Действия с компаниями", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: Interaction):
+        v = self.values[0]
+        if v == "create":
+            await interaction.response.send_modal(CompanyCreateModal())
+        elif v == "buy":
+            await interaction.response.send_modal(CompanyBuyModal())
+        elif v == "sell":
+            await interaction.response.send_modal(CompanySellModal())
+        elif v == "upgrade":
+            await interaction.response.send_modal(CompanyUpgradeModal())
+
+
+class CompaniesMenuView(View):
+    def __init__(self, pages: list[Embed], author_id: int):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.author_id = author_id
+        self.index = 0
+        self.add_item(CompanyActionsSelect())
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это меню не для вас.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⬅️", style=ButtonStyle.gray)
+    async def prev(self, interaction: Interaction, button: Button):
+        if not self.pages:
+            await interaction.response.defer()
+            return
+        self.index = (self.index - 1) % len(self.pages)
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="➡️", style=ButtonStyle.gray)
+    async def next(self, interaction: Interaction, button: Button):
+        if not self.pages:
+            await interaction.response.defer()
+            return
+        self.index = (self.index + 1) % len(self.pages)
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+
+async def show_companies_menu(ctx, member: discord.Member):
+    user_id = str(member.id)
+    companies = [c for c in companies_data.setdefault("companies", {}).values() if str(c.get("owner_id")) == user_id]
+    if not companies:
+        em = Embed(title="🏢 Компании", description="У вас нет компаний. Используйте меню ниже: **Создать новую компанию**.", color=0x3498DB)
+        await ctx.send(embed=em, view=CompaniesMenuView([], member.id))
+        return
+
+    pages = [build_company_embed(c, i + 1, len(companies)) for i, c in enumerate(companies)]
+    await ctx.send(embed=pages[0], view=CompaniesMenuView(pages, member.id))
+
+
+@bot.command(name="компании")
+async def компании(ctx):
+    await show_companies_menu(ctx, ctx.author)
+
+
+@bot.command(name="заявкикомпаний")
+@commands.has_permissions(administrator=True)
+async def заявкикомпаний(ctx, channel: discord.TextChannel):
+    companies_data["requests_channel"] = channel.id
+    save_companies_data()
+    await ctx.send(embed=Embed(title="✅ Канал заявок компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="итогикомпанийканал")
+@commands.has_permissions(administrator=True)
+async def итогикомпанийканал(ctx, channel: discord.TextChannel):
+    companies_data["result_channel"] = channel.id
+    save_companies_data()
+    await ctx.send(embed=Embed(title="✅ Канал итогов компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+
+
 class RatingModal(Modal):
     def __init__(self, target_id: str):
         self.target_id = str(target_id)
@@ -9186,6 +9855,55 @@ async def auto_role_income_loop():
             save_investments()
         if balances_changed:
             save_json(BALANCES_FILE, balances)
+
+        # Автоначисление компаний
+        comp_changed = False
+        balances_changed_comp = False
+        now_comp = int(time.time())
+        for company in companies_data.setdefault("companies", {}).values():
+            owner_id = str(company.get("owner_id") or "")
+            if not owner_id:
+                continue
+            update_company_derived_fields(company)
+            user = ensure_user(owner_id)
+
+            income_cd = max(60, int(company.get("income_cooldown", 3600)))
+            last_income = int(company.get("last_income_at", now_comp))
+            if now_comp - last_income >= income_cd:
+                cycles = (now_comp - last_income) // income_cd
+                income_raw = str(company.get("income_amount", "0"))
+                for _ in range(max(0, cycles)):
+                    try:
+                        inc = parse_money_value(income_raw, int(user.get("наличка", 0)))
+                    except Exception:
+                        inc = 0
+                    if inc:
+                        user["наличка"] = int(user.get("наличка", 0)) + int(inc)
+                        balances_changed_comp = True
+                company["last_income_at"] = last_income + cycles * income_cd
+                comp_changed = True
+
+            expense_cd = max(60, int(company.get("expense_cooldown", 86400)))
+            last_expense = int(company.get("last_expense_at", now_comp))
+            if now_comp - last_expense >= expense_cd:
+                cycles = (now_comp - last_expense) // expense_cd
+                expense_raw = str(company.get("expense_amount", "0"))
+                for _ in range(max(0, cycles)):
+                    try:
+                        exp = parse_money_value(expense_raw, int(user.get("наличка", 0)))
+                    except Exception:
+                        exp = 0
+                    if exp:
+                        user["наличка"] = int(user.get("наличка", 0)) - int(exp)
+                        balances_changed_comp = True
+                company["last_expense_at"] = last_expense + cycles * expense_cd
+                comp_changed = True
+
+        if comp_changed:
+            save_companies_data()
+        if balances_changed_comp:
+            save_json(BALANCES_FILE, balances)
+
 
         status_until = settings.get("status_until")
         if status_until is not None and int(time.time()) >= int(status_until):
