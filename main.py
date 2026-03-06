@@ -163,7 +163,24 @@ reg_settings = load_json(
     },
 )
 player_state = load_json(PLAYER_STATE_FILE, {"users": {}})
-investments = load_json(INVESTMENTS_FILE, {"users": {}})
+investments = load_json(
+    INVESTMENTS_FILE,
+    {
+        "requests": {},
+        "next_id": 1,
+        "panel_channel": None,
+        "requests_channel": None,
+        "result_channel": None,
+        "active_investments": {},
+        "rp_year": {
+            "channel_id": None,
+            "message_id": None,
+            "year": None,
+            "cooldown": 86400,
+            "next_tick_at": None,
+        },
+    },
+)
 moderation_data = load_json(
     MODERATION_FILE,
     {"log_channel": None, "warns": {}, "warn_limit": {"count": 3, "action": "мут 1ч"}},
@@ -236,6 +253,19 @@ reg_settings.setdefault("roles_remove", [])
 reg_settings.setdefault("wipe_roles", [])
 reg_settings.setdefault("wipe_role_exclusions", [])
 server_inventory.setdefault("users", {})
+investments.setdefault("requests", {})
+investments.setdefault("next_id", 1)
+investments.setdefault("panel_channel", None)
+investments.setdefault("requests_channel", None)
+investments.setdefault("result_channel", None)
+investments.setdefault("active_investments", {})
+investments.setdefault("rp_year", {})
+investments["rp_year"].setdefault("channel_id", None)
+investments["rp_year"].setdefault("message_id", None)
+investments["rp_year"].setdefault("year", None)
+investments["rp_year"].setdefault("cooldown", 86400)
+investments["rp_year"].setdefault("next_tick_at", None)
+investments.setdefault("users", {})
 
 items_data.setdefault("categories", {}).setdefault("1", "Гражданские")
 items_data.setdefault("categories", {}).setdefault("2", "Военные")
@@ -562,33 +592,37 @@ def ensure_investments(user_id: str):
     return investments.setdefault("users", {}).setdefault(user_id, [])
 
 
+def get_active_investments_for_user(user_id: str):
+    result = []
+    for inv_id, inv in investments.setdefault("active_investments", {}).items():
+        if str(inv.get("user_id")) == str(user_id):
+            result.append((str(inv_id), inv))
+    return result
+
+
 def save_investments():
     save_json(INVESTMENTS_FILE, investments)
 
 
-INVESTMENT_BANKS = {
-    "alta-bank": {
-        "name": "Alta-Bank",
-        "cost": 100_000_000,
-        "profit_pct": 5,
-        "delay_chance": 0.0,
-        "burn_chance": 0.0,
-    },
-    "neo-bank": {
-        "name": "Neo-Bank",
-        "cost": 150_000_000,
-        "profit_pct": 10,
-        "delay_chance": 0.5,
-        "burn_chance": 0.0,
-    },
-    "fantom-bank": {
-        "name": "Fantom-Bank",
-        "cost": 170_000_000,
-        "profit_pct": 25,
-        "delay_chance": 0.0,
-        "burn_chance": 0.4,
-    },
-}
+def format_rp_year_embed(year: int, quarter_index: int):
+    seasons = [
+        ("🌱 Весна", 0x55AA55, "Рост, обновление и новые возможности."),
+        ("☀️ Лето", 0xF1C40F, "Пик активности, энергии и побед."),
+        ("🍂 Осень", 0xE67E22, "Время зрелых решений и результатов."),
+        ("❄️ Зима", 0x5DADE2, "Пауза, переоценка и подготовка к рывку."),
+    ]
+    season_name, color, mood = seasons[max(0, min(3, int(quarter_index)))]
+    em = Embed(
+        title="🗓 RP-календарь",
+        description=(
+            f"**Игровой год:** {int(year)}\n"
+            f"**Пора года:** {season_name}\n\n"
+            f"{mood}"
+        ),
+        color=color,
+    )
+    em.set_footer(text="Сообщение обновляется автоматически, не создавая новые посты.")
+    return em
 
 
 def get_population_growth_percent(happiness: int) -> int:
@@ -840,32 +874,16 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
                 pass
 
 
-def ensure_investment_items():
-    changed = False
-    templates = [
-        ("Alta-Bank", 100_000_000, "Безрисковый банк: +5%/сутки."),
-        ("Neo-Bank", 150_000_000, "+10%/сутки, 50% шанс задержки вывода на сутки."),
-        ("Fantom-Bank", 170_000_000, "+25%/сутки, 40% шанс полного сгорания."),
-    ]
-    for key, price, desc in templates:
-        if key not in items_data.setdefault("items", {}):
-            items_data["items"][key] = {
-                "key": key,
-                "price": price,
-                "description": desc,
-                "category": "3",
-                "stock": -1,
-                "expires_at": None,
-                "require_roles": [],
-                "give_roles": [],
-                "remove_roles": [],
-                "use_text": "🏦 Инвестиционный банк куплен.",
-                "created_at": int(time.time()),
-            }
-            changed = True
-    if changed:
-        save_items()
 
+
+def remove_legacy_investment_banks():
+    removed = False
+    for key in ["Alta-Bank", "Neo-Bank", "Fantom-Bank"]:
+        if key in items_data.setdefault("items", {}):
+            items_data["items"].pop(key, None)
+            removed = True
+    if removed:
+        save_items()
 
 def ensure_alta_box_item():
     key = "Альта бокс"
@@ -1078,12 +1096,13 @@ async def on_ready():
     global persistent_views_registered
 
     print(f"Бот запущен как {bot.user}")
-    ensure_investment_items()
+    remove_legacy_investment_banks()
     ensure_alta_box_item()
     if not persistent_views_registered:
         bot.add_view(RatingsPanelView())
         bot.add_view(VerdictPanelView())
         bot.add_view(PartnershipPanelView())
+        bot.add_view(InvestmentPanelView())
         persistent_views_registered = True
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
@@ -1484,11 +1503,14 @@ async def on_command_error(ctx, error):
             "сеттикет": "!сеттикет",
             "тикетотправить": "!тикетотправить #канал",
             "удалитьтикет": "!удалитьтикет <ID или название>",
-            "инвестировать": "!инвестировать 5000 Alta-Bank",
             "списоксезонов": "!списоксезонов",
             "тайнканал": "!тайнканал #канал",
             "рассылка": "!рассылка Текст объявления",
-            "кдгод": "!кдгод 24ч",
+            "кдгод": "!рпгодканал #канал 1939 24ч",
+            "рпгодканал": "!рпгодканал #канал 1939 24ч",
+            "заявкиинвестиций": "!заявкиинвестиций #канал",
+            "итогинвестицийканал": "!итогинвестицийканал #канал",
+            "податьинвестициюканал": "!податьинвестициюканал #канал",
             "мут": "!мут @игрок 4ч причина",
             "бан": "!бан @игрок - причина",
             "кик": "!кик @игрок - причина",
@@ -1600,6 +1622,7 @@ async def хелп(ctx):
             "заморозкарольудалить",
             "заморозкавывести",
             "кдгод",
+            "рпгодканал",
             "автоколлектканал",
             "грабеж",
             "грабежсейвроль",
@@ -1622,7 +1645,10 @@ async def хелп(ctx):
             "использовать",
             "выдать",
             "изъять",
-            "инвестировать",
+            "заявкиинвестиций",
+            "итогинвестицийканал",
+            "податьинвестициюканал",
+            "инвестиции",
             "продать",
             "продатьпредмет",
             "продатьроль",
@@ -1670,6 +1696,7 @@ async def хелп(ctx):
             "заявкипартнерокканал",
             "партнеркиканал",
             "партнерства",
+            "инвестиции",
             "рассылка",
         },
         "Регистрация / Страны": {
@@ -1714,7 +1741,7 @@ async def хелп(ctx):
         "пинг": "Проверка отклика бота.",
         "привет": "Короткое приветственное сообщение.",
         "хелп": "Открывает это меню помощи.",
-        "меню": "Открывает быстрое меню игрока (магазин, инвентарь, серверный инвентарь, профиль, сферы, вердикт, работа+коллект).",
+        "меню": "Открывает быстрое меню игрока (магазин, инвентарь, серверный инвентарь, профиль, сферы, вердикт, инвестиции, работа+коллект).",
         "баланс": "Показывает баланс игрока/роли.",
         "профиль": "Профиль игрока и его показатели.",
         "статистика": "Статистика сервера/игрока.",
@@ -1736,6 +1763,11 @@ async def хелп(ctx):
         "серверныйинвентарь": "Подарочные серверные предметы с таймером.",
         "партнерства": "Служебная команда для выдачи прав на модерацию партнерок.",
         "партнерство": "Алиас команды !партнерства для выдачи прав на модерацию партнерок.",
+        "инвестиции": "Служебная команда для выдачи прав на модерацию инвестиций.",
+        "податьинвестициюканал": "Отправляет панель подачи инвестиционной заявки в выбранный канал.",
+        "заявкиинвестиций": "Устанавливает канал, куда отправляются заявки инвестиций.",
+        "итогинвестицийканал": "Устанавливает канал итогов по инвестиционным заявкам.",
+        "рпгодканал": "Настраивает канал RP-года, стартовый год и авто-обновление по КД.",
         "податьпартнеркуканал": "Отправляет панель с кнопкой подачи партнерки в выбранный канал.",
         "заявкипартнерокканал": "Устанавливает канал, куда отправляются заявки партнерок.",
         "партнеркиканал": "Устанавливает канал публикации принятых партнерок.",
@@ -1940,6 +1972,12 @@ async def меню(ctx):
                     description="Отправить заявку на вердикт",
                 ),
                 SelectOption(
+                    label="Инвестиции",
+                    value="investments",
+                    emoji="📈",
+                    description="Подать заявку на инвестицию",
+                ),
+                SelectOption(
                     label="Собрать: работа + коллект",
                     value="collect",
                     emoji="💰",
@@ -1958,6 +1996,9 @@ async def меню(ctx):
 
             if selected == "verdict":
                 await interaction.response.send_modal(VerdictRequestModal())
+                return
+            if selected == "investments":
+                await interaction.response.send_modal(InvestmentRequestModal())
                 return
 
             await interaction.response.defer(ephemeral=True)
@@ -5830,6 +5871,266 @@ async def партнеркиканал(ctx, channel: discord.TextChannel):
     )
 
 
+
+
+def investment_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("инвестиции")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+def build_investment_request_embed(req: dict, status_text: str | None = None, color=0x3498DB):
+    text = status_text or req.get("status_text") or "⏳ На рассмотрении"
+    em = Embed(title=f"📈 Заявка на инвестицию #{req.get('id')}", color=color)
+    em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
+    em.add_field(name="Ссылка на пост", value=req.get("post_url") or "—", inline=False)
+    em.add_field(name="Краткое описание", value=req.get("description") or "—", inline=False)
+    em.add_field(name="Сумма инвестиций", value=req.get("amount") or "—", inline=False)
+    em.add_field(name="Статус", value=text, inline=False)
+    return em
+
+
+class InvestmentActionModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Оформить инвестицию", timeout=600)
+        self.inv_description = TextInput(label="Описание инвестиций", style=discord.TextStyle.paragraph, required=True, max_length=1200)
+        self.profit = TextInput(label="Сумма/% прибыли", required=True, max_length=100)
+        self.start_year = TextInput(label='Начало начисления прибыли: "год" или "скип"', required=True, default="скип", max_length=64)
+        self.cooldown = TextInput(label="Кулдаун прибыли", required=True, default="24ч", max_length=64)
+        self.duration = TextInput(label="Сколько действует инвестиция", required=True, default="7д", max_length=64)
+        self.add_item(self.inv_description)
+        self.add_item(self.profit)
+        self.add_item(self.start_year)
+        self.add_item(self.cooldown)
+        self.add_item(self.duration)
+
+    async def on_submit(self, interaction: Interaction):
+        req = investments.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        now_ts = int(time.time())
+        try:
+            cooldown_secs = max(60, parse_interval(str(self.cooldown.value).strip()))
+            duration_secs = max(60, parse_interval(str(self.duration.value).strip()))
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный формат времени: {e}", ephemeral=True)
+            return
+
+        start_raw = str(self.start_year.value).strip().lower()
+        pending_year = None
+        start_at = now_ts
+        if start_raw != "скип":
+            try:
+                pending_year = int(start_raw)
+            except Exception:
+                await interaction.response.send_message("❌ Укажите игровой год числом или `скип`.", ephemeral=True)
+                return
+            start_at = now_ts + cooldown_secs
+
+        inv_id = str(int(time.time() * 1000))
+        active = {
+            "id": inv_id,
+            "request_id": self.req_id,
+            "user_id": str(req.get("author_id")),
+            "description": str(self.inv_description.value).strip(),
+            "payout": str(self.profit.value).strip(),
+            "cooldown": int(cooldown_secs),
+            "duration": int(duration_secs),
+            "start_at": int(start_at),
+            "next_at": int(start_at),
+            "expires_at": int(start_at + duration_secs),
+            "created_by": str(interaction.user.id),
+            "status": "pending_year" if pending_year is not None else "active",
+            "pending_year": pending_year,
+            "created_at": now_ts,
+        }
+        investments.setdefault("active_investments", {})[inv_id] = active
+
+        req["status"] = "approved"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"✅ Одобрено\nЭкономист: {interaction.user.mention}"
+        req["investment_id"] = inv_id
+        save_investments()
+
+        result_channel_id = investments.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        start_text = (
+            f"с игрового года **{pending_year}**"
+            if pending_year is not None
+            else "сразу"
+        )
+        result_embed = Embed(title=f"✅ Инвестиция одобрена #{self.req_id}", color=0x00FF00)
+        result_embed.add_field(name="Автор заявки", value=f"<@{req.get('author_id')}>", inline=False)
+        result_embed.add_field(name="Описание инвестиций", value=active["description"], inline=False)
+        result_embed.add_field(name="Прибыль", value=active["payout"], inline=True)
+        result_embed.add_field(name="Начало", value=start_text, inline=True)
+        result_embed.add_field(name="Кулдаун", value=format_interval(cooldown_secs), inline=True)
+        result_embed.add_field(name="Срок действия", value=format_interval(duration_secs), inline=True)
+        result_embed.add_field(name="Рассмотрел", value=interaction.user.mention, inline=True)
+        if result_channel:
+            await result_channel.send(content=f"<@{req.get('author_id')}>", embed=result_embed)
+
+        await interaction.response.edit_message(
+            embed=build_investment_request_embed(req, status_text=req["status_text"], color=discord.Color.green().value),
+            view=None,
+        )
+
+
+class InvestmentRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения инвестиции", timeout=300)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = investments.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        reason = str(self.reason.value).strip()
+        req["status"] = "rejected"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"❌ Отклонено\nЭкономист: {interaction.user.mention}\nПричина: {reason}"
+        req["reject_reason"] = reason
+        save_investments()
+
+        result_channel_id = investments.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            await result_channel.send(
+                content=f"<@{req.get('author_id')}>",
+                embed=Embed(
+                    title=f"❌ Инвестиция отклонена #{self.req_id}",
+                    description=f"**Причина:** {reason}",
+                    color=0xFF0000,
+                ),
+            )
+
+        await interaction.response.edit_message(
+            embed=build_investment_request_embed(req, status_text=req["status_text"], color=discord.Color.red().value),
+            view=None,
+        )
+
+
+class InvestmentReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if has_custom_command_access(interaction.user, "инвестиции"):
+            return True
+        await interaction.response.send_message("❌ Нет доступа к заявкам инвестиций.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="✅ Принять", style=ButtonStyle.success, custom_id="investment:approve")
+    async def approve(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(InvestmentActionModal(self.req_id))
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="investment:reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(InvestmentRejectModal(self.req_id))
+
+
+class InvestmentRequestModal(Modal):
+    def __init__(self):
+        super().__init__(title="Заявка на инвестицию", timeout=600)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.description = TextInput(label="Краткое описание", style=discord.TextStyle.paragraph, required=True, max_length=1200)
+        self.amount = TextInput(label="Сумма инвестиций", required=True, max_length=100)
+        self.add_item(self.post_url)
+        self.add_item(self.description)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: Interaction):
+        req_id = int(investments.get("next_id", 1))
+        investments["next_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "author_id": str(interaction.user.id),
+            "post_url": str(self.post_url.value).strip(),
+            "description": str(self.description.value).strip(),
+            "amount": str(self.amount.value).strip(),
+            "status": "pending",
+            "status_text": "⏳ На рассмотрении",
+            "created_at": int(time.time()),
+        }
+        investments.setdefault("requests", {})[str(req_id)] = req
+        save_investments()
+
+        req_channel_id = investments.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if not req_channel:
+            await interaction.response.send_message("❌ Канал заявок инвестиций не настроен (`!заявкиинвестиций`).", ephemeral=True)
+            return
+
+        content = investment_ping_roles_line(interaction.guild) or None
+        msg = await req_channel.send(content=content, embed=build_investment_request_embed(req), view=InvestmentReviewView(str(req_id)))
+        req["request_channel_id"] = msg.channel.id
+        req["request_message_id"] = msg.id
+        save_investments()
+        await interaction.response.send_message(f"✅ Заявка #{req_id} отправлена.", ephemeral=True)
+
+
+class InvestmentPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Подать инвестицию", style=ButtonStyle.primary, custom_id="investment:request")
+    async def request(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(InvestmentRequestModal())
+
+
+@bot.command(name="инвестиции")
+async def инвестиции(ctx):
+    await ctx.send(
+        embed=Embed(
+            title="ℹ️ Инвестиции",
+            description="Служебная команда для настройки прав. Используйте `!разрешить @роль инвестиции`.",
+            color=0x3498DB,
+        )
+    )
+
+
+@bot.command(name="податьинвестициюканал")
+@commands.has_permissions(administrator=True)
+async def податьинвестициюканал(ctx, channel: discord.TextChannel):
+    investments["panel_channel"] = channel.id
+    save_investments()
+    em = Embed(
+        title="📈 Инвестиционные заявки",
+        description="Нажмите кнопку ниже, чтобы подать заявку на инвестицию.",
+        color=0x3498DB,
+    )
+    await channel.send(embed=em, view=InvestmentPanelView())
+    await ctx.send(embed=Embed(title="✅ Канал панели инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="заявкиинвестиций")
+@commands.has_permissions(administrator=True)
+async def заявкиинвестиций(ctx, channel: discord.TextChannel):
+    investments["requests_channel"] = channel.id
+    save_investments()
+    await ctx.send(embed=Embed(title="✅ Канал заявок инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="итогинвестицийканал")
+@commands.has_permissions(administrator=True)
+async def итогинвестицийканал(ctx, channel: discord.TextChannel):
+    investments["result_channel"] = channel.id
+    save_investments()
+    await ctx.send(embed=Embed(title="✅ Канал итогов инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
 class RatingModal(Modal):
     def __init__(self, target_id: str):
         self.target_id = str(target_id)
@@ -7637,39 +7938,60 @@ async def коллект(ctx):
 
     investment_profit_total = 0
     investment_lines = []
-    invs = ensure_investments(user_id)
     now_ts = int(time.time())
-    for inv in invs:
-        if inv.get("status") != "active":
+    active_map = investments.setdefault("active_investments", {})
+    inv_changed = False
+    for inv_id, inv in list(get_active_investments_for_user(user_id)):
+        status = str(inv.get("status", "active"))
+        if status != "active":
             continue
-        bank_key = inv.get("bank", "")
-        bank_cfg = INVESTMENT_BANKS.get(bank_key, {})
-        bank_name = inv.get("bank_name", bank_cfg.get("name", "Банк"))
-        next_at = int(inv.get("next_at", now_ts))
-        amount_inv = int(inv.get("amount", 0))
-        if now_ts < next_at:
+
+        start_at = int(inv.get("start_at", now_ts))
+        if now_ts < start_at:
             investment_lines.append(
-                f"• Вывод с {bank_name}: через {format_seconds_left(next_at - now_ts)}"
+                f"• {inv.get('description', 'Инвестиция')}: старт через {format_seconds_left(start_at - now_ts)}"
             )
             continue
 
-        if bank_key == "neo-bank" and random.random() < float(
-            bank_cfg.get("delay_chance", 0)
-        ):
-            inv["next_at"] = now_ts + 86400
-            investment_lines.append(f"• Инвестиция с {bank_name} задержана на сутки")
-            continue
-        if bank_key == "fantom-bank" and random.random() < float(
-            bank_cfg.get("burn_chance", 0)
-        ):
-            inv["status"] = "burned"
-            investment_lines.append(f"• {bank_name} вас обманул, инвестиция сгорела")
+        expires_at = inv.get("expires_at")
+        if expires_at is not None and now_ts >= int(expires_at):
+            inv["status"] = "expired"
+            active_map[str(inv_id)] = inv
+            inv_changed = True
+            investment_lines.append(
+                f"• {inv.get('description', 'Инвестиция')}: срок действия завершён"
+            )
             continue
 
-        profit = int(round(amount_inv * float(bank_cfg.get("profit_pct", 0)) / 100.0))
-        investment_profit_total += profit
-        inv["next_at"] = now_ts + 86400
-        investment_lines.append(f"• Вывод с {bank_name}: +{fmt_money(profit)}")
+        cooldown = max(60, int(inv.get("cooldown", 3600)))
+        next_at = int(inv.get("next_at", start_at))
+        if now_ts < next_at:
+            investment_lines.append(
+                f"• {inv.get('description', 'Инвестиция')}: выплата через {format_seconds_left(next_at - now_ts)}"
+            )
+            continue
+
+        cycles = max(1, (now_ts - next_at) // cooldown + 1)
+        base_cash = int(user.get("наличка", 0))
+        try:
+            per_cycle = parse_money_value(str(inv.get("payout", 0)), base_cash)
+        except Exception:
+            per_cycle = 0
+
+        if per_cycle <= 0:
+            inv["next_at"] = next_at + cycles * cooldown
+            active_map[str(inv_id)] = inv
+            inv_changed = True
+            continue
+
+        total_profit = per_cycle * cycles
+        investment_profit_total += total_profit
+        inv["next_at"] = next_at + cycles * cooldown
+        active_map[str(inv_id)] = inv
+        inv_changed = True
+        investment_lines.append(
+            f"• {inv.get('description', 'Инвестиция')}: +{fmt_money(total_profit)}"
+        )
 
     gross_income_pool = max(0, total_earned) + max(0, investment_profit_total)
     frozen_added, freeze_lines, _ = apply_freeze_roles_for_member(
@@ -7680,7 +8002,8 @@ async def коллект(ctx):
 
     save_json(BALANCES_FILE, balances)
     save_json(ROLE_INCOME_FILE, role_income)
-    save_investments()
+    if inv_changed:
+        save_investments()
 
     if not collected_roles and not freeze_lines and not investment_lines:
         if cooldown_wait:
@@ -8197,37 +8520,46 @@ async def заморозкавывести(ctx, member: discord.Member, amount: 
     )
 
 
-@bot.command(name="кдгод")
+@bot.command(name="рпгодканал", aliases=["кдгод"])
 @commands.has_permissions(administrator=True)
-async def кдгод(ctx, duration: str):
+async def рпгодканал(ctx, channel: discord.TextChannel, year: int, cooldown: str):
     try:
-        secs = parse_interval(duration)
+        secs = parse_interval(cooldown)
     except Exception as e:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description=f"Неверный формат времени: {e}",
-                color=0xFF0000,
-            )
-        )
+        await ctx.send(embed=Embed(title="❌ Ошибка", description=f"Неверный формат времени: {e}", color=0xFF0000))
         return
 
     if secs < 60:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description="Минимальный интервал — 60 секунд.",
-                color=0xFF0000,
-            )
-        )
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Минимальный интервал — 60 секунд.", color=0xFF0000))
         return
 
-    settings["happiness_tick_seconds"] = int(secs)
-    save_json(SETTINGS_FILE, settings)
+    now_ts = int(time.time())
+    rp = investments.setdefault("rp_year", {})
+    rp["channel_id"] = channel.id
+    rp["year"] = int(year)
+    rp["cooldown"] = int(secs)
+    rp["next_tick_at"] = now_ts + int(secs)
+
+    msg = None
+    old_msg_id = rp.get("message_id")
+    if old_msg_id:
+        try:
+            msg = await channel.fetch_message(int(old_msg_id))
+        except Exception:
+            msg = None
+    quarter = int(((int(secs) - max(0, rp["next_tick_at"] - now_ts)) * 4) / int(secs)) % 4
+    em = format_rp_year_embed(int(year), quarter)
+    if msg:
+        await msg.edit(embed=em)
+    else:
+        sent = await channel.send(embed=em)
+        rp["message_id"] = sent.id
+
+    save_investments()
     await ctx.send(
         embed=Embed(
-            title="✅ КД счастья обновлён",
-            description=f"Автоснятие счастья теперь происходит раз в **{format_interval(secs)}**.",
+            title="✅ RP-год настроен",
+            description=f"Канал: {channel.mention}\nГод: **{year}**\nКД года: **{format_interval(secs)}**",
             color=0x00FF00,
         )
     )
@@ -8809,6 +9141,64 @@ async def auto_role_income_loop():
                 await bot.change_presence(activity=None)
             except Exception:
                 pass
+
+        # RP-год: автоматическое обновление одного сообщения + триггер инвестиций по году
+        rp = investments.setdefault("rp_year", {})
+        rp_channel_id = rp.get("channel_id")
+        rp_year = rp.get("year")
+        rp_cooldown = max(60, int(rp.get("cooldown", 86400)))
+        next_tick_at = rp.get("next_tick_at")
+        if rp_channel_id and rp_year is not None:
+            rp_channel = guild.get_channel(int(rp_channel_id))
+            if rp_channel:
+                now_rp = int(time.time())
+                if next_tick_at is None:
+                    rp["next_tick_at"] = now_rp + rp_cooldown
+                    next_tick_at = rp["next_tick_at"]
+
+                progressed_year = False
+                while now_rp >= int(next_tick_at):
+                    rp_year = int(rp.get("year", rp_year)) + 1
+                    rp["year"] = rp_year
+                    next_tick_at = int(next_tick_at) + rp_cooldown
+                    rp["next_tick_at"] = next_tick_at
+                    progressed_year = True
+
+                    for inv_id, inv in investments.setdefault("active_investments", {}).items():
+                        if str(inv.get("status")) != "pending_year":
+                            continue
+                        pending_year = inv.get("pending_year")
+                        if pending_year is not None and int(pending_year) <= rp_year:
+                            inv["status"] = "active"
+                            inv["start_at"] = now_rp
+                            inv["next_at"] = now_rp
+                            inv["expires_at"] = now_rp + int(inv.get("duration", rp_cooldown))
+                            investments["active_investments"][str(inv_id)] = inv
+
+                elapsed = max(0, rp_cooldown - max(0, int(next_tick_at) - now_rp))
+                quarter = int((elapsed * 4) / rp_cooldown) % 4
+                em = format_rp_year_embed(int(rp.get("year", rp_year)), quarter)
+                msg = None
+                msg_id = rp.get("message_id")
+                if msg_id:
+                    try:
+                        msg = await rp_channel.fetch_message(int(msg_id))
+                    except Exception:
+                        msg = None
+                if msg:
+                    try:
+                        await msg.edit(embed=em)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        sent = await rp_channel.send(embed=em)
+                        rp["message_id"] = sent.id
+                    except Exception:
+                        pass
+
+                if progressed_year:
+                    save_investments()
 
         # Счастье / население / содержание войск (каждые 12ч)
         pop = load_json(POPULATION_FILE, {})
@@ -9540,108 +9930,15 @@ async def купить(ctx, количество: int, *, item_key: str):
 
 
 @bot.command(name="инвестировать")
-async def инвестировать(ctx, сумма: int, *, bank_name: str):
-    user_id = str(ctx.author.id)
-    user = ensure_user(user_id)
-
-    if сумма <= 0:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description="Сумма инвестиции должна быть больше нуля.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    matches = resolve_item_key(bank_name)
-    bank_matches = [m for m in matches if m.lower() in INVESTMENT_BANKS]
-
-    if not bank_matches:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description="Банк не найден. Доступно: **Alta-Bank**, **Neo-Bank**, **Fantom-Bank**.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    selected_key = bank_matches[0]
-    if len(bank_matches) > 1:
-        options = "\n".join(
-            f"{i+1} — {name}" for i, name in enumerate(bank_matches[:10])
-        )
-        await ctx.send(
-            embed=Embed(
-                title="🔎 Найдены совпадения",
-                description=f"Уточните номер банка:\n{options}",
-                color=0x3498DB,
-            )
-        )
-
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
-
-        try:
-            msg = await bot.wait_for("message", check=check, timeout=60)
-            idx = int(msg.content.strip()) - 1
-            selected_key = bank_matches[idx]
-        except Exception:
-            await ctx.send(
-                embed=Embed(
-                    title="❌ Ошибка",
-                    description="Не удалось выбрать банк по номеру.",
-                    color=0xFF0000,
-                )
-            )
-            return
-
-    user_items = inventory.get(user_id, {})
-    if int(user_items.get(selected_key, 0)) <= 0:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Нет банка",
-                description=f"Для инвестирования в **{selected_key}** у вас должен быть хотя бы **1 × {selected_key}** в инвентаре.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    if get_available_cash(user) < сумма:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Недостаточно средств",
-                description=f"Для инвестирования нужно **{сумма} {currency}**, а доступно **{get_available_cash(user)} {currency}**.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    user["наличка"] -= сумма
-    cfg = INVESTMENT_BANKS[selected_key.lower()]
-    ensure_investments(user_id).append(
-        {
-            "bank": selected_key.lower(),
-            "bank_name": cfg["name"],
-            "amount": сумма,
-            "next_at": int(time.time()) + 86400,
-            "status": "active",
-        }
-    )
-
-    save_json(BALANCES_FILE, balances)
-    save_investments()
-
+async def инвестировать(ctx, *args):
     await ctx.send(
         embed=Embed(
-            title="🏦 Инвестиция оформлена",
+            title="ℹ️ Система обновлена",
             description=(
-                f"{ctx.author.mention}, вы инвестировали **{сумма} {currency}** в **{selected_key}**.\n"
-                f"Банк не расходуется: требуется только наличие **1 × {selected_key}**.\n"
-                f"Результат будет доступен через **24ч** в команде `!коллект`."
+                "Старая система банковых инвестиций отключена.\n"
+                "Используйте новую форму через меню или панель инвестиций."
             ),
-            color=0x00FF00,
+            color=0x3498DB,
         )
     )
 
