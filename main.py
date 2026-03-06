@@ -7936,76 +7936,17 @@ async def коллект(ctx):
         collected_roles.append((role.mention, amount))
         role_income.setdefault("last_claim", {}).setdefault(user_id, {})[rid] = now
 
-    investment_profit_total = 0
-    investment_lines = []
-    now_ts = int(time.time())
-    active_map = investments.setdefault("active_investments", {})
-    inv_changed = False
-    for inv_id, inv in list(get_active_investments_for_user(user_id)):
-        status = str(inv.get("status", "active"))
-        if status != "active":
-            continue
-
-        start_at = int(inv.get("start_at", now_ts))
-        if now_ts < start_at:
-            investment_lines.append(
-                f"• {inv.get('description', 'Инвестиция')}: старт через {format_seconds_left(start_at - now_ts)}"
-            )
-            continue
-
-        expires_at = inv.get("expires_at")
-        if expires_at is not None and now_ts >= int(expires_at):
-            inv["status"] = "expired"
-            active_map[str(inv_id)] = inv
-            inv_changed = True
-            investment_lines.append(
-                f"• {inv.get('description', 'Инвестиция')}: срок действия завершён"
-            )
-            continue
-
-        cooldown = max(60, int(inv.get("cooldown", 3600)))
-        next_at = int(inv.get("next_at", start_at))
-        if now_ts < next_at:
-            investment_lines.append(
-                f"• {inv.get('description', 'Инвестиция')}: выплата через {format_seconds_left(next_at - now_ts)}"
-            )
-            continue
-
-        cycles = max(1, (now_ts - next_at) // cooldown + 1)
-        base_cash = int(user.get("наличка", 0))
-        try:
-            per_cycle = parse_money_value(str(inv.get("payout", 0)), base_cash)
-        except Exception:
-            per_cycle = 0
-
-        if per_cycle <= 0:
-            inv["next_at"] = next_at + cycles * cooldown
-            active_map[str(inv_id)] = inv
-            inv_changed = True
-            continue
-
-        total_profit = per_cycle * cycles
-        investment_profit_total += total_profit
-        inv["next_at"] = next_at + cycles * cooldown
-        active_map[str(inv_id)] = inv
-        inv_changed = True
-        investment_lines.append(
-            f"• {inv.get('description', 'Инвестиция')}: +{fmt_money(total_profit)}"
-        )
-
-    gross_income_pool = max(0, total_earned) + max(0, investment_profit_total)
+    gross_income_pool = max(0, total_earned)
     frozen_added, freeze_lines, _ = apply_freeze_roles_for_member(
         ctx.guild, ctx.author, now, gross_income_pool
     )
-    final_cash_delta = total_earned + investment_profit_total - frozen_added
+    final_cash_delta = total_earned - frozen_added
     user["наличка"] += final_cash_delta
 
     save_json(BALANCES_FILE, balances)
     save_json(ROLE_INCOME_FILE, role_income)
-    if inv_changed:
-        save_investments()
 
-    if not collected_roles and not freeze_lines and not investment_lines:
+    if not collected_roles and not freeze_lines:
         if cooldown_wait:
             wait_lines = "\n".join(
                 f"• {role_mention}: через {format_seconds_left(left)}"
@@ -8048,8 +7989,6 @@ async def коллект(ctx):
     if freeze_lines:
         desc += f"\n\n**Заморозка средств:**\n" + "\n".join(freeze_lines)
         desc += f"\n\nИтого заморожено: **{fmt_money(frozen_added)}**"
-    if investment_lines:
-        desc += "\n\n**Инвестиции:**\n" + "\n".join(investment_lines)
 
     await ctx.send(
         embed=Embed(title="💰 Коллект выполнен", description=desc, color=0x00FF00)
@@ -9131,6 +9070,59 @@ async def auto_role_income_loop():
             save_json(BALANCES_FILE, balances)
             save_passive_flows()
 
+        # Автоначисление инвестиций (без ручного !коллект)
+        inv_changed = False
+        balances_changed = False
+        now_ts = int(time.time())
+        for inv_id, inv in list(investments.setdefault("active_investments", {}).items()):
+            status = str(inv.get("status", "active"))
+            if status != "active":
+                continue
+
+            user_id = str(inv.get("user_id") or "")
+            if not user_id:
+                continue
+
+            start_at = int(inv.get("start_at", now_ts))
+            if now_ts < start_at:
+                continue
+
+            expires_at = inv.get("expires_at")
+            if expires_at is not None and now_ts >= int(expires_at):
+                inv["status"] = "expired"
+                investments["active_investments"][str(inv_id)] = inv
+                inv_changed = True
+                continue
+
+            cooldown = max(60, int(inv.get("cooldown", 3600)))
+            next_at = int(inv.get("next_at", start_at))
+            if now_ts < next_at:
+                continue
+
+            cycles = max(1, (now_ts - next_at) // cooldown + 1)
+            user = ensure_user(user_id)
+            base_cash = int(user.get("наличка", 0))
+            try:
+                per_cycle = parse_money_value(str(inv.get("payout", 0)), base_cash)
+            except Exception:
+                per_cycle = 0
+
+            inv["next_at"] = next_at + cycles * cooldown
+            investments["active_investments"][str(inv_id)] = inv
+            inv_changed = True
+
+            if per_cycle <= 0:
+                continue
+
+            total_profit = per_cycle * cycles
+            user["наличка"] += total_profit
+            balances_changed = True
+
+        if inv_changed:
+            save_investments()
+        if balances_changed:
+            save_json(BALANCES_FILE, balances)
+
         status_until = settings.get("status_until")
         if status_until is not None and int(time.time()) >= int(status_until):
             settings["status_emoji"] = None
@@ -9925,20 +9917,6 @@ async def купить(ctx, количество: int, *, item_key: str):
             title=f"💰 Покупка успешна — {selected_key}",
             description=f"{ctx.author.mention}, вы приобрели **{количество} × {selected_key}** за **{total_price} {currency}**.\n{use_text}",
             color=0x00FF00,
-        )
-    )
-
-
-@bot.command(name="инвестировать")
-async def инвестировать(ctx, *args):
-    await ctx.send(
-        embed=Embed(
-            title="ℹ️ Система обновлена",
-            description=(
-                "Старая система банковых инвестиций отключена.\n"
-                "Используйте новую форму через меню или панель инвестиций."
-            ),
-            color=0x3498DB,
         )
     )
 
