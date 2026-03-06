@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import re
@@ -621,7 +622,6 @@ def format_rp_year_embed(year: int, quarter_index: int):
         ),
         color=color,
     )
-    em.set_footer(text="Сообщение обновляется автоматически, не создавая новые посты.")
     return em
 
 
@@ -5664,7 +5664,7 @@ class PartnershipReviewView(View):
                 color=0x2ECC71,
             )
             post.add_field(name="Жанр сервера", value=req.get("genre") or "—", inline=False)
-            post.add_field(name="От кого", value=f"<@{req.get('author_id')}>", inline=False)
+            post.add_field(name="Партнер", value=f"<@{req.get('author_id')}>", inline=False)
             await result_channel.send(embed=post)
 
         try:
@@ -5892,6 +5892,9 @@ def build_investment_request_embed(req: dict, status_text: str | None = None, co
     em.add_field(name="Краткое описание", value=req.get("description") or "—", inline=False)
     em.add_field(name="Сумма инвестиций", value=req.get("amount") or "—", inline=False)
     em.add_field(name="Статус", value=text, inline=False)
+    processed_by = req.get("processed_by")
+    if processed_by:
+        em.add_field(name="Рассмотрел", value=f"<@{processed_by}>", inline=False)
     return em
 
 
@@ -5917,12 +5920,49 @@ class InvestmentActionModal(Modal):
             return
 
         now_ts = int(time.time())
+        req_author_id = str(req.get("author_id") or "")
+        if not req_author_id:
+            await interaction.response.send_message("❌ Не удалось определить автора заявки.", ephemeral=True)
+            return
+
+        user = ensure_user(req_author_id)
+        try:
+            invest_amount = parse_money_value(str(req.get("amount", "0")).strip(), int(user.get("наличка", 0)))
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверная сумма инвестиций в заявке: {e}", ephemeral=True)
+            return
+
+        if invest_amount <= 0:
+            await interaction.response.send_message("❌ Сумма инвестиций должна быть больше 0.", ephemeral=True)
+            return
+
+        available_cash = int(user.get("наличка", 0)) - int(user.get("заморожено", 0))
+        if invest_amount > available_cash:
+            await interaction.response.send_message(
+                f"❌ У автора заявки недостаточно средств. Доступно: {available_cash:,}. Нужно: {invest_amount:,}.",
+                ephemeral=True,
+            )
+            return
+
         try:
             cooldown_secs = max(60, parse_interval(str(self.cooldown.value).strip()))
             duration_secs = max(60, parse_interval(str(self.duration.value).strip()))
         except Exception as e:
             await interaction.response.send_message(f"❌ Неверный формат времени: {e}", ephemeral=True)
             return
+
+        payout_raw = str(self.profit.value).strip()
+        try:
+            total_return = parse_money_value(payout_raw, invest_amount)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный формат суммы/% прибыли: {e}", ephemeral=True)
+            return
+
+        if total_return <= 0:
+            await interaction.response.send_message("❌ Итоговая сумма выплаты должна быть больше 0.", ephemeral=True)
+            return
+
+        cycles_total = max(1, math.ceil(duration_secs / cooldown_secs))
 
         start_raw = str(self.start_year.value).strip().lower()
         pending_year = None
@@ -5939,9 +5979,14 @@ class InvestmentActionModal(Modal):
         active = {
             "id": inv_id,
             "request_id": self.req_id,
-            "user_id": str(req.get("author_id")),
+            "user_id": req_author_id,
             "description": str(self.inv_description.value).strip(),
-            "payout": str(self.profit.value).strip(),
+            "payout": payout_raw,
+            "invest_amount": int(invest_amount),
+            "total_return": int(total_return),
+            "paid_amount": 0,
+            "cycles_total": int(cycles_total),
+            "cycles_paid": 0,
             "cooldown": int(cooldown_secs),
             "duration": int(duration_secs),
             "start_at": int(start_at),
@@ -5954,10 +5999,13 @@ class InvestmentActionModal(Modal):
         }
         investments.setdefault("active_investments", {})[inv_id] = active
 
+        user["наличка"] = int(user.get("наличка", 0)) - int(invest_amount)
+
         req["status"] = "approved"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"✅ Одобрено\nЭкономист: {interaction.user.mention}"
+        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.mention}"
         req["investment_id"] = inv_id
+        save_json(BALANCES_FILE, balances)
         save_investments()
 
         result_channel_id = investments.get("result_channel")
@@ -5970,11 +6018,12 @@ class InvestmentActionModal(Modal):
         result_embed = Embed(title=f"✅ Инвестиция одобрена #{self.req_id}", color=0x00FF00)
         result_embed.add_field(name="Автор заявки", value=f"<@{req.get('author_id')}>", inline=False)
         result_embed.add_field(name="Описание инвестиций", value=active["description"], inline=False)
-        result_embed.add_field(name="Прибыль", value=active["payout"], inline=True)
+        result_embed.add_field(name="Вложено", value=f"{invest_amount:,}", inline=True)
+        result_embed.add_field(name="Итог к выплате", value=f"{total_return:,}", inline=True)
         result_embed.add_field(name="Начало", value=start_text, inline=True)
         result_embed.add_field(name="Кулдаун", value=format_interval(cooldown_secs), inline=True)
         result_embed.add_field(name="Срок действия", value=format_interval(duration_secs), inline=True)
-        result_embed.add_field(name="Рассмотрел", value=interaction.user.mention, inline=True)
+        result_embed.add_field(name="Частей выплаты", value=str(cycles_total), inline=True)
         if result_channel:
             await result_channel.send(content=f"<@{req.get('author_id')}>", embed=result_embed)
 
@@ -5999,7 +6048,7 @@ class InvestmentRejectModal(Modal):
         reason = str(self.reason.value).strip()
         req["status"] = "rejected"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"❌ Отклонено\nЭкономист: {interaction.user.mention}\nПричина: {reason}"
+        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.mention}\nПричина: {reason}"
         req["reject_reason"] = reason
         save_investments()
 
@@ -9087,36 +9136,51 @@ async def auto_role_income_loop():
             if now_ts < start_at:
                 continue
 
-            expires_at = inv.get("expires_at")
-            if expires_at is not None and now_ts >= int(expires_at):
-                inv["status"] = "expired"
-                investments["active_investments"][str(inv_id)] = inv
-                inv_changed = True
-                continue
-
             cooldown = max(60, int(inv.get("cooldown", 3600)))
             next_at = int(inv.get("next_at", start_at))
             if now_ts < next_at:
                 continue
 
-            cycles = max(1, (now_ts - next_at) // cooldown + 1)
-            user = ensure_user(user_id)
-            base_cash = int(user.get("наличка", 0))
-            try:
-                per_cycle = parse_money_value(str(inv.get("payout", 0)), base_cash)
-            except Exception:
-                per_cycle = 0
+            total_return = max(0, int(inv.get("total_return", 0)))
+            cycles_total = max(1, int(inv.get("cycles_total", 1)))
+            cycles_paid = max(0, int(inv.get("cycles_paid", 0)))
+            paid_amount = max(0, int(inv.get("paid_amount", 0)))
 
-            inv["next_at"] = next_at + cycles * cooldown
+            if cycles_paid >= cycles_total or paid_amount >= total_return:
+                inv["status"] = "expired"
+                investments["active_investments"][str(inv_id)] = inv
+                inv_changed = True
+                continue
+
+            cycles_due = max(1, (now_ts - next_at) // cooldown + 1)
+            cycles_to_pay = min(cycles_due, cycles_total - cycles_paid)
+            if cycles_to_pay <= 0:
+                continue
+
+            base_part = total_return // cycles_total
+            remainder = total_return % cycles_total
+            payout_now = 0
+            for i in range(cycles_to_pay):
+                cycle_index = cycles_paid + i
+                payout_now += base_part + (1 if cycle_index < remainder else 0)
+
+            inv["cycles_paid"] = cycles_paid + cycles_to_pay
+            inv["paid_amount"] = paid_amount + payout_now
+            inv["next_at"] = next_at + cycles_to_pay * cooldown
+
+            expires_at = inv.get("expires_at")
+            if expires_at is not None and now_ts >= int(expires_at):
+                inv["status"] = "expired"
+            if inv["cycles_paid"] >= cycles_total or inv["paid_amount"] >= total_return:
+                inv["status"] = "expired"
+
             investments["active_investments"][str(inv_id)] = inv
             inv_changed = True
 
-            if per_cycle <= 0:
-                continue
-
-            total_profit = per_cycle * cycles
-            user["наличка"] += total_profit
-            balances_changed = True
+            if payout_now > 0:
+                user = ensure_user(user_id)
+                user["наличка"] = int(user.get("наличка", 0)) + int(payout_now)
+                balances_changed = True
 
         if inv_changed:
             save_investments()
