@@ -5766,6 +5766,19 @@ class VerdictPanelView(View):
         await interaction.response.send_modal(VerdictRequestModal())
 
 
+def _can_manage_verdicts_member(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return has_custom_command_access(member, "вердикты")
+
+
+def _is_unreviewed_verdict(req: dict) -> bool:
+    return str(req.get("status", "pending")).strip().lower() in {
+        "pending",
+        "pending_moderation",
+    }
+
+
 @bot.command(name="вердикты")
 async def вердикты(ctx):
     await ctx.send(
@@ -5773,6 +5786,102 @@ async def вердикты(ctx):
             title="ℹ️ Вердикты",
             description="Служебная команда для настройки прав. Используйте `!разрешить @роль вердикты`.",
             color=0x3498DB,
+        )
+    )
+
+
+@bot.command(name="очиститьверды")
+async def очиститьверды(ctx):
+    if not _can_manage_verdicts_member(ctx.author):
+        await ctx.send(
+            embed=Embed(
+                title="❌ Нет доступа",
+                description="Команда доступна только администрации или ролям с правом `вердикты`.",
+                color=0xE74C3C,
+            )
+        )
+        return
+
+    requests = verdicts_data.setdefault("requests", {})
+    to_delete = [rid for rid, req in requests.items() if _is_unreviewed_verdict(req)]
+    for rid in to_delete:
+        requests.pop(rid, None)
+
+    save_verdicts_data()
+    await ctx.send(
+        embed=Embed(
+            title="🧹 Нерассмотренные вердикты очищены",
+            description=(
+                f"Удалено заявок: **{len(to_delete)}**.\n"
+                "Теперь игроки могут отправить новые заявки на вердикт."
+            ),
+            color=0x2ECC71,
+        )
+    )
+
+
+@bot.command(name="принятьверд")
+async def принятьверд(ctx, number: int):
+    if not _can_manage_verdicts_member(ctx.author):
+        await ctx.send(
+            embed=Embed(
+                title="❌ Нет доступа",
+                description="Команда доступна только администрации или ролям с правом `вердикты`.",
+                color=0xE74C3C,
+            )
+        )
+        return
+
+    req = verdicts_data.setdefault("requests", {}).get(str(number))
+    if not req:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Заявка не найдена",
+                description=f"Заявка вердикта **#{number}** отсутствует.",
+                color=0xE74C3C,
+            )
+        )
+        return
+
+    if not _is_unreviewed_verdict(req):
+        await ctx.send(
+            embed=Embed(
+                title="⚠️ Уже рассмотрено",
+                description=f"Заявка **#{number}** уже имеет статус: `{req.get('status')}`.",
+                color=0xF1C40F,
+            )
+        )
+        return
+
+    req_channel = None
+    req_channel_id = verdicts_data.get("requests_channel")
+    if req_channel_id:
+        req_channel = await get_channel_safe(req_channel_id)
+    if req_channel is None:
+        req_channel = ctx.channel
+
+    link = req.get("message_link") or "—"
+    embed = Embed(title=f"📨 Заявка на вердикт #{number}", color=0x3498DB)
+    embed.add_field(name="От", value=f"<@{req.get('author_id')}>", inline=False)
+    embed.add_field(name="Ссылка", value=str(link), inline=False)
+    embed.add_field(name="Статус", value="⏳ На рассмотрении", inline=False)
+
+    content = verdict_ping_roles_line(req_channel.guild) if getattr(req_channel, "guild", None) else ""
+    msg = await req_channel.send(
+        content=(content or None),
+        embed=embed,
+        view=VerdictReviewView(str(number)),
+    )
+    req["request_message_id"] = msg.id
+    req["request_channel_id"] = msg.channel.id
+    req["status"] = "pending"
+    save_verdicts_data()
+
+    await ctx.send(
+        embed=Embed(
+            title="✅ Меню вердикта восстановлено",
+            description=f"Для заявки **#{number}** отправлено новое меню рассмотрения в {msg.channel.mention}.",
+            color=0x2ECC71,
         )
     )
 
