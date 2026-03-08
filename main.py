@@ -2117,7 +2117,7 @@ async def меню(ctx):
                 await interaction.response.send_modal(InvestmentRequestModal())
                 return
             if selected == "companies":
-                await show_companies_menu(ctx, interaction.user)
+                await show_companies_menu(ctx, interaction.user, viewer_id=interaction.user.id)
                 if not interaction.response.is_done():
                     await interaction.response.defer(ephemeral=True)
                 return
@@ -6869,14 +6869,16 @@ class CompanyActionsSelect(Select):
             await interaction.response.send_modal(CompanyCreateModal())
             return
 
-        owned_companies = find_companies_by_name("*", owner_id=str(interaction.user.id))
-        if not owned_companies:
-            await interaction.response.send_message("❌ Эти действия доступны только владельцу своих компаний.", ephemeral=True)
-            return
-
         if v == "buy":
             await interaction.response.send_modal(CompanyBuyModal())
-        elif v == "sell":
+            return
+
+        owned_companies = find_companies_by_name("*", owner_id=str(interaction.user.id))
+        if not owned_companies:
+            await interaction.response.send_message("❌ Продажа и улучшение доступны только владельцу компаний.", ephemeral=True)
+            return
+
+        if v == "sell":
             await interaction.response.send_modal(CompanySellModal())
         elif v == "upgrade":
             await interaction.response.send_modal(CompanyUpgradeModal())
@@ -6913,16 +6915,21 @@ class CompaniesMenuView(View):
         await interaction.response.edit_message(embed=self.pages[self.index], view=self)
 
 
-async def show_companies_menu(ctx, member: discord.Member):
+async def show_companies_menu(ctx, member: discord.Member, viewer_id: int | None = None):
     user_id = str(member.id)
+    viewer_id = int(viewer_id) if viewer_id is not None else member.id
     companies = [c for c in companies_data.setdefault("companies", {}).values() if str(c.get("owner_id")) == user_id]
     if not companies:
-        em = Embed(title="🏢 Компании", description="У вас нет компаний. Используйте меню ниже: **Создать новую компанию**.", color=0x3498DB)
-        await ctx.send(embed=em, view=CompaniesMenuView([], member.id))
+        if viewer_id == member.id:
+            desc = "У вас нет компаний. Используйте меню ниже: **Создать новую компанию**."
+        else:
+            desc = f"У игрока {member.mention} пока нет компаний."
+        em = Embed(title="🏢 Компании", description=desc, color=0x3498DB)
+        await ctx.send(embed=em, view=CompaniesMenuView([], viewer_id))
         return
 
     pages = [build_company_embed(c, i + 1, len(companies)) for i, c in enumerate(companies)]
-    await ctx.send(embed=pages[0], view=CompaniesMenuView(pages, member.id))
+    await ctx.send(embed=pages[0], view=CompaniesMenuView(pages, viewer_id))
 
 
 @bot.command(name="компании")
@@ -12796,6 +12803,12 @@ async def профиль(ctx, member: discord.Member = None):
                 ),
                 ephemeral=True,
             )
+
+        @discord.ui.button(label="Компании игрока", style=ButtonStyle.secondary)
+        async def player_companies(self, interaction: Interaction, button: Button):
+            await interaction.response.defer(ephemeral=True)
+            await show_companies_menu(ctx, self.target_member, viewer_id=interaction.user.id)
+            await interaction.followup.send("✅ Список компаний отправлен в канал.", ephemeral=True)
 
     await ctx.send(embed=embed, view=PlayerEconomyView(member))
 
