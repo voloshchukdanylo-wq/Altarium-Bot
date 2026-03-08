@@ -8200,6 +8200,14 @@ def get_country_type(country_name: str) -> str:
     return "Государство"
 
 
+def get_region_owner_country(region_name: str) -> str | None:
+    data = country_stats.get(region_name)
+    if not isinstance(data, dict):
+        return None
+    parent = str(data.get("owner_country") or "").strip()
+    return parent or None
+
+
 def get_country_population_for_season(country_name: str, season_name: str):
     data = country_stats.get(country_name)
     if not isinstance(data, dict):
@@ -12303,16 +12311,20 @@ async def wipe_player(ctx, member: discord.Member):
 @bot.command(name="создатьстат")
 @commands.has_permissions(administrator=True)
 async def создатьстат(ctx):
-    draft = {"country": "", "type": "Государство", "season": "", "population": 0}
+    draft = {"country": "", "type": "Государство", "season": "", "population": 0, "owner_country": ""}
     types = ["Государство", "Регион", "ЧВК", "Организация", "Повстанцы", "Террористы"]
 
     def build_embed():
         embed = Embed(title="🧾 Создание стата", color=0x3498DB)
+        owner_line = ""
+        if draft["type"] == "Регион":
+            owner_line = f"\n**Государство-владелец:** {draft['owner_country'] or '—'}"
         embed.description = (
             f"**Название:** {draft['country'] or '—'}\n"
             f"**Тип:** {draft['type']}\n"
             f"**Сезон:** {draft['season'] or '—'}\n"
             f"**Население:** {fmt_num(draft['population']) if draft['population'] else '—'}"
+            f"{owner_line}"
         )
         return embed
 
@@ -12339,10 +12351,18 @@ async def создатьстат(ctx):
                 required=True,
                 default=(str(draft["population"]) if draft["population"] else ""),
             )
+            self.owner_country_in = TextInput(
+                label="Государство-владелец (для региона)",
+                required=False,
+                max_length=120,
+                default=draft.get("owner_country", ""),
+                placeholder="Обязательно для типа Регион",
+            )
             self.add_item(self.country_in)
             self.add_item(self.type_in)
             self.add_item(self.season_in)
             self.add_item(self.pop_in)
+            self.add_item(self.owner_country_in)
 
         async def on_submit(self, interaction: Interaction):
             country_type = next(
@@ -12369,6 +12389,25 @@ async def создатьстат(ctx):
             draft["type"] = country_type
             draft["season"] = str(self.season_in.value).strip()
             draft["population"] = max(0, pop_val)
+            draft["owner_country"] = str(self.owner_country_in.value).strip()
+
+            if draft["type"] == "Регион":
+                parent_name = resolve_country_name(draft["owner_country"])
+                if not parent_name:
+                    await interaction.response.send_message(
+                        "❌ Создание региона невозможно: государство-владелец не найдено в статах.",
+                        ephemeral=True,
+                    )
+                    return
+                if get_country_type(parent_name) != "Государство":
+                    await interaction.response.send_message(
+                        "❌ Владелец региона должен быть типа `Государство`.",
+                        ephemeral=True,
+                    )
+                    return
+                draft["owner_country"] = parent_name
+            else:
+                draft["owner_country"] = ""
             await interaction.response.edit_message(embed=build_embed(), view=view)
 
     class StatView(View):
@@ -12399,12 +12438,27 @@ async def создатьстат(ctx):
                     "❌ Такой сезон не создан. Сначала !создатьсезон.", ephemeral=True
                 )
                 return
+            if draft["type"] == "Регион":
+                parent_name = resolve_country_name(draft.get("owner_country", ""))
+                if not parent_name or get_country_type(parent_name) != "Государство":
+                    await interaction.response.send_message(
+                        "❌ Создание региона невозможно до создания государства-владельца.",
+                        ephemeral=True,
+                    )
+                    return
+                draft["owner_country"] = parent_name
+
             set_country_population_for_season(
                 draft["country"],
                 draft["season"],
                 int(draft["population"]),
                 draft["type"],
             )
+            record = country_stats.setdefault(draft["country"], {})
+            if draft["type"] == "Регион":
+                record["owner_country"] = draft["owner_country"]
+            else:
+                record.pop("owner_country", None)
             save_json(COUNTRY_STATS_FILE, country_stats)
             await interaction.response.edit_message(
                 embed=Embed(
@@ -12484,16 +12538,64 @@ async def статы(ctx):
         )
         return
 
+    country_to_user, _ = get_occupied_country_map()
     lines = []
-    for country_name in sorted(country_stats.keys(), key=lambda x: str(x).casefold()):
-        season_population = get_country_population_for_season(
-            country_name, active_season
-        )
+
+    countries = [
+        name
+        for name in country_stats.keys()
+        if get_country_type(name) == "Государство"
+    ]
+    for country_name in sorted(countries, key=lambda x: str(x).casefold()):
+        season_population = get_country_population_for_season(country_name, active_season)
+        if season_population is None:
+            continue
+
+        attached_regions = []
+        detached_regions = []
+        cut_population = 0
+
+        for region_name in country_stats.keys():
+            if get_country_type(region_name) != "Регион":
+                continue
+            owner_country = get_region_owner_country(region_name)
+            if not owner_country or str(owner_country).casefold() != str(country_name).casefold():
+                continue
+
+            region_pop = get_country_population_for_season(region_name, active_season)
+            if region_pop is None:
+                continue
+
+            owner_uid = country_to_user.get(region_name)
+            if owner_uid:
+                detached_regions.append((region_name, int(region_pop), owner_uid))
+                cut_population += int(region_pop)
+            else:
+                attached_regions.append((region_name, int(region_pop)))
+
+        display_population = max(0, int(season_population) - cut_population)
+        lines.append(f"• **{country_name}** — {display_population}\n↳ *Государство*")
+
+        if attached_regions:
+            reg_line = ", ".join([f"{rn} ({rp})" for rn, rp in attached_regions])
+            lines.append(f"  └ В составе: {reg_line}")
+
+        if detached_regions:
+            reg_line = ", ".join([f"{rn} ({rp}, <@{uid}>)" for rn, rp, uid in detached_regions])
+            lines.append(f"  └ Отделено игрокам: {reg_line}")
+
+    extras = []
+    for entity_name in sorted(country_stats.keys(), key=lambda x: str(x).casefold()):
+        entity_type = get_country_type(entity_name)
+        if entity_type in ("Государство", "Регион"):
+            continue
+        season_population = get_country_population_for_season(entity_name, active_season)
         if season_population is not None:
-            country_type = get_country_type(country_name)
-            lines.append(
-                f"• **{country_name}** — {season_population}\n↳ *{country_type}*"
-            )
+            extras.append(f"• **{entity_name}** — {season_population}\n↳ *{entity_type}*")
+
+    if extras:
+        lines.append("\n**Прочие формирования:**")
+        lines.extend(extras)
 
     if not lines:
         await ctx.send(
