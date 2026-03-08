@@ -648,10 +648,36 @@ def update_company_derived_fields(company: dict):
     name, recommended_cd = calculate_company_level(company.get("income_amount", "100000"), int(company.get("income_cooldown", 3600)))
     company["level"] = name
     company.setdefault("advert_level", 1)
-    company.setdefault("income_cooldown", recommended_cd)
-    company.setdefault("expense_amount", "0")
-    company.setdefault("expense_cooldown", 86400)
-    company.setdefault("min_value", int(company.get("first_invest", 0) or 0))
+    try:
+        income_cd = int(company.get("income_cooldown", recommended_cd) or recommended_cd)
+    except Exception:
+        income_cd = recommended_cd
+    company["income_cooldown"] = max(60, income_cd)
+
+    first_invest = int(company.get("first_invest", 0) or 0)
+    try:
+        expense_num = parse_money_value(str(company.get("expense_amount", "0")), max(first_invest, 1))
+    except Exception:
+        expense_num = 0
+    if expense_num <= 0:
+        expense_num = max(10_000, int(first_invest * 0.01) if first_invest > 0 else 10_000)
+    company["expense_amount"] = str(expense_num)
+
+    try:
+        expense_cd = int(company.get("expense_cooldown", 86400) or 86400)
+    except Exception:
+        expense_cd = 86400
+    company["expense_cooldown"] = max(60, expense_cd)
+
+    try:
+        income_num = parse_money_value(str(company.get("income_amount", "0")), max(first_invest, 1))
+    except Exception:
+        income_num = 0
+    if income_num <= 0:
+        income_num = max(100_000, int(first_invest * 0.05) if first_invest > 0 else 100_000)
+    company["income_amount"] = str(income_num)
+
+    company.setdefault("min_value", first_invest)
     company.setdefault("last_income_at", int(time.time()))
     company.setdefault("last_expense_at", int(time.time()))
 
@@ -662,9 +688,22 @@ def company_estimated_price(company: dict) -> int:
     return min_value if min_value > 0 else first_invest
 
 
+def company_year_amount(amount_raw: str, cooldown_secs: int, fallback_base: int = 1) -> int:
+    cooldown = max(60, int(cooldown_secs or 3600))
+    try:
+        amount = parse_money_value(str(amount_raw), max(1, int(fallback_base or 1)))
+    except Exception:
+        amount = 0
+    return int((max(0, int(amount)) * 31_536_000) / cooldown)
+
+
 def build_company_embed(company: dict, idx: int, total: int):
     update_company_derived_fields(company)
     est_price = company_estimated_price(company)
+    income_cd = int(company.get("income_cooldown", 3600) or 3600)
+    expense_cd = int(company.get("expense_cooldown", 86400) or 86400)
+    income_year = company_year_amount(company.get("income_amount", "0"), income_cd, est_price)
+    expense_year = company_year_amount(company.get("expense_amount", "0"), expense_cd, est_price)
     em = Embed(
         title=f"🏢 Компания {idx}/{total}",
         color=0x2ECC71,
@@ -676,8 +715,10 @@ def build_company_embed(company: dict, idx: int, total: int):
             f"**Уровень рекламы:** {company.get('advert_level', 1)}"
         ),
     )
-    em.add_field(name="Траты", value=f"{company.get('expense_amount', '0')} / {format_interval(int(company.get('expense_cooldown', 86400)))}", inline=True)
-    em.add_field(name="Доходы", value=f"{company.get('income_amount', '0')} / {format_interval(int(company.get('income_cooldown', 3600)))}", inline=True)
+    em.add_field(name="Траты (за цикл)", value=f"{company.get('expense_amount', '0')} / {format_interval(expense_cd)}", inline=True)
+    em.add_field(name="Доходы (за цикл)", value=f"{company.get('income_amount', '0')} / {format_interval(income_cd)}", inline=True)
+    em.add_field(name="Траты в год", value=fmt_money(expense_year), inline=True)
+    em.add_field(name="Доходы в год", value=fmt_money(income_year), inline=True)
     em.add_field(name="Оценка цены компании", value=f"{est_price:,}", inline=False)
     em.add_field(name="Владелец", value=f"<@{company.get('owner_id')}>", inline=False)
     return em
@@ -6746,13 +6787,15 @@ class CompanyOwnerRejectModal(Modal):
             await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
             return
         req["status"] = "rejected_by_owner"
-        req["status_text"] = f"❌ Отклонено владельцем\nПартнер: {interaction.user.mention}\nПричина: {self.reason.value}"
+        req["status_text"] = f"❌ Отклонено владельцем\nПартнер: {interaction.user.display_name}\nПричина: {self.reason.value}"
         req["owner_reason"] = str(self.reason.value).strip()
         save_companies_data()
 
         result_channel = await get_channel_safe(companies_data.get("result_channel"))
         if result_channel:
-            mentions = [f"<@{req.get('author_id')}>", f"<@{req.get('owner_id')}>", f"<@{interaction.user.id}>"]
+            mentions = [f"<@{req.get('author_id')}>", f"<@{req.get('owner_id')}>"]
+            if req.get("buyer_id"):
+                mentions.append(f"<@{req.get('buyer_id')}>")
             await result_channel.send(content=" ".join(sorted(set(mentions))), embed=build_company_request_embed(req, color=0xE74C3C))
         await interaction.response.edit_message(
             embed=build_company_request_embed(req, color=0xE74C3C),
@@ -6781,7 +6824,7 @@ class CompanyOwnerDecisionView(View):
             return
 
         req["status"] = "pending_moderation"
-        req["status_text"] = f"⏳ Вторая сторона согласовала. Ожидает модерацию\nПартнер: {interaction.user.mention}"
+        req["status_text"] = f"⏳ Вторая сторона согласовала. Ожидает модерацию\nПартнер: {interaction.user.display_name}"
 
         req_channel = await get_channel_safe(companies_data.get("requests_channel"))
         if req_channel:
@@ -6878,7 +6921,7 @@ class CompanyRejectModal(Modal):
 
         result_channel = await get_channel_safe(companies_data.get("result_channel"))
         if result_channel:
-            mentions = [f"<@{req.get('author_id')}>", f"<@{interaction.user.id}>"]
+            mentions = [f"<@{req.get('author_id')}>"]
             if req.get("owner_id"):
                 mentions.append(f"<@{req.get('owner_id')}>")
             if req.get("buyer_id"):
