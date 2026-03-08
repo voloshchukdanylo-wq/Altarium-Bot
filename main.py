@@ -8882,6 +8882,8 @@ class TopModeSelect(Select):
             SelectOption(label="Топ по населению", value="population", emoji="👥"),
             SelectOption(label="Топ по армии", value="army", emoji="🪖"),
             SelectOption(label="Топ по постам", value="posts", emoji="📰"),
+            SelectOption(label="Топ компаний (цена)", value="companies_price", emoji="🏢"),
+            SelectOption(label="Топ по репутации", value="reputation", emoji="⭐"),
         ]
         super().__init__(
             placeholder="Выберите тип топа", min_values=1, max_values=1, options=options
@@ -8938,6 +8940,30 @@ class TopView(View):
                 ),
                 "📰 Топ по постам",
             )
+        if self.mode == "reputation":
+            users = player_state.get("users", {})
+            return (
+                sorted(
+                    (
+                        (uid, int((users.get(uid) or {}).get("reputation", 0)))
+                        for uid in users.keys()
+                    ),
+                    key=lambda x: x[1],
+                    reverse=True,
+                ),
+                "⭐ Топ по репутации",
+            )
+        if self.mode == "companies_price":
+            companies = []
+            for company in companies_data.setdefault("companies", {}).values():
+                update_company_derived_fields(company)
+                companies.append((
+                    str(company.get("name") or "Без названия"),
+                    int(company_estimated_price(company)),
+                    str(company.get("owner_id") or "0"),
+                ))
+            companies.sort(key=lambda x: x[1], reverse=True)
+            return companies, "🏢 Топ компаний по цене"
         data = []
         for uid, user in balances.items():
             if uid == "валюта" or not isinstance(user, dict):
@@ -8959,9 +8985,14 @@ class TopView(View):
         chunk = pages[self.page]
         desc = ""
         start = self.page * 10 + 1
-        for idx, (uid, val) in enumerate(chunk, start=start):
-            suffix = currency if self.mode == "economy" else ""
-            desc += f"{idx}. <@{uid}> — {fmt_num(val)} {suffix}\n".rstrip() + "\n"
+        for idx, row in enumerate(chunk, start=start):
+            if self.mode == "companies_price":
+                company_name, val, owner_id = row
+                desc += f"{idx}. **{company_name}** — {fmt_num(val)} {currency} (владелец: <@{owner_id}>)\n"
+            else:
+                uid, val = row
+                suffix = currency if self.mode == "economy" else ""
+                desc += f"{idx}. <@{uid}> — {fmt_num(val)} {suffix}\n".rstrip() + "\n"
         em = Embed(title=title, description=desc, color=0x3498DB)
         em.set_footer(text=f"Страница {self.page + 1}/{len(pages)}")
 
@@ -8970,6 +9001,8 @@ class TopView(View):
             "population": "Топ по населению",
             "army": "Топ по армии",
             "posts": "Топ по постам",
+            "companies_price": "Топ компаний (цена)",
+            "reputation": "Топ по репутации",
         }
         current = mode_map.get(self.mode, "")
         for option in self.mode_select.options:
