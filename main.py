@@ -2101,10 +2101,10 @@ async def меню(ctx):
                     description="Управление компаниями",
                 ),
                 SelectOption(
-                    label="Собрать: работа + коллект",
+                    label="Собрать прибыль (коллект)",
                     value="collect",
                     emoji="💰",
-                    description="Выполнить !работа и !коллект",
+                    description="Выполнить !коллект (общий КД)",
                 ),
             ]
             super().__init__(
@@ -2142,8 +2142,19 @@ async def меню(ctx):
             elif selected == "spheres":
                 await сферы(ctx)
             elif selected == "collect":
-                await работа(ctx)
-                await коллект(ctx)
+                collect_cmd = bot.get_command("коллект")
+                if collect_cmd is None:
+                    await interaction.followup.send("❌ Команда !коллект не найдена.", ephemeral=True)
+                    return
+                try:
+                    await ctx.invoke(collect_cmd)
+                except commands.CommandOnCooldown as e:
+                    retry = int(e.retry_after)
+                    await interaction.followup.send(
+                        f"⏳ Коллект на кулдауне: подождите {retry // 60} мин {retry % 60} сек.",
+                        ephemeral=True,
+                    )
+                    return
 
             await interaction.followup.send("✅ Действие выполнено.", ephemeral=True)
 
@@ -8815,6 +8826,7 @@ async def наказания(ctx):
 
 # ================== ROLE INCOME ==================
 @bot.command()
+@commands.cooldown(1, 1800, commands.BucketType.user)
 async def коллект(ctx):
     user_id = str(ctx.author.id)
     user = ensure_user(user_id)
