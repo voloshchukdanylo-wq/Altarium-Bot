@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import re
@@ -39,6 +40,8 @@ INVESTMENTS_FILE = os.path.join(DATA_DIR, "investments.json")
 MODERATION_FILE = os.path.join(DATA_DIR, "moderation.json")
 RATINGS_FILE = os.path.join(DATA_DIR, "ratings.json")
 VERDICTS_FILE = os.path.join(DATA_DIR, "verdicts.json")
+PARTNERSHIP_FILE = os.path.join(DATA_DIR, "partnerships.json")
+COMPANIES_FILE = os.path.join(DATA_DIR, "companies.json")
 WIPE_BACKUP_TTL = 3600
 
 AUTOMOD_MIN_ACCOUNT_AGE_DAYS = 30
@@ -136,7 +139,7 @@ passive_flows = load_json(PASSIVE_FLOW_FILE, {"users": {}})
 command_access = load_json(COMMAND_ACCESS_FILE, {"commands": {}})
 seasons_data = load_json(
     SEASONS_FILE,
-    {"seasons": {}, "active_season": None, "spheres": {}, "user_progress": {}},
+    {"seasons": {}, "active_season": None, "spheres": {}, "user_progress": {}, "season_user_progress": {}},
 )
 sphere_requests = load_json(
     SPHERE_REQUESTS_FILE,
@@ -162,7 +165,24 @@ reg_settings = load_json(
     },
 )
 player_state = load_json(PLAYER_STATE_FILE, {"users": {}})
-investments = load_json(INVESTMENTS_FILE, {"users": {}})
+investments = load_json(
+    INVESTMENTS_FILE,
+    {
+        "requests": {},
+        "next_id": 1,
+        "panel_channel": None,
+        "requests_channel": None,
+        "result_channel": None,
+        "active_investments": {},
+        "rp_year": {
+            "channel_id": None,
+            "message_id": None,
+            "year": None,
+            "cooldown": 86400,
+            "next_tick_at": None,
+        },
+    },
+)
 moderation_data = load_json(
     MODERATION_FILE,
     {"log_channel": None, "warns": {}, "warn_limit": {"count": 3, "action": "мут 1ч"}},
@@ -178,6 +198,27 @@ verdicts_data = load_json(
         "result_channel": None,
         "requests": {},
         "next_id": 1,
+    },
+)
+partnership_data = load_json(
+    PARTNERSHIP_FILE,
+    {
+        "panel_channel": None,
+        "requests_channel": None,
+        "result_channel": None,
+        "requests": {},
+        "next_id": 1,
+    },
+)
+companies_data = load_json(
+    COMPANIES_FILE,
+    {
+        "companies": {},
+        "requests": {},
+        "next_company_id": 1,
+        "next_request_id": 1,
+        "requests_channel": None,
+        "result_channel": None,
     },
 )
 
@@ -210,6 +251,11 @@ verdicts_data.setdefault("requests_channel", None)
 verdicts_data.setdefault("result_channel", None)
 verdicts_data.setdefault("requests", {})
 verdicts_data.setdefault("next_id", 1)
+partnership_data.setdefault("next_id", 1)
+partnership_data.setdefault("requests", {})
+partnership_data.setdefault("result_channel", None)
+partnership_data.setdefault("requests_channel", None)
+partnership_data.setdefault("panel_channel", None)
 persistent_views_registered = False
 automod_link_tracker = {}
 country_owners.setdefault("country_to_user", {})
@@ -220,6 +266,31 @@ reg_settings.setdefault("roles_remove", [])
 reg_settings.setdefault("wipe_roles", [])
 reg_settings.setdefault("wipe_role_exclusions", [])
 server_inventory.setdefault("users", {})
+investments.setdefault("requests", {})
+investments.setdefault("next_id", 1)
+investments.setdefault("panel_channel", None)
+investments.setdefault("requests_channel", None)
+investments.setdefault("result_channel", None)
+investments.setdefault("active_investments", {})
+investments.setdefault("rp_year", {})
+investments["rp_year"].setdefault("channel_id", None)
+investments["rp_year"].setdefault("message_id", None)
+investments["rp_year"].setdefault("year", None)
+investments["rp_year"].setdefault("cooldown", 86400)
+investments["rp_year"].setdefault("next_tick_at", None)
+investments.setdefault("users", {})
+companies_data.setdefault("companies", {})
+companies_data.setdefault("requests", {})
+companies_data.setdefault("next_company_id", 1)
+companies_data.setdefault("next_request_id", 1)
+companies_data.setdefault("requests_channel", None)
+companies_data.setdefault("result_channel", None)
+seasons_data.setdefault("seasons", {})
+seasons_data.setdefault("active_season", None)
+seasons_data.setdefault("spheres", {})
+seasons_data.setdefault("season_user_progress", {})
+if seasons_data.get("user_progress") and seasons_data.get("active_season"):
+    seasons_data["season_user_progress"].setdefault(str(seasons_data.get("active_season")), dict(seasons_data.get("user_progress", {})))
 
 items_data.setdefault("categories", {}).setdefault("1", "Гражданские")
 items_data.setdefault("categories", {}).setdefault("2", "Военные")
@@ -461,6 +532,10 @@ def save_verdicts_data():
     save_json(VERDICTS_FILE, verdicts_data)
 
 
+def save_partnership_data():
+    save_json(PARTNERSHIP_FILE, partnership_data)
+
+
 def ensure_player_state(user_id: str):
     users = player_state.setdefault("users", {})
     state = users.setdefault(
@@ -534,6 +609,121 @@ async def restore_member_roles_after_wipe(
         await member.add_roles(*roles_to_add, reason=reason)
 
 
+def save_companies_data():
+    save_json(COMPANIES_FILE, companies_data)
+
+
+def is_registered_player(user_id: str) -> bool:
+    return str(user_id) in country_owners.setdefault("user_to_country", {})
+
+
+def calculate_company_level(income_amount: str, income_cooldown: int) -> tuple[str, int]:
+    try:
+        base_amount = 10_000_000
+        income_value = max(0, parse_money_value(str(income_amount), base_amount))
+    except Exception:
+        income_value = 0
+    cd = max(60, int(income_cooldown or 3600))
+    income_per_hour = int((income_value * 3600) / cd)
+
+    levels = [
+        ("Стартап", 100_000, 370_000, 3600),
+        ("Микро бизнес", 370_000, 750_000, 3600),
+        ("Малый бизнес", 750_000, 1_200_000, 7200),
+        ("Средний бизнес", 1_200_000, 8_300_000, 7200),
+        ("Крупная компания", 8_300_000, 25_700_000, 7200),
+        ("Корпорация", 25_700_000, 38_000_000, 21600),
+        ("Транснациональная компания", 38_000_000, 50_000_000, 43200),
+        ("Конгломерат", 50_000_000, None, 86400),
+    ]
+    selected = levels[0]
+    for lvl in levels:
+        lo, hi = lvl[1], lvl[2]
+        if income_per_hour >= lo and (hi is None or income_per_hour < hi):
+            selected = lvl
+    return selected[0], selected[3]
+
+
+def update_company_derived_fields(company: dict):
+    name, recommended_cd = calculate_company_level(company.get("income_amount", "100000"), int(company.get("income_cooldown", 3600)))
+    company["level"] = name
+    company.setdefault("advert_level", 1)
+    try:
+        income_cd = int(company.get("income_cooldown", recommended_cd) or recommended_cd)
+    except Exception:
+        income_cd = recommended_cd
+    company["income_cooldown"] = max(60, income_cd)
+
+    first_invest = int(company.get("first_invest", 0) or 0)
+    try:
+        expense_num = parse_money_value(str(company.get("expense_amount", "0")), max(first_invest, 1))
+    except Exception:
+        expense_num = 0
+    if expense_num <= 0:
+        expense_num = max(10_000, int(first_invest * 0.01) if first_invest > 0 else 10_000)
+    company["expense_amount"] = str(expense_num)
+
+    try:
+        expense_cd = int(company.get("expense_cooldown", 86400) or 86400)
+    except Exception:
+        expense_cd = 86400
+    company["expense_cooldown"] = max(60, expense_cd)
+
+    try:
+        income_num = parse_money_value(str(company.get("income_amount", "0")), max(first_invest, 1))
+    except Exception:
+        income_num = 0
+    if income_num <= 0:
+        income_num = max(100_000, int(first_invest * 0.05) if first_invest > 0 else 100_000)
+    company["income_amount"] = str(income_num)
+
+    company.setdefault("min_value", first_invest)
+    company.setdefault("last_income_at", int(time.time()))
+    company.setdefault("last_expense_at", int(time.time()))
+
+
+def company_estimated_price(company: dict) -> int:
+    min_value = int(company.get("min_value", 0) or 0)
+    first_invest = int(company.get("first_invest", 0) or 0)
+    return min_value if min_value > 0 else first_invest
+
+
+def company_year_amount(amount_raw: str, cooldown_secs: int, fallback_base: int = 1) -> int:
+    cooldown = max(60, int(cooldown_secs or 3600))
+    try:
+        amount = parse_money_value(str(amount_raw), max(1, int(fallback_base or 1)))
+    except Exception:
+        amount = 0
+    return int((max(0, int(amount)) * 31_536_000) / cooldown)
+
+
+def build_company_embed(company: dict, idx: int, total: int):
+    update_company_derived_fields(company)
+    est_price = company_estimated_price(company)
+    income_cd = int(company.get("income_cooldown", 3600) or 3600)
+    expense_cd = int(company.get("expense_cooldown", 86400) or 86400)
+    income_year = company_year_amount(company.get("income_amount", "0"), income_cd, est_price)
+    expense_year = company_year_amount(company.get("expense_amount", "0"), expense_cd, est_price)
+    em = Embed(
+        title=f"🏢 Компания {idx}/{total}",
+        color=0x2ECC71,
+        description=(
+            f"**Название компании:** {company.get('name', '—')}\n"
+            f"**Специализация:** {company.get('specialization', '—')}\n"
+            f"**Дата основания:** {company.get('founded_year', '—')}\n"
+            f"**Уровень компании:** {company.get('level', '—')}\n"
+            f"**Уровень рекламы:** {company.get('advert_level', 1)}"
+        ),
+    )
+    em.add_field(name="Траты (за цикл)", value=f"{company.get('expense_amount', '0')} / {format_interval(expense_cd)}", inline=True)
+    em.add_field(name="Доходы (за цикл)", value=f"{company.get('income_amount', '0')} / {format_interval(income_cd)}", inline=True)
+    em.add_field(name="Траты в год", value=fmt_money(expense_year), inline=True)
+    em.add_field(name="Доходы в год", value=fmt_money(income_year), inline=True)
+    em.add_field(name="Оценка цены компании", value=f"{est_price:,}", inline=False)
+    em.add_field(name="Владелец", value=f"<@{company.get('owner_id')}>", inline=False)
+    return em
+
+
 def save_player_state():
     save_json(PLAYER_STATE_FILE, player_state)
 
@@ -542,33 +732,36 @@ def ensure_investments(user_id: str):
     return investments.setdefault("users", {}).setdefault(user_id, [])
 
 
+def get_active_investments_for_user(user_id: str):
+    result = []
+    for inv_id, inv in investments.setdefault("active_investments", {}).items():
+        if str(inv.get("user_id")) == str(user_id):
+            result.append((str(inv_id), inv))
+    return result
+
+
 def save_investments():
     save_json(INVESTMENTS_FILE, investments)
 
 
-INVESTMENT_BANKS = {
-    "alta-bank": {
-        "name": "Alta-Bank",
-        "cost": 100_000_000,
-        "profit_pct": 5,
-        "delay_chance": 0.0,
-        "burn_chance": 0.0,
-    },
-    "neo-bank": {
-        "name": "Neo-Bank",
-        "cost": 150_000_000,
-        "profit_pct": 10,
-        "delay_chance": 0.5,
-        "burn_chance": 0.0,
-    },
-    "fantom-bank": {
-        "name": "Fantom-Bank",
-        "cost": 170_000_000,
-        "profit_pct": 25,
-        "delay_chance": 0.0,
-        "burn_chance": 0.4,
-    },
-}
+def format_rp_year_embed(year: int, quarter_index: int):
+    seasons = [
+        ("🌱 Весна", 0x55AA55, "Рост, обновление и новые возможности."),
+        ("☀️ Лето", 0xF1C40F, "Пик активности, энергии и побед."),
+        ("🍂 Осень", 0xE67E22, "Время зрелых решений и результатов."),
+        ("❄️ Зима", 0x5DADE2, "Пауза, переоценка и подготовка к рывку."),
+    ]
+    season_name, color, mood = seasons[max(0, min(3, int(quarter_index)))]
+    em = Embed(
+        title="🗓 RP-календарь",
+        description=(
+            f"**Игровой год:** {int(year)}\n"
+            f"**Пора года:** {season_name}\n\n"
+            f"{mood}"
+        ),
+        color=color,
+    )
+    return em
 
 
 def get_population_growth_percent(happiness: int) -> int:
@@ -773,11 +966,28 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     players = load_json(PLAYER_STATS_FILE, {})
     players.pop(user_id, None)
     passive_flows.setdefault("users", {}).pop(user_id, None)
-    seasons_data.setdefault("user_progress", {}).pop(user_id, None)
+    for _season_map in seasons_data.setdefault("season_user_progress", {}).values():
+        _season_map.pop(user_id, None)
     state = ensure_player_state(user_id)
     state["posts_count"] = 0
     player_state.setdefault("users", {}).pop(user_id, None)
     investments.setdefault("users", {}).pop(user_id, None)
+    companies_data["companies"] = {
+        cid: c
+        for cid, c in companies_data.setdefault("companies", {}).items()
+        if str(c.get("owner_id")) != user_id
+    }
+    companies_data["requests"] = {
+        rid: r
+        for rid, r in companies_data.setdefault("requests", {}).items()
+        if user_id
+        not in {
+            str(r.get("author_id", "")),
+            str(r.get("owner_id", "")),
+            str(r.get("buyer_id", "")),
+            str(r.get("decision_user_id", "")),
+        }
+    }
     old_country = country_owners.setdefault("user_to_country", {}).pop(user_id, None)
     if old_country:
         country_owners.setdefault("country_to_user", {}).pop(old_country, None)
@@ -789,6 +999,7 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     save_seasons_data()
     save_player_state()
     save_investments()
+    save_companies_data()
     save_country_owners()
 
     if guild is not None:
@@ -820,32 +1031,16 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
                 pass
 
 
-def ensure_investment_items():
-    changed = False
-    templates = [
-        ("Alta-Bank", 100_000_000, "Безрисковый банк: +5%/сутки."),
-        ("Neo-Bank", 150_000_000, "+10%/сутки, 50% шанс задержки вывода на сутки."),
-        ("Fantom-Bank", 170_000_000, "+25%/сутки, 40% шанс полного сгорания."),
-    ]
-    for key, price, desc in templates:
-        if key not in items_data.setdefault("items", {}):
-            items_data["items"][key] = {
-                "key": key,
-                "price": price,
-                "description": desc,
-                "category": "3",
-                "stock": -1,
-                "expires_at": None,
-                "require_roles": [],
-                "give_roles": [],
-                "remove_roles": [],
-                "use_text": "🏦 Инвестиционный банк куплен.",
-                "created_at": int(time.time()),
-            }
-            changed = True
-    if changed:
-        save_items()
 
+
+def remove_legacy_investment_banks():
+    removed = False
+    for key in ["Alta-Bank", "Neo-Bank", "Fantom-Bank"]:
+        if key in items_data.setdefault("items", {}):
+            items_data["items"].pop(key, None)
+            removed = True
+    if removed:
+        save_items()
 
 def ensure_alta_box_item():
     key = "Альта бокс"
@@ -1040,6 +1235,38 @@ async def ask_with_cancel(
     return None, True
 
 
+async def restore_company_request_views():
+    """Восстанавливает кнопки у незавершённых заявок компаний после рестарта бота."""
+    requests_map = companies_data.get("requests", {})
+    if not isinstance(requests_map, dict) or not requests_map:
+        return
+
+    for req_id, req in requests_map.items():
+        if not isinstance(req, dict):
+            continue
+        status = str(req.get("status") or "")
+
+        if status in ("pending", "pending_moderation"):
+            ch = await get_channel_safe(req.get("request_channel_id"))
+            mid = req.get("request_message_id")
+            if ch and mid:
+                try:
+                    msg = await ch.fetch_message(int(mid))
+                    await msg.edit(view=CompanyReviewView(str(req_id)))
+                except Exception:
+                    pass
+
+        if status in ("pending_owner", "pending_buyer"):
+            dm_ch = await get_channel_safe(req.get("decision_channel_id"))
+            dm_mid = req.get("decision_message_id")
+            if dm_ch and dm_mid:
+                try:
+                    msg = await dm_ch.fetch_message(int(dm_mid))
+                    await msg.edit(view=CompanyOwnerDecisionView(str(req_id)))
+                except Exception:
+                    pass
+
+
 # ================== CHECKS & EVENTS ==================
 @bot.check
 async def only_allowed_guild(ctx):
@@ -1058,12 +1285,15 @@ async def on_ready():
     global persistent_views_registered
 
     print(f"Бот запущен как {bot.user}")
-    ensure_investment_items()
+    remove_legacy_investment_banks()
     ensure_alta_box_item()
     if not persistent_views_registered:
         bot.add_view(RatingsPanelView())
         bot.add_view(VerdictPanelView())
+        bot.add_view(PartnershipPanelView())
+        bot.add_view(InvestmentPanelView())
         persistent_views_registered = True
+    await restore_company_request_views()
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
     status_until = settings.get("status_until")
@@ -1463,11 +1693,14 @@ async def on_command_error(ctx, error):
             "сеттикет": "!сеттикет",
             "тикетотправить": "!тикетотправить #канал",
             "удалитьтикет": "!удалитьтикет <ID или название>",
-            "инвестировать": "!инвестировать 5000 Alta-Bank",
             "списоксезонов": "!списоксезонов",
             "тайнканал": "!тайнканал #канал",
             "рассылка": "!рассылка Текст объявления",
-            "кдгод": "!кдгод 24ч",
+            "кдгод": "!рпгодканал #канал 1939 24ч",
+            "рпгодканал": "!рпгодканал #канал 1939 24ч",
+            "заявкиинвестиций": "!заявкиинвестиций #канал",
+            "итогинвестицийканал": "!итогинвестицийканал #канал",
+            "податьинвестициюканал": "!податьинвестициюканал #канал",
             "мут": "!мут @игрок 4ч причина",
             "бан": "!бан @игрок - причина",
             "кик": "!кик @игрок - причина",
@@ -1505,6 +1738,11 @@ async def on_command_error(ctx, error):
             "вердиктканал": "!вердиктканал #канал",
             "вердзаявкиканал": "!вердзаявкиканал #канал",
             "итогвердиктканал": "!итогвердиктканал #канал",
+            "податьпартнеркуканал": "!податьпартнеркуканал #канал",
+            "заявкипартнерокканал": "!заявкипартнерокканал #канал",
+            "партнеркиканал": "!партнеркиканал #канал",
+            "партнерства": "!партнерства",
+            "партнерство": "!партнерство",
         }
         example = examples.get(ctx.command.qualified_name)
         details = f"**Синтаксис:**\n`{usage}`"
@@ -1574,6 +1812,7 @@ async def хелп(ctx):
             "заморозкарольудалить",
             "заморозкавывести",
             "кдгод",
+            "рпгодканал",
             "автоколлектканал",
             "грабеж",
             "грабежсейвроль",
@@ -1596,7 +1835,10 @@ async def хелп(ctx):
             "использовать",
             "выдать",
             "изъять",
-            "инвестировать",
+            "заявкиинвестиций",
+            "итогинвестицийканал",
+            "податьинвестициюканал",
+            "инвестиции",
             "продать",
             "продатьпредмет",
             "продатьроль",
@@ -1640,6 +1882,11 @@ async def хелп(ctx):
             "вердиктканал",
             "вердзаявкиканал",
             "итогвердиктканал",
+            "податьпартнеркуканал",
+            "заявкипартнерокканал",
+            "партнеркиканал",
+            "партнерства",
+            "инвестиции",
             "рассылка",
         },
         "Регистрация / Страны": {
@@ -1684,7 +1931,7 @@ async def хелп(ctx):
         "пинг": "Проверка отклика бота.",
         "привет": "Короткое приветственное сообщение.",
         "хелп": "Открывает это меню помощи.",
-        "меню": "Открывает быстрое меню игрока (магазин, инвентарь, серверный инвентарь, профиль, сферы, вердикт, работа+коллект).",
+        "меню": "Открывает быстрое меню игрока (магазин, инвентарь, серверный инвентарь, профиль, сферы, вердикт, инвестиции, работа+коллект).",
         "баланс": "Показывает баланс игрока/роли.",
         "профиль": "Профиль игрока и его показатели.",
         "статистика": "Статистика сервера/игрока.",
@@ -1704,6 +1951,16 @@ async def хелп(ctx):
         "купить": "Покупка товара из магазина.",
         "инвентарь": "Инвентарь игрока.",
         "серверныйинвентарь": "Подарочные серверные предметы с таймером.",
+        "партнерства": "Служебная команда для выдачи прав на модерацию партнерок.",
+        "партнерство": "Алиас команды !партнерства для выдачи прав на модерацию партнерок.",
+        "инвестиции": "Служебная команда для выдачи прав на модерацию инвестиций.",
+        "податьинвестициюканал": "Отправляет панель подачи инвестиционной заявки в выбранный канал.",
+        "заявкиинвестиций": "Устанавливает канал, куда отправляются заявки инвестиций.",
+        "итогинвестицийканал": "Устанавливает канал итогов по инвестиционным заявкам.",
+        "рпгодканал": "Настраивает канал RP-года, стартовый год и авто-обновление по КД.",
+        "податьпартнеркуканал": "Отправляет панель с кнопкой подачи партнерки в выбранный канал.",
+        "заявкипартнерокканал": "Устанавливает канал, куда отправляются заявки партнерок.",
+        "партнеркиканал": "Устанавливает канал публикации принятых партнерок.",
         "рег": "Регистрация игрока в стране/сезоне.",
         "регроли": "Настройка ролей для команды !рег.",
         "вайп": "Глобальный сброс игровых данных.",
@@ -1905,10 +2162,28 @@ async def меню(ctx):
                     description="Отправить заявку на вердикт",
                 ),
                 SelectOption(
-                    label="Собрать: работа + коллект",
+                    label="Инвестиции",
+                    value="investments",
+                    emoji="📈",
+                    description="Подать заявку на инвестицию",
+                ),
+                SelectOption(
+                    label="Компании",
+                    value="companies",
+                    emoji="🏢",
+                    description="Управление компаниями",
+                ),
+                SelectOption(
+                    label="Работа",
+                    value="work",
+                    emoji="💼",
+                    description="Выполнить !работа (общий КД)",
+                ),
+                SelectOption(
+                    label="Собрать прибыль (коллект)",
                     value="collect",
                     emoji="💰",
-                    description="Выполнить !работа и !коллект",
+                    description="Выполнить !коллект (общий КД)",
                 ),
             ]
             super().__init__(
@@ -1924,6 +2199,14 @@ async def меню(ctx):
             if selected == "verdict":
                 await interaction.response.send_modal(VerdictRequestModal())
                 return
+            if selected == "investments":
+                await interaction.response.send_modal(InvestmentRequestModal())
+                return
+            if selected == "companies":
+                await show_companies_menu(ctx, interaction.user, viewer_id=interaction.user.id)
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True)
+                return
 
             await interaction.response.defer(ephemeral=True)
 
@@ -1937,9 +2220,34 @@ async def меню(ctx):
                 await серверныйинвентарь(ctx)
             elif selected == "spheres":
                 await сферы(ctx)
+            elif selected == "work":
+                work_cmd = bot.get_command("работа")
+                if work_cmd is None:
+                    await interaction.followup.send("❌ Команда !работа не найдена.", ephemeral=True)
+                    return
+                try:
+                    await ctx.invoke(work_cmd)
+                except commands.CommandOnCooldown as e:
+                    retry = int(e.retry_after)
+                    await interaction.followup.send(
+                        f"⏳ Работа на кулдауне: подождите {retry // 60} мин {retry % 60} сек.",
+                        ephemeral=True,
+                    )
+                    return
             elif selected == "collect":
-                await работа(ctx)
-                await коллект(ctx)
+                collect_cmd = bot.get_command("коллект")
+                if collect_cmd is None:
+                    await interaction.followup.send("❌ Команда !коллект не найдена.", ephemeral=True)
+                    return
+                try:
+                    await ctx.invoke(collect_cmd)
+                except commands.CommandOnCooldown as e:
+                    retry = int(e.retry_after)
+                    await interaction.followup.send(
+                        f"⏳ Коллект на кулдауне: подождите {retry // 60} мин {retry % 60} сек.",
+                        ephemeral=True,
+                    )
+                    return
 
             await interaction.followup.send("✅ Действие выполнено.", ephemeral=True)
 
@@ -2656,31 +2964,64 @@ def get_active_spheres():
     ]
 
 
-def get_user_sphere_level(user_id: str, sphere_name: str) -> int:
-    return int(
-        seasons_data.setdefault("user_progress", {})
-        .setdefault(user_id, {})
-        .get(sphere_name, 0)
-    )
+def build_sphere_id(season_name: str, sphere_name: str) -> str:
+    return f"{str(season_name).strip()}::{str(sphere_name).strip().lower()}"
 
 
-def get_user_sphere_level_by_requirement(user_id: str, sphere_name: str) -> int:
-    """Возвращает уровень сферы по требованию с учетом регистра/пробелов в названии."""
-    progress = seasons_data.setdefault("user_progress", {}).setdefault(user_id, {})
-    if sphere_name in progress:
-        return int(progress.get(sphere_name, 0))
+def get_season_progress_map(season_name: str | None = None) -> dict:
+    season = str(season_name or seasons_data.get("active_season") or "").strip()
+    if not season:
+        return {}
+    seasons_data.setdefault("season_user_progress", {})
+    season_map = seasons_data["season_user_progress"].setdefault(season, {})
+    if not isinstance(season_map, dict):
+        seasons_data["season_user_progress"][season] = {}
+        season_map = seasons_data["season_user_progress"][season]
+    return season_map
 
-    normalized = str(sphere_name).strip().casefold()
-    for name, level in progress.items():
-        if str(name).strip().casefold() == normalized:
+
+def get_user_progress_for_season(user_id: str, season_name: str | None = None) -> dict:
+    return get_season_progress_map(season_name).setdefault(str(user_id), {})
+
+
+def get_user_sphere_level(user_id: str, sphere_id_or_name: str, season_name: str | None = None) -> int:
+    progress = get_user_progress_for_season(user_id, season_name)
+    key = str(sphere_id_or_name)
+    if key in progress:
+        return int(progress.get(key, 0))
+
+    normalized = str(sphere_id_or_name).strip().casefold()
+    target_season = str(season_name or seasons_data.get("active_season") or "")
+    for sid, level in progress.items():
+        sp = seasons_data.setdefault("spheres", {}).get(str(sid), {})
+        if target_season and str(sp.get("season")) != target_season:
+            continue
+        if str(sp.get("name", "")).strip().casefold() == normalized:
             return int(level)
     return 0
 
 
-def set_user_sphere_level(user_id: str, sphere_name: str, level: int):
-    seasons_data.setdefault("user_progress", {}).setdefault(user_id, {})[
-        sphere_name
-    ] = level
+def resolve_sphere_id_by_name(sphere_name: str, season_name: str | None = None) -> str | None:
+    normalized = str(sphere_name).strip().casefold()
+    target_season = str(season_name or seasons_data.get("active_season") or "")
+    for sid, sp in seasons_data.setdefault("spheres", {}).items():
+        if target_season and str(sp.get("season")) != target_season:
+            continue
+        if str(sp.get("name", "")).strip().casefold() == normalized:
+            return str(sid)
+    return None
+
+
+def get_user_sphere_level_by_requirement(user_id: str, sphere_name: str, season_name: str | None = None) -> int:
+    """Возвращает уровень сферы по требованию с учетом сезона и регистра."""
+    sid = resolve_sphere_id_by_name(sphere_name, season_name)
+    if sid:
+        return get_user_sphere_level(user_id, sid, season_name)
+    return 0
+
+
+def set_user_sphere_level(user_id: str, sphere_id: str, level: int, season_name: str | None = None):
+    get_user_progress_for_season(user_id, season_name)[str(sphere_id)] = int(level)
     save_seasons_data()
 
 
@@ -2818,6 +3159,7 @@ async def установитьсезон(ctx, year: str):
             return
 
     seasons_data["active_season"] = selected
+    get_season_progress_map(selected)
     save_seasons_data()
     await ctx.send(
         embed=Embed(
@@ -2831,18 +3173,35 @@ async def установитьсезон(ctx, year: str):
 @bot.command(name="удалитьсферу")
 @commands.has_permissions(administrator=True)
 async def удалитьсферу(ctx, *, sphere_name: str):
-    key = sphere_name.strip().lower()
-    sphere = seasons_data.get("spheres", {}).get(key)
-    if not sphere:
+    query = sphere_name.strip().casefold()
+    active = seasons_data.get("active_season")
+    matches = [
+        (k, v)
+        for k, v in seasons_data.get("spheres", {}).items()
+        if str(v.get("season")) == str(active)
+        and query in str(v.get("name", "")).strip().casefold()
+    ]
+    if not matches:
         await ctx.send(
             embed=Embed(
-                title="❌ Ошибка", description="Сфера не найдена.", color=0xFF0000
+                title="❌ Ошибка", description="Сфера не найдена в активном сезоне.", color=0xFF0000
             )
         )
         return
+    if len(matches) > 1:
+        lines = "\n".join([f"• {v.get('name')}" for _, v in matches[:10]])
+        await ctx.send(
+            embed=Embed(
+                title="⚠️ Несколько сфер",
+                description=f"Уточните название:\n{lines}",
+                color=0xFFA500,
+            )
+        )
+        return
+    key, sphere = matches[0]
     del seasons_data["spheres"][key]
-    for uid, progress in seasons_data.setdefault("user_progress", {}).items():
-        progress.pop(sphere.get("name"), None)
+    for _, progress in get_season_progress_map(active).items():
+        progress.pop(str(key), None)
     save_seasons_data()
     await ctx.send(
         embed=Embed(
@@ -2869,9 +3228,9 @@ async def удалитьсезон(ctx, year: str):
     ]
     for k in to_del:
         del seasons_data["spheres"][k]
+    seasons_data.setdefault("season_user_progress", {}).pop(str(year), None)
     if seasons_data.get("active_season") == year:
         seasons_data["active_season"] = None
-    seasons_data["user_progress"] = {}
     save_seasons_data()
     await ctx.send(
         embed=Embed(
@@ -3257,7 +3616,16 @@ async def создатьсферу(ctx):
         )
         return
 
-    key = name.lower()
+    key = build_sphere_id(season_year, name)
+    if key in seasons_data.setdefault("spheres", {}):
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description=f"Сфера **{name}** уже существует в сезоне **{season_year}**.",
+                color=0xFF0000,
+            )
+        )
+        return
     seasons_data.setdefault("spheres", {})[key] = {
         "id": key,
         "name": name,
@@ -3377,7 +3745,7 @@ async def редактсферу(ctx):
 
     old_name = sphere.get("name", sphere_key)
     old_key = sphere_key
-    new_key = new_name.lower()
+    new_key = build_sphere_id(new_season, new_name)
 
     updated_sphere = {
         "id": new_key,
@@ -3390,15 +3758,17 @@ async def редактсферу(ctx):
         seasons_data.setdefault("spheres", {}).pop(old_key, None)
     seasons_data.setdefault("spheres", {})[new_key] = updated_sphere
 
-    if new_name != old_name:
-        for _, progress_map in seasons_data.setdefault("user_progress", {}).items():
-            if old_name in progress_map and new_name not in progress_map:
-                progress_map[new_name] = progress_map.pop(old_name)
-            elif old_name in progress_map and new_name in progress_map:
-                progress_map[new_name] = max(
-                    int(progress_map[new_name]), int(progress_map.pop(old_name))
-                )
+    if old_key != new_key or old_name != new_name or sphere.get("season") != new_season:
+        old_season = str(sphere.get("season"))
+        old_map = get_season_progress_map(old_season)
+        new_map = get_season_progress_map(new_season)
+        for uid, progress_map in old_map.items():
+            if old_key in progress_map:
+                val = int(progress_map.pop(old_key))
+                target = new_map.setdefault(uid, {})
+                target[new_key] = max(int(target.get(new_key, 0)), val)
 
+    if new_name != old_name:
         for sp in seasons_data.setdefault("spheres", {}).values():
             for lvl in sp.get("levels", []):
                 for req in lvl.get("requirements", []):
@@ -3658,7 +4028,7 @@ class SphereReviewView(View):
             return
 
         user["наличка"] -= price
-        set_user_sphere_level(str(req["user_id"]), sphere["name"], req["level"])
+        set_user_sphere_level(str(req["user_id"]), req["sphere_id"], req["level"], sphere.get("season"))
         save_json(BALANCES_FILE, balances)
 
         guild = interaction.guild
@@ -3784,7 +4154,7 @@ async def принять_заявку(ctx, request_id: str):
         return
 
     user["наличка"] -= price
-    set_user_sphere_level(str(req["user_id"]), sphere["name"], int(req["level"]))
+    set_user_sphere_level(str(req["user_id"]), req["sphere_id"], int(req["level"]), sphere.get("season"))
     save_json(BALANCES_FILE, balances)
 
     member = ctx.guild.get_member(req["user_id"])
@@ -3932,7 +4302,7 @@ class SphereLevelsView(View):
     async def buy(self, interaction: Interaction, button: Button):
         sphere = seasons_data["spheres"][self.sphere_id]
         wanted_level = self.index + 1
-        current = get_user_sphere_level(str(interaction.user.id), sphere["name"])
+        current = get_user_sphere_level(str(interaction.user.id), sphere["id"], sphere.get("season"))
         if wanted_level != current + 1:
             await interaction.response.send_message(
                 "Можно покупать только следующий уровень по очереди.", ephemeral=True
@@ -3941,7 +4311,7 @@ class SphereLevelsView(View):
         reqs = sphere["levels"][self.index].get("requirements", [])
         for req in reqs:
             current_req_level = get_user_sphere_level_by_requirement(
-                str(interaction.user.id), req["sphere"]
+                str(interaction.user.id), req["sphere"], sphere.get("season")
             )
             required_level = int(req["level"])
             if current_req_level < required_level:
@@ -4005,8 +4375,15 @@ async def сферы(ctx):
 @commands.has_permissions(administrator=True)
 async def понизитьсферу(ctx, member: discord.Member):
     user_id = str(member.id)
-    progress = seasons_data.setdefault("user_progress", {}).setdefault(user_id, {})
-    current = [(name, int(level)) for name, level in progress.items() if int(level) > 0]
+    active = seasons_data.get("active_season")
+    progress = get_user_progress_for_season(user_id, active)
+    current = []
+    for sid, level in progress.items():
+        lvl = int(level)
+        if lvl <= 0:
+            continue
+        sp = seasons_data.setdefault("spheres", {}).get(str(sid), {})
+        current.append((str(sid), sp.get("name", str(sid)), lvl))
     if not current:
         await ctx.send(
             embed=Embed(
@@ -4042,13 +4419,14 @@ async def понизитьсферу(ctx, member: discord.Member):
         if ":" not in raw:
             raise ValueError("Неверный формат")
         sphere_name, level_text = [x.strip() for x in raw.split(":", 1)]
-        if sphere_name not in progress:
-            raise ValueError("Сфера не найдена у игрока")
+        sid = resolve_sphere_id_by_name(sphere_name, active)
+        if not sid or sid not in progress:
+            raise ValueError("Сфера не найдена у игрока в активном сезоне")
         new_level = int(level_text)
-        old_level = int(progress.get(sphere_name, 0))
+        old_level = int(progress.get(sid, 0))
         if new_level < 0 or new_level >= old_level:
             raise ValueError("Новый уровень должен быть меньше текущего и не ниже 0")
-        progress[sphere_name] = new_level
+        progress[sid] = new_level
         save_seasons_data()
     except Exception as e:
         await ctx.send(
@@ -4063,7 +4441,7 @@ async def понизитьсферу(ctx, member: discord.Member):
     await ctx.send(
         embed=Embed(
             title="✅ Сфера понижена",
-            description=f"{member.mention}: **{sphere_name}** → уровень **{new_level}**.",
+            description=f"{member.mention}: **{sphere_name}** (сезон {active}) → уровень **{new_level}**.",
             color=0x00FF00,
         )
     )
@@ -5388,6 +5766,19 @@ class VerdictPanelView(View):
         await interaction.response.send_modal(VerdictRequestModal())
 
 
+def _can_manage_verdicts_member(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return has_custom_command_access(member, "вердикты")
+
+
+def _is_unreviewed_verdict(req: dict) -> bool:
+    return str(req.get("status", "pending")).strip().lower() in {
+        "pending",
+        "pending_moderation",
+    }
+
+
 @bot.command(name="вердикты")
 async def вердикты(ctx):
     await ctx.send(
@@ -5395,6 +5786,102 @@ async def вердикты(ctx):
             title="ℹ️ Вердикты",
             description="Служебная команда для настройки прав. Используйте `!разрешить @роль вердикты`.",
             color=0x3498DB,
+        )
+    )
+
+
+@bot.command(name="очиститьверды")
+async def очиститьверды(ctx):
+    if not _can_manage_verdicts_member(ctx.author):
+        await ctx.send(
+            embed=Embed(
+                title="❌ Нет доступа",
+                description="Команда доступна только администрации или ролям с правом `вердикты`.",
+                color=0xE74C3C,
+            )
+        )
+        return
+
+    requests = verdicts_data.setdefault("requests", {})
+    to_delete = [rid for rid, req in requests.items() if _is_unreviewed_verdict(req)]
+    for rid in to_delete:
+        requests.pop(rid, None)
+
+    save_verdicts_data()
+    await ctx.send(
+        embed=Embed(
+            title="🧹 Нерассмотренные вердикты очищены",
+            description=(
+                f"Удалено заявок: **{len(to_delete)}**.\n"
+                "Теперь игроки могут отправить новые заявки на вердикт."
+            ),
+            color=0x2ECC71,
+        )
+    )
+
+
+@bot.command(name="принятьверд")
+async def принятьверд(ctx, number: int):
+    if not _can_manage_verdicts_member(ctx.author):
+        await ctx.send(
+            embed=Embed(
+                title="❌ Нет доступа",
+                description="Команда доступна только администрации или ролям с правом `вердикты`.",
+                color=0xE74C3C,
+            )
+        )
+        return
+
+    req = verdicts_data.setdefault("requests", {}).get(str(number))
+    if not req:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Заявка не найдена",
+                description=f"Заявка вердикта **#{number}** отсутствует.",
+                color=0xE74C3C,
+            )
+        )
+        return
+
+    if not _is_unreviewed_verdict(req):
+        await ctx.send(
+            embed=Embed(
+                title="⚠️ Уже рассмотрено",
+                description=f"Заявка **#{number}** уже имеет статус: `{req.get('status')}`.",
+                color=0xF1C40F,
+            )
+        )
+        return
+
+    req_channel = None
+    req_channel_id = verdicts_data.get("requests_channel")
+    if req_channel_id:
+        req_channel = await get_channel_safe(req_channel_id)
+    if req_channel is None:
+        req_channel = ctx.channel
+
+    link = req.get("message_link") or "—"
+    embed = Embed(title=f"📨 Заявка на вердикт #{number}", color=0x3498DB)
+    embed.add_field(name="От", value=f"<@{req.get('author_id')}>", inline=False)
+    embed.add_field(name="Ссылка", value=str(link), inline=False)
+    embed.add_field(name="Статус", value="⏳ На рассмотрении", inline=False)
+
+    content = verdict_ping_roles_line(req_channel.guild) if getattr(req_channel, "guild", None) else ""
+    msg = await req_channel.send(
+        content=(content or None),
+        embed=embed,
+        view=VerdictReviewView(str(number)),
+    )
+    req["request_message_id"] = msg.id
+    req["request_channel_id"] = msg.channel.id
+    req["status"] = "pending"
+    save_verdicts_data()
+
+    await ctx.send(
+        embed=Embed(
+            title="✅ Меню вердикта восстановлено",
+            description=f"Для заявки **#{number}** отправлено новое меню рассмотрения в {msg.channel.mention}.",
+            color=0x2ECC71,
         )
     )
 
@@ -5445,6 +5932,1380 @@ async def итогвердиктканал(ctx, channel: discord.TextChannel):
             color=0x00FF00,
         )
     )
+
+
+def partnership_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("партнерства")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+def build_partnership_request_embed(req: dict, status_text: str | None = None, color=0x3498DB):
+    text = status_text or req.get("status_text") or "⏳ На рассмотрении"
+    em = Embed(title=f"🤝 Заявка на партнерство #{req.get('id')}", color=color)
+    em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
+    em.add_field(name="Жанр сервера", value=req.get("genre") or "—", inline=False)
+    em.add_field(name="Описание сервера", value=req.get("description") or "—", inline=False)
+    em.add_field(name="Статус", value=text, inline=False)
+    screenshot_url = req.get("screenshot_url")
+    if screenshot_url:
+        em.set_image(url=screenshot_url)
+    return em
+
+
+async def _edit_partnership_request_message(guild: discord.Guild, req: dict, status_text: str, color: discord.Color):
+    channel_id = req.get("request_channel_id")
+    message_id = req.get("request_message_id")
+    if not channel_id or not message_id:
+        return
+    ch = guild.get_channel(int(channel_id)) if guild else None
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(message_id))
+        em = build_partnership_request_embed(req, status_text=status_text, color=color.value)
+        await msg.edit(embed=em, view=None)
+    except Exception:
+        pass
+
+
+class PartnershipRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения партнерства", timeout=300)
+        self.reason = TextInput(
+            label="Причина",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = partnership_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        reason = str(self.reason.value).strip()
+        req["status"] = "rejected"
+        req["reject_reason"] = reason
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"❌ Отклонено\nМодератор: {interaction.user.mention}\nПричина: {reason}"
+        save_partnership_data()
+
+        await _edit_partnership_request_message(
+            interaction.guild,
+            req,
+            req["status_text"],
+            discord.Color.red(),
+        )
+
+        try:
+            member = interaction.guild.get_member(int(req.get("author_id"))) if interaction.guild and str(req.get("author_id", "")).isdigit() else None
+            if member:
+                await member.send(
+                    embed=Embed(
+                        title="❌ Партнерство отклонено",
+                        description=f"Ваша заявка #{self.req_id} отклонена.\n**Причина:** {reason}",
+                        color=0xFF0000,
+                    )
+                )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            embed=build_partnership_request_embed(req, status_text=req["status_text"], color=discord.Color.red().value),
+            view=None,
+        )
+
+
+class PartnershipReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
+        if has_custom_command_access(interaction.user, "партнерства"):
+            return True
+        await interaction.response.send_message(
+            "❌ Нет доступа к заявкам партнерства.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="✅ Принять", style=ButtonStyle.success, custom_id="partner:approve")
+    async def approve(self, interaction: Interaction, button: Button):
+        req = partnership_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        if req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+
+        req["status"] = "approved"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"✅ Принято\nМодератор: {interaction.user.mention}"
+        save_partnership_data()
+
+        await _edit_partnership_request_message(
+            interaction.guild,
+            req,
+            req["status_text"],
+            discord.Color.green(),
+        )
+
+        result_channel_id = partnership_data.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            post = Embed(
+                title="🤝 Новая партнерка",
+                description=req.get("description") or "—",
+                color=0x2ECC71,
+            )
+            post.add_field(name="Жанр сервера", value=req.get("genre") or "—", inline=False)
+            post.add_field(name="Партнер", value=f"<@{req.get('author_id')}>", inline=False)
+            await result_channel.send(embed=post)
+
+        try:
+            member = interaction.guild.get_member(int(req.get("author_id"))) if interaction.guild and str(req.get("author_id", "")).isdigit() else None
+            if member:
+                await member.send(
+                    embed=Embed(
+                        title="✅ Партнерство принято",
+                        description=f"Ваша заявка #{self.req_id} принята.",
+                        color=0x00FF00,
+                    )
+                )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            embed=build_partnership_request_embed(req, status_text=req["status_text"], color=discord.Color.green().value),
+            view=None,
+        )
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="partner:reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        req = partnership_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        if req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PartnershipRejectModal(self.req_id))
+
+
+class PartnershipRequestModal(Modal):
+    def __init__(self):
+        super().__init__(title="Заявка на партнерство", timeout=600)
+        self.genre = TextInput(label="Жанр сервера", required=True, max_length=120)
+        self.description = TextInput(
+            label="Описание сервера",
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.add_item(self.genre)
+        self.add_item(self.description)
+
+    async def on_submit(self, interaction: Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Команда доступна только на сервере.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "✅ Форма принята. Проверьте ЛС с ботом и отправьте скриншот опубликованной нашей партнерки.",
+            ephemeral=True,
+        )
+
+        dm = await interaction.user.create_dm()
+        await dm.send(
+            embed=Embed(
+                title="📩 Нужен скриншот",
+                description=(
+                    "Отправьте **одним сообщением** скриншот опубликованной нашей партнерки.\n"
+                    "Время ожидания: 10 минут."
+                ),
+                color=0x3498DB,
+            )
+        )
+
+        def check_dm(msg: discord.Message):
+            return (
+                msg.author.id == interaction.user.id
+                and isinstance(msg.channel, discord.DMChannel)
+                and len(msg.attachments) > 0
+            )
+
+        try:
+            dm_msg = await bot.wait_for("message", check=check_dm, timeout=600)
+        except Exception:
+            await interaction.followup.send(
+                "⏰ Время ожидания скриншота истекло. Подайте заявку заново.",
+                ephemeral=True,
+            )
+            return
+
+        req_id = int(partnership_data.get("next_id", 1))
+        partnership_data["next_id"] = req_id + 1
+        screenshot_url = dm_msg.attachments[0].url
+        req = {
+            "id": req_id,
+            "author_id": str(interaction.user.id),
+            "genre": str(self.genre.value).strip(),
+            "description": str(self.description.value).strip(),
+            "screenshot_url": screenshot_url,
+            "status": "pending",
+            "status_text": "⏳ На рассмотрении",
+            "created_at": int(time.time()),
+        }
+        partnership_data.setdefault("requests", {})[str(req_id)] = req
+        save_partnership_data()
+
+        req_channel_id = partnership_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if not req_channel:
+            await interaction.followup.send(
+                "❌ Канал заявок партнерок не настроен (`!заявкипартнерокканал`).",
+                ephemeral=True,
+            )
+            return
+
+        content = partnership_ping_roles_line(interaction.guild) or None
+        msg = await req_channel.send(
+            content=content,
+            embed=build_partnership_request_embed(req),
+            view=PartnershipReviewView(str(req_id)),
+        )
+        req["request_message_id"] = msg.id
+        req["request_channel_id"] = req_channel.id
+        save_partnership_data()
+
+        await interaction.followup.send(
+            f"✅ Заявка #{req_id} отправлена в канал модерации партнерок.",
+            ephemeral=True,
+        )
+
+
+class PartnershipPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Подать партнерку",
+        style=ButtonStyle.primary,
+        custom_id="partnership:request",
+    )
+    async def request(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(PartnershipRequestModal())
+
+
+@bot.command(name="партнерства", aliases=["партнерство"])
+async def партнерства(ctx):
+    await ctx.send(
+        embed=Embed(
+            title="ℹ️ Партнерства",
+            description="Служебная команда для настройки прав. Используйте `!разрешить @роль партнерства`.",
+            color=0x3498DB,
+        )
+    )
+
+
+@bot.command(name="податьпартнеркуканал")
+@commands.has_permissions(administrator=True)
+async def податьпартнеркуканал(ctx, channel: discord.TextChannel):
+    partnership_data["panel_channel"] = channel.id
+    save_partnership_data()
+    panel_embed = Embed(
+        title="🤝 Быстрая партнерка",
+        description=(
+            "Нажмите кнопку ниже, чтобы подать заявку на партнерство.\n\n"
+            "**Условия:**\n"
+            "• Укажите жанр и описание сервера в форме.\n"
+            "• После формы отправьте в ЛС боту скрин опубликованной нашей партнерки.\n"
+            "• Заявка уйдёт на модерацию."
+        ),
+        color=0x3498DB,
+    )
+    await channel.send(embed=panel_embed, view=PartnershipPanelView())
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал подачи партнерки установлен",
+            description=f"Канал: {channel.mention}",
+            color=0x00FF00,
+        )
+    )
+
+
+@bot.command(name="заявкипартнерокканал")
+@commands.has_permissions(administrator=True)
+async def заявкипартнерокканал(ctx, channel: discord.TextChannel):
+    partnership_data["requests_channel"] = channel.id
+    save_partnership_data()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал заявок партнерок установлен",
+            description=f"Канал: {channel.mention}",
+            color=0x00FF00,
+        )
+    )
+
+
+@bot.command(name="партнеркиканал")
+@commands.has_permissions(administrator=True)
+async def партнеркиканал(ctx, channel: discord.TextChannel):
+    partnership_data["result_channel"] = channel.id
+    save_partnership_data()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал партнерок установлен",
+            description=f"Канал: {channel.mention}",
+            color=0x00FF00,
+        )
+    )
+
+
+
+
+def investment_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("инвестиции")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+def build_investment_request_embed(req: dict, status_text: str | None = None, color=0x3498DB):
+    text = status_text or req.get("status_text") or "⏳ На рассмотрении"
+    em = Embed(title=f"📈 Заявка на инвестицию #{req.get('id')}", color=color)
+    em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
+    em.add_field(name="Ссылка на пост", value=req.get("post_url") or "—", inline=False)
+    em.add_field(name="Краткое описание", value=req.get("description") or "—", inline=False)
+    em.add_field(name="Сумма инвестиций", value=req.get("amount") or "—", inline=False)
+    em.add_field(name="Статус", value=text, inline=False)
+    processed_by = req.get("processed_by")
+    if processed_by:
+        em.add_field(name="Рассмотрел", value=f"<@{processed_by}>", inline=False)
+    return em
+
+
+class InvestmentActionModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Оформить инвестицию", timeout=600)
+        self.inv_description = TextInput(label="Описание инвестиций", style=discord.TextStyle.paragraph, required=True, max_length=1200)
+        self.profit = TextInput(label="Сумма/% прибыли", required=True, max_length=100)
+        self.start_year = TextInput(label='Начало начисления прибыли: "год" или "скип"', required=True, default="скип", max_length=64)
+        self.cooldown = TextInput(label="Кулдаун прибыли", required=True, default="24ч", max_length=64)
+        self.duration = TextInput(label="Сколько действует инвестиция", required=True, default="7д", max_length=64)
+        self.add_item(self.inv_description)
+        self.add_item(self.profit)
+        self.add_item(self.start_year)
+        self.add_item(self.cooldown)
+        self.add_item(self.duration)
+
+    async def on_submit(self, interaction: Interaction):
+        req = investments.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        now_ts = int(time.time())
+        req_author_id = str(req.get("author_id") or "")
+        if not req_author_id:
+            await interaction.response.send_message("❌ Не удалось определить автора заявки.", ephemeral=True)
+            return
+
+        user = ensure_user(req_author_id)
+        try:
+            invest_amount = parse_money_value(str(req.get("amount", "0")).strip(), int(user.get("наличка", 0)))
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверная сумма инвестиций в заявке: {e}", ephemeral=True)
+            return
+
+        if invest_amount <= 0:
+            await interaction.response.send_message("❌ Сумма инвестиций должна быть больше 0.", ephemeral=True)
+            return
+
+        available_cash = int(user.get("наличка", 0)) - int(user.get("заморожено", 0))
+        if invest_amount > available_cash:
+            await interaction.response.send_message(
+                f"❌ У автора заявки недостаточно средств. Доступно: {available_cash:,}. Нужно: {invest_amount:,}.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            cooldown_secs = max(60, parse_interval(str(self.cooldown.value).strip()))
+            duration_secs = max(60, parse_interval(str(self.duration.value).strip()))
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный формат времени: {e}", ephemeral=True)
+            return
+
+        payout_raw = str(self.profit.value).strip()
+        try:
+            total_return = parse_money_value(payout_raw, invest_amount)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный формат суммы/% прибыли: {e}", ephemeral=True)
+            return
+
+        if total_return <= 0:
+            await interaction.response.send_message("❌ Итоговая сумма выплаты должна быть больше 0.", ephemeral=True)
+            return
+
+        cycles_total = max(1, math.ceil(duration_secs / cooldown_secs))
+
+        start_raw = str(self.start_year.value).strip().lower()
+        pending_year = None
+        start_at = now_ts
+        if start_raw != "скип":
+            try:
+                pending_year = int(start_raw)
+            except Exception:
+                await interaction.response.send_message("❌ Укажите игровой год числом или `скип`.", ephemeral=True)
+                return
+            start_at = now_ts + cooldown_secs
+
+        inv_id = str(int(time.time() * 1000))
+        active = {
+            "id": inv_id,
+            "request_id": self.req_id,
+            "user_id": req_author_id,
+            "description": str(self.inv_description.value).strip(),
+            "payout": payout_raw,
+            "invest_amount": int(invest_amount),
+            "total_return": int(total_return),
+            "paid_amount": 0,
+            "cycles_total": int(cycles_total),
+            "cycles_paid": 0,
+            "cooldown": int(cooldown_secs),
+            "duration": int(duration_secs),
+            "start_at": int(start_at),
+            "next_at": int(start_at),
+            "expires_at": int(start_at + duration_secs),
+            "created_by": str(interaction.user.id),
+            "status": "pending_year" if pending_year is not None else "active",
+            "pending_year": pending_year,
+            "created_at": now_ts,
+        }
+        investments.setdefault("active_investments", {})[inv_id] = active
+
+        user["наличка"] = int(user.get("наличка", 0)) - int(invest_amount)
+
+        req["status"] = "approved"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.display_name}"
+        req["investment_id"] = inv_id
+        save_json(BALANCES_FILE, balances)
+        save_investments()
+
+        result_channel_id = investments.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        start_text = (
+            f"с игрового года **{pending_year}**"
+            if pending_year is not None
+            else "сразу"
+        )
+        result_embed = Embed(title=f"✅ Инвестиция одобрена #{self.req_id}", color=0x00FF00)
+        result_embed.add_field(name="Автор заявки", value=f"<@{req.get('author_id')}>", inline=False)
+        result_embed.add_field(name="Описание инвестиций", value=active["description"], inline=False)
+        result_embed.add_field(name="Вложено", value=f"{invest_amount:,}", inline=True)
+        result_embed.add_field(name="Итог к выплате", value=f"{total_return:,}", inline=True)
+        result_embed.add_field(name="Начало", value=start_text, inline=True)
+        result_embed.add_field(name="Кулдаун", value=format_interval(cooldown_secs), inline=True)
+        result_embed.add_field(name="Срок действия", value=format_interval(duration_secs), inline=True)
+        result_embed.add_field(name="Частей выплаты", value=str(cycles_total), inline=True)
+        if result_channel:
+            await result_channel.send(content=f"<@{req.get('author_id')}>", embed=result_embed)
+
+        await interaction.response.edit_message(
+            embed=build_investment_request_embed(req, status_text=req["status_text"], color=discord.Color.green().value),
+            view=None,
+        )
+
+
+class InvestmentRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения инвестиции", timeout=300)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = investments.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        reason = str(self.reason.value).strip()
+        req["status"] = "rejected"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.display_name}\nПричина: {reason}"
+        req["reject_reason"] = reason
+        save_investments()
+
+        result_channel_id = investments.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            await result_channel.send(
+                content=f"<@{req.get('author_id')}>",
+                embed=Embed(
+                    title=f"❌ Инвестиция отклонена #{self.req_id}",
+                    description=f"**Причина:** {reason}",
+                    color=0xFF0000,
+                ),
+            )
+
+        await interaction.response.edit_message(
+            embed=build_investment_request_embed(req, status_text=req["status_text"], color=discord.Color.red().value),
+            view=None,
+        )
+
+
+class InvestmentReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if has_custom_command_access(interaction.user, "инвестиции"):
+            return True
+        await interaction.response.send_message("❌ Нет доступа к заявкам инвестиций.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="✅ Принять", style=ButtonStyle.success, custom_id="investment:approve")
+    async def approve(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(InvestmentActionModal(self.req_id))
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="investment:reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(InvestmentRejectModal(self.req_id))
+
+
+class InvestmentRequestModal(Modal):
+    def __init__(self):
+        super().__init__(title="Заявка на инвестицию", timeout=600)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.description = TextInput(label="Краткое описание", style=discord.TextStyle.paragraph, required=True, max_length=1200)
+        self.amount = TextInput(label="Сумма инвестиций", required=True, max_length=100)
+        self.add_item(self.post_url)
+        self.add_item(self.description)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: Interaction):
+        req_id = int(investments.get("next_id", 1))
+        investments["next_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "author_id": str(interaction.user.id),
+            "post_url": str(self.post_url.value).strip(),
+            "description": str(self.description.value).strip(),
+            "amount": str(self.amount.value).strip(),
+            "status": "pending",
+            "status_text": "⏳ На рассмотрении",
+            "created_at": int(time.time()),
+        }
+        investments.setdefault("requests", {})[str(req_id)] = req
+        save_investments()
+
+        req_channel_id = investments.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if not req_channel:
+            await interaction.response.send_message("❌ Канал заявок инвестиций не настроен (`!заявкиинвестиций`).", ephemeral=True)
+            return
+
+        content = investment_ping_roles_line(interaction.guild) or None
+        msg = await req_channel.send(content=content, embed=build_investment_request_embed(req), view=InvestmentReviewView(str(req_id)))
+        req["request_channel_id"] = msg.channel.id
+        req["request_message_id"] = msg.id
+        save_investments()
+        await interaction.response.send_message(f"✅ Заявка #{req_id} отправлена.", ephemeral=True)
+
+
+class InvestmentPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Подать инвестицию", style=ButtonStyle.primary, custom_id="investment:request")
+    async def request(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(InvestmentRequestModal())
+
+
+@bot.command(name="инвестиции")
+async def инвестиции(ctx):
+    await ctx.send(
+        embed=Embed(
+            title="ℹ️ Инвестиции",
+            description="Служебная команда для настройки прав. Используйте `!разрешить @роль инвестиции`.",
+            color=0x3498DB,
+        )
+    )
+
+
+@bot.command(name="податьинвестициюканал")
+@commands.has_permissions(administrator=True)
+async def податьинвестициюканал(ctx, channel: discord.TextChannel):
+    investments["panel_channel"] = channel.id
+    save_investments()
+    em = Embed(
+        title="📈 Инвестиционные заявки",
+        description="Нажмите кнопку ниже, чтобы подать заявку на инвестицию.",
+        color=0x3498DB,
+    )
+    await channel.send(embed=em, view=InvestmentPanelView())
+    await ctx.send(embed=Embed(title="✅ Канал панели инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="заявкиинвестиций")
+@commands.has_permissions(administrator=True)
+async def заявкиинвестиций(ctx, channel: discord.TextChannel):
+    investments["requests_channel"] = channel.id
+    save_investments()
+    await ctx.send(embed=Embed(title="✅ Канал заявок инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="итогинвестицийканал")
+@commands.has_permissions(administrator=True)
+async def итогинвестицийканал(ctx, channel: discord.TextChannel):
+    investments["result_channel"] = channel.id
+    save_investments()
+    await ctx.send(embed=Embed(title="✅ Канал итогов инвестиций установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+
+
+def company_ping_roles_line(guild: discord.Guild):
+    access = get_command_access("компании")
+    role_ids = access.get("roles", [])
+    mentions = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid)) if guild and str(rid).isdigit() else None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions).strip()
+
+
+async def get_channel_safe(channel_id):
+    if not channel_id:
+        return None
+    try:
+        cid = int(channel_id)
+    except (TypeError, ValueError):
+        return None
+    ch = bot.get_channel(cid)
+    if ch:
+        return ch
+    try:
+        fetched = await bot.fetch_channel(cid)
+        return fetched if isinstance(fetched, discord.abc.Messageable) else None
+    except Exception:
+        return None
+
+
+def find_companies_by_name(query: str, owner_id: str | None = None):
+    q = str(query or "").strip().lower()
+    all_companies = list(companies_data.setdefault("companies", {}).values())
+    if owner_id is not None:
+        all_companies = [c for c in all_companies if str(c.get("owner_id")) == str(owner_id)]
+    if q == "*":
+        return all_companies
+    if not q:
+        return []
+    exact = [c for c in all_companies if str(c.get("name", "")).strip().lower() == q]
+    if exact:
+        return exact
+    return [c for c in all_companies if q in str(c.get("name", "")).strip().lower()]
+
+
+def build_company_request_embed(req: dict, color=0x3498DB):
+    em = Embed(title=f"🏢 Заявка компании #{req.get('id')} ({req.get('type')})", color=color)
+    em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
+    em.add_field(name="Статус", value=req.get("status_text", "⏳ На рассмотрении"), inline=False)
+    payload = req.get("payload", {})
+    for key, value in payload.items():
+        em.add_field(name=str(key), value=str(value), inline=False)
+    return em
+
+
+class CompanyCreateModal(Modal):
+    def __init__(self):
+        super().__init__(title="Создание компании", timeout=600)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.company_name = TextInput(label="Название компании", required=True, max_length=120)
+        self.specialization = TextInput(label="Специализация", required=True, max_length=200)
+        self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100)
+        self.add_item(self.post_url)
+        self.add_item(self.company_name)
+        self.add_item(self.specialization)
+        self.add_item(self.first_invest)
+
+    async def on_submit(self, interaction: Interaction):
+        if not is_registered_player(str(interaction.user.id)):
+            await interaction.response.send_message("❌ Компании доступны только зарегистрированным игрокам (`!рег`).", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "create",
+            "author_id": str(interaction.user.id),
+            "status": "pending",
+            "status_text": "⏳ На рассмотрении",
+            "payload": {
+                "Ссылка на пост": str(self.post_url.value).strip(),
+                "Название": str(self.company_name.value).strip(),
+                "Специализация": str(self.specialization.value).strip(),
+                "Первый вклад": str(self.first_invest.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        ch_id = companies_data.get("requests_channel")
+        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
+        if not ch:
+            await interaction.response.send_message("❌ Канал заявок компаний не настроен (`!заявкикомпаний`).", ephemeral=True)
+            return
+
+        content = company_ping_roles_line(interaction.guild) or None
+        msg = await ch.send(content=content, embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
+        req["request_channel_id"] = msg.channel.id
+        req["request_message_id"] = msg.id
+        save_companies_data()
+        await interaction.response.send_message(f"✅ Заявка #{req_id} отправлена.", ephemeral=True)
+
+
+class CompanyBuyModal(Modal):
+    def __init__(self):
+        super().__init__(title="Купить компанию", timeout=600)
+        self.company_name = TextInput(label="Название компании (можно частично)", required=True, max_length=120)
+        self.post_url = TextInput(label="Пост", required=True, max_length=400)
+        self.offer = TextInput(label="Сколько денег предлагаете", required=True, max_length=100)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        for item in (self.company_name, self.post_url, self.offer, self.reason):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        buyer_id = str(interaction.user.id)
+        if not is_registered_player(buyer_id):
+            await interaction.response.send_message("❌ Купить компанию могут только зарегистрированные игроки.", ephemeral=True)
+            return
+
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=None)
+        if not matches:
+            await interaction.response.send_message("❌ Компания с таким названием не найдена.", ephemeral=True)
+            return
+        if len(matches) > 1:
+            names = "\n".join([f"• {c.get('name', 'Без названия')} (владелец: <@{c.get('owner_id')}>)" for c in matches[:10]])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько компаний. Уточните название и подтвердите выбор:\n" + names,
+                ephemeral=True,
+            )
+            return
+        company = matches[0]
+        if str(company.get("owner_id")) == buyer_id:
+            await interaction.response.send_message("❌ Вы уже владелец этой компании.", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "buy",
+            "author_id": buyer_id,
+            "owner_id": str(company.get("owner_id")),
+            "decision_user_id": str(company.get("owner_id")),
+            "company_id": str(company.get("id")),
+            "status": "pending_owner",
+            "status_text": "⏳ Ожидает решения владельца",
+            "payload": {
+                "Пост": str(self.post_url.value).strip(),
+                "Предложение": str(self.offer.value).strip(),
+                "Причина": str(self.reason.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        owner = interaction.guild.get_member(int(req["owner_id"])) if interaction.guild else None
+        if owner:
+            try:
+                dm_msg = await owner.send(
+                    content=f"📩 Новое предложение о покупке вашей компании **{company.get('name')}** от {interaction.user.mention}",
+                    embed=build_company_request_embed(req),
+                    view=CompanyOwnerDecisionView(str(req_id)),
+                )
+                req["decision_channel_id"] = dm_msg.channel.id
+                req["decision_message_id"] = dm_msg.id
+                save_companies_data()
+            except Exception:
+                pass
+
+        await interaction.response.send_message("✅ Предложение отправлено владельцу компании в ЛС.", ephemeral=True)
+
+
+class CompanySellModal(Modal):
+    def __init__(self):
+        super().__init__(title="Продать компанию", timeout=600)
+        self.company_name = TextInput(label="Название компании (можно частично)", required=True, max_length=120)
+        self.buyer_id = TextInput(label="ID покупателя", required=True, max_length=30)
+        self.post_url = TextInput(label="Пост", required=True, max_length=400)
+        self.price = TextInput(label="Цена продажи", required=True, max_length=100)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        for item in (self.company_name, self.buyer_id, self.post_url, self.price, self.reason):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        owner_id = str(interaction.user.id)
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
+        if not matches:
+            await interaction.response.send_message("❌ У вас нет компании с таким названием.", ephemeral=True)
+            return
+        if len(matches) > 1:
+            names = "\n".join([f"• {c.get('name', 'Без названия')}" for c in matches[:10]])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько ваших компаний. Уточните название:\n" + names,
+                ephemeral=True,
+            )
+            return
+        company = matches[0]
+
+        buyer_id = str(self.buyer_id.value).strip().replace("<@", "").replace(">", "").replace("!", "")
+        if not buyer_id.isdigit() or not is_registered_player(buyer_id):
+            await interaction.response.send_message("❌ Покупатель должен быть зарегистрированным игроком (ID).", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "sell",
+            "author_id": owner_id,
+            "buyer_id": buyer_id,
+            "decision_user_id": buyer_id,
+            "company_id": str(company.get("id")),
+            "status": "pending_buyer",
+            "status_text": "⏳ Ожидает решения второй стороны",
+            "payload": {
+                "Пост": str(self.post_url.value).strip(),
+                "Цена": str(self.price.value).strip(),
+                "Причина": str(self.reason.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        buyer_member = interaction.guild.get_member(int(buyer_id)) if interaction.guild else None
+        if buyer_member:
+            try:
+                dm_msg = await buyer_member.send(
+                    content=f"📩 Вам предложили покупку компании **{company.get('name')}** от {interaction.user.mention}",
+                    embed=build_company_request_embed(req),
+                    view=CompanyOwnerDecisionView(str(req_id)),
+                )
+                req["decision_channel_id"] = dm_msg.channel.id
+                req["decision_message_id"] = dm_msg.id
+                save_companies_data()
+            except Exception:
+                pass
+
+        save_companies_data()
+        await interaction.response.send_message("✅ Предложение отправлено второй стороне в ЛС.", ephemeral=True)
+
+
+class CompanyUpgradeModal(Modal):
+    def __init__(self):
+        super().__init__(title="Улучшить компанию", timeout=600)
+        self.company_name = TextInput(label="Название компании (можно частично)", required=True, max_length=120)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.invest = TextInput(label="Вклад денег", required=True, max_length=100)
+        for item in (self.company_name, self.post_url, self.invest):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        owner_id = str(interaction.user.id)
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
+        if not matches:
+            await interaction.response.send_message("❌ У вас нет компании с таким названием.", ephemeral=True)
+            return
+        if len(matches) > 1:
+            names = "\n".join([f"• {c.get('name', 'Без названия')}" for c in matches[:10]])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько ваших компаний. Уточните название:\n" + names,
+                ephemeral=True,
+            )
+            return
+        company = matches[0]
+        cid = str(company.get("id"))
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "upgrade",
+            "author_id": owner_id,
+            "company_id": cid,
+            "status": "pending_moderation",
+            "status_text": "⏳ На рассмотрении модерации",
+            "payload": {
+                "Ссылка на пост": str(self.post_url.value).strip(),
+                "Вклад": str(self.invest.value).strip(),
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        req_channel_id = companies_data.get("requests_channel")
+        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        if req_channel:
+            content = company_ping_roles_line(interaction.guild) or None
+            msg = await req_channel.send(content=content, embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
+            req["request_channel_id"] = msg.channel.id
+            req["request_message_id"] = msg.id
+            save_companies_data()
+
+        await interaction.response.send_message("✅ Заявка на улучшение отправлена.", ephemeral=True)
+
+
+class CompanyOwnerRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения предложения", timeout=300)
+        self.reason = TextInput(label="Причина", required=True, style=discord.TextStyle.paragraph, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req["status"] = "rejected_by_owner"
+        req["status_text"] = f"❌ Отклонено владельцем\nПартнер: {interaction.user.display_name}\nПричина: {self.reason.value}"
+        req["owner_reason"] = str(self.reason.value).strip()
+        save_companies_data()
+
+        result_channel = await get_channel_safe(companies_data.get("result_channel"))
+        if result_channel:
+            mentions = [f"<@{req.get('author_id')}>", f"<@{req.get('owner_id')}>"]
+            if req.get("buyer_id"):
+                mentions.append(f"<@{req.get('buyer_id')}>")
+            await result_channel.send(content=" ".join(sorted(set(mentions))), embed=build_company_request_embed(req, color=0xE74C3C))
+        await interaction.response.edit_message(
+            embed=build_company_request_embed(req, color=0xE74C3C),
+            view=None,
+        )
+
+
+class CompanyOwnerDecisionView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    @discord.ui.button(label="✅ Принять", style=ButtonStyle.success, custom_id="company:owner_accept")
+    async def accept(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        decision_user_id = str(req.get("decision_user_id") or req.get("owner_id") or req.get("buyer_id") or "")
+        if decision_user_id != str(interaction.user.id):
+            await interaction.response.send_message("❌ Только вторая сторона сделки может принять.", ephemeral=True)
+            return
+
+        if req.get("status") not in ("pending_owner", "pending_buyer"):
+            await interaction.response.send_message("❌ Эта заявка уже обработана.", ephemeral=True)
+            return
+
+        req["status"] = "pending_moderation"
+        req["status_text"] = f"⏳ Вторая сторона согласовала. Ожидает модерацию\nПартнер: {interaction.user.display_name}"
+
+        req_channel = await get_channel_safe(companies_data.get("requests_channel"))
+        if req_channel:
+            second_party = str(req.get("owner_id") or req.get("buyer_id") or "")
+            content = (f"<@{req.get('author_id')}> " + (f"<@{second_party}> " if second_party else "") + company_ping_roles_line(req_channel.guild)).strip()
+            msg = await req_channel.send(content=content or None, embed=build_company_request_embed(req), view=CompanyReviewView(self.req_id))
+            req["request_channel_id"] = msg.channel.id
+            req["request_message_id"] = msg.id
+
+        save_companies_data()
+        await interaction.response.edit_message(
+            embed=build_company_request_embed(req, color=0xF1C40F),
+            view=None,
+        )
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:owner_reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return
+        decision_user_id = str(req.get("decision_user_id") or req.get("owner_id") or req.get("buyer_id") or "")
+        if decision_user_id != str(interaction.user.id):
+            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return
+        if req.get("status") not in ("pending_owner", "pending_buyer"):
+            await interaction.response.send_message("❌ Эта заявка уже обработана.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CompanyOwnerRejectModal(self.req_id))
+
+
+class CompanyApplyChangesModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = companies_data.get("requests", {}).get(self.req_id, {})
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")), {}) if req else {}
+        super().__init__(title="Изменения компании", timeout=600)
+        self.expense_amount = TextInput(label="1. Сменить сумму затрат", required=False, max_length=100, default=str(company.get("expense_amount", "")))
+        self.expense_cd = TextInput(label="2. Сменить кулдаун затрат", required=False, max_length=100, default=format_interval(int(company.get("expense_cooldown", 86400))))
+        self.income_amount = TextInput(label="3. Сменить сумму дохода", required=False, max_length=100, default=str(company.get("income_amount", "")))
+        self.income_cd = TextInput(label="4. Сменить кулдаун дохода", required=False, max_length=100, default=format_interval(int(company.get("income_cooldown", 3600))))
+        self.value_advert = TextInput(
+            label="5. Мин. стоимость / уровень рекламы",
+            required=False,
+            max_length=100,
+            default=f"{company.get('min_value', '')} / {company.get('advert_level', 1)}",
+            placeholder="например: 5000000 / 3",
+        )
+        modal_items = [
+            self.expense_amount,
+            self.expense_cd,
+            self.income_amount,
+            self.income_cd,
+            self.value_advert,
+        ]
+        # Discord Modal поддерживает максимум 5 полей.
+        for i in modal_items[:5]:
+            self.add_item(i)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        change_lines = []
+        req["review_changes"] = {}
+
+        def _val(x):
+            return str(x.value).strip()
+
+        def _apply_change(key: str, value: str, label: str):
+            if not value:
+                return
+            req["review_changes"][key] = value
+            change_lines.append(f"{label}: {value}")
+
+        _apply_change("expense_amount", _val(self.expense_amount), "Затраты")
+        _apply_change("expense_cooldown", _val(self.expense_cd), "КД затрат")
+        _apply_change("income_amount", _val(self.income_amount), "Доход")
+        _apply_change("income_cooldown", _val(self.income_cd), "КД дохода")
+
+        value_advert_raw = _val(self.value_advert)
+        if value_advert_raw:
+            parts = [p.strip() for p in value_advert_raw.split("/")]
+            if len(parts) == 1:
+                _apply_change("min_value", parts[0], "Минимальная стоимость")
+            else:
+                if parts[0]:
+                    _apply_change("min_value", parts[0], "Минимальная стоимость")
+                if parts[1]:
+                    _apply_change("advert_level", parts[1], "Уровень рекламы")
+
+        req["status_text"] = "📝 Изменения подготовлены:\n" + ("\n".join(change_lines) if change_lines else "изменений нет")
+        req["processed_by"] = str(interaction.user.id)
+        save_companies_data()
+        await interaction.response.send_message("✅ Изменения сохранены. Нажмите 'Подтвердить изменения'.", ephemeral=True)
+
+
+class CompanyRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отклонения заявки компании", timeout=300)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req["status"] = "rejected"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.display_name}\nПричина: {self.reason.value}"
+        save_companies_data()
+
+        result_channel = await get_channel_safe(companies_data.get("result_channel"))
+        if result_channel:
+            mentions = [f"<@{req.get('author_id')}>"]
+            if req.get("owner_id"):
+                mentions.append(f"<@{req.get('owner_id')}>")
+            if req.get("buyer_id"):
+                mentions.append(f"<@{req.get('buyer_id')}>")
+            await result_channel.send(content=" ".join(sorted(set(mentions))), embed=build_company_request_embed(req, color=0xE74C3C))
+        await interaction.response.edit_message(embed=build_company_request_embed(req, color=0xE74C3C), view=None)
+
+
+class CompanyReviewView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator or has_custom_command_access(interaction.user, "компании"):
+            return True
+        await interaction.response.send_message("❌ Нет доступа к заявкам компаний.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="🛠 Подготовить изменения", style=ButtonStyle.primary, custom_id="company:prepare")
+    async def prepare(self, interaction: Interaction, button: Button):
+        try:
+            await interaction.response.send_modal(CompanyApplyChangesModal(self.req_id))
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Не удалось открыть форму изменений (лимит полей Discord). Попробуйте ещё раз.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="✅ Подтвердить изменения", style=ButtonStyle.success, custom_id="company:approve")
+    async def approve(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+
+        req_type = req.get("type")
+        payload = req.get("payload", {})
+        author_id = str(req.get("author_id"))
+        summary = []
+
+        if req_type == "create":
+            company_id = str(int(companies_data.get("next_company_id", 1)))
+            companies_data["next_company_id"] = int(company_id) + 1
+            founded = investments.get("rp_year", {}).get("year") or "—"
+            try:
+                first_invest = parse_money_value(str(payload.get("Первый вклад", "0")), ensure_user(author_id).get("наличка", 0))
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Неверный формат `Первый вклад` в заявке. Укажите сумму числом, например `10000000` или `10кк`.",
+                    ephemeral=True,
+                )
+                return
+            company = {
+                "id": company_id,
+                "owner_id": author_id,
+                "name": payload.get("Название", "Компания"),
+                "specialization": payload.get("Специализация", "—"),
+                "founded_year": founded,
+                "first_invest": int(first_invest),
+                "advert_level": 1,
+                "income_amount": str(max(100000, int(first_invest * 0.05) if first_invest > 0 else 100000)),
+                "income_cooldown": 3600,
+                "expense_amount": str(max(10000, int(first_invest * 0.01) if first_invest > 0 else 10000)),
+                "expense_cooldown": 86400,
+                "min_value": int(first_invest),
+                "last_income_at": int(time.time()),
+                "last_expense_at": int(time.time()),
+                "created_at": int(time.time()),
+            }
+            update_company_derived_fields(company)
+            companies_data.setdefault("companies", {})[company_id] = company
+            summary.append(f"Создана компания {company.get('name')}")
+
+        elif req_type in ("buy", "sell"):
+            company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
+            if not company:
+                await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+                return
+
+            buyer_id = str(req.get("author_id")) if req_type == "buy" else str(req.get("buyer_id"))
+            seller_id = str(req.get("owner_id")) if req_type == "buy" else str(req.get("author_id"))
+            raw_price = payload.get("Предложение") if req_type == "buy" else payload.get("Цена")
+            try:
+                price = parse_money_value(str(raw_price), ensure_user(buyer_id).get("наличка", 0))
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Неверный формат цены в заявке покупки/продажи компании.",
+                    ephemeral=True,
+                )
+                return
+            if ensure_user(buyer_id).get("наличка", 0) < price:
+                await interaction.response.send_message("❌ У покупателя недостаточно средств.", ephemeral=True)
+                return
+            ensure_user(buyer_id)["наличка"] -= int(price)
+            ensure_user(seller_id)["наличка"] += int(price)
+            company["owner_id"] = buyer_id
+            update_company_derived_fields(company)
+            summary.append(f"Передана компания {company.get('name')} от <@{seller_id}> к <@{buyer_id}> за {price:,}")
+            save_json(BALANCES_FILE, balances)
+
+        elif req_type == "upgrade":
+            company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
+            if not company:
+                await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+                return
+            changes = req.get("review_changes", {})
+            if "expense_amount" in changes:
+                company["expense_amount"] = changes["expense_amount"]
+            if "expense_cooldown" in changes:
+                company["expense_cooldown"] = max(60, parse_interval(str(changes["expense_cooldown"])))
+            if "income_amount" in changes:
+                company["income_amount"] = changes["income_amount"]
+            if "income_cooldown" in changes:
+                company["income_cooldown"] = max(60, parse_interval(str(changes["income_cooldown"])))
+            if "min_value" in changes:
+                try:
+                    company["min_value"] = parse_money_value(str(changes["min_value"]), ensure_user(author_id).get("наличка", 0))
+                except Exception:
+                    await interaction.response.send_message(
+                        "❌ Неверный формат `минимальной стоимости` в изменениях компании.",
+                        ephemeral=True,
+                    )
+                    return
+            update_company_derived_fields(company)
+            summary.append("Обновлены параметры компании: " + (", ".join(changes.keys()) if changes else "без изменений"))
+
+        req["status"] = "approved"
+        req["processed_by"] = str(interaction.user.id)
+        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.display_name}"
+        req["summary"] = "\n".join(summary)
+        save_companies_data()
+
+        result_channel_id = companies_data.get("result_channel")
+        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        if result_channel:
+            em = build_company_request_embed(req, color=0x2ECC71)
+            if summary:
+                em.add_field(name="Что поменялось", value="\n".join(summary), inline=False)
+            pings = [f"<@{req.get('author_id')}>"]
+            if req.get("owner_id"):
+                pings.append(f"<@{req.get('owner_id')}>")
+            if req.get("buyer_id"):
+                pings.append(f"<@{req.get('buyer_id')}>")
+            await result_channel.send(content=" ".join(sorted(set(pings))), embed=em)
+
+        await interaction.response.edit_message(embed=build_company_request_embed(req, color=0x2ECC71), view=None)
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(CompanyRejectModal(self.req_id))
+
+
+class CompanyActionsSelect(Select):
+    def __init__(self):
+        options = [
+            SelectOption(label="Создать новую компанию", value="create", emoji="🆕"),
+            SelectOption(label="Купить компанию", value="buy", emoji="🛒"),
+            SelectOption(label="Продать компанию", value="sell", emoji="💼"),
+            SelectOption(label="Улучшить компанию", value="upgrade", emoji="🛠"),
+        ]
+        super().__init__(placeholder="Действия с компаниями", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: Interaction):
+        v = self.values[0]
+        if v == "create":
+            await interaction.response.send_modal(CompanyCreateModal())
+            return
+
+        if v == "buy":
+            await interaction.response.send_modal(CompanyBuyModal())
+            return
+
+        owned_companies = find_companies_by_name("*", owner_id=str(interaction.user.id))
+        if not owned_companies:
+            await interaction.response.send_message("❌ Продажа и улучшение доступны только владельцу компаний.", ephemeral=True)
+            return
+
+        if v == "sell":
+            await interaction.response.send_modal(CompanySellModal())
+        elif v == "upgrade":
+            await interaction.response.send_modal(CompanyUpgradeModal())
+
+
+class CompaniesMenuView(View):
+    def __init__(self, pages: list[Embed], author_id: int):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.author_id = author_id
+        self.index = 0
+        self.add_item(CompanyActionsSelect())
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Это меню не для вас.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⬅️", style=ButtonStyle.gray)
+    async def prev(self, interaction: Interaction, button: Button):
+        if not self.pages:
+            await interaction.response.defer()
+            return
+        self.index = (self.index - 1) % len(self.pages)
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="➡️", style=ButtonStyle.gray)
+    async def next(self, interaction: Interaction, button: Button):
+        if not self.pages:
+            await interaction.response.defer()
+            return
+        self.index = (self.index + 1) % len(self.pages)
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+
+async def show_companies_menu(ctx, member: discord.Member, viewer_id: int | None = None):
+    user_id = str(member.id)
+    viewer_id = int(viewer_id) if viewer_id is not None else member.id
+    companies = [c for c in companies_data.setdefault("companies", {}).values() if str(c.get("owner_id")) == user_id]
+    if not companies:
+        if viewer_id == member.id:
+            desc = "У вас нет компаний. Используйте меню ниже: **Создать новую компанию**."
+        else:
+            desc = f"У игрока {member.mention} пока нет компаний."
+        em = Embed(title="🏢 Компании", description=desc, color=0x3498DB)
+        await ctx.send(embed=em, view=CompaniesMenuView([], viewer_id))
+        return
+
+    pages = [build_company_embed(c, i + 1, len(companies)) for i, c in enumerate(companies)]
+    await ctx.send(embed=pages[0], view=CompaniesMenuView(pages, viewer_id))
+
+
+@bot.command(name="компании")
+async def компании(ctx):
+    await show_companies_menu(ctx, ctx.author)
+
+
+@bot.command(name="заявкикомпаний")
+@commands.has_permissions(administrator=True)
+async def заявкикомпаний(ctx, channel: discord.TextChannel):
+    companies_data["requests_channel"] = channel.id
+    save_companies_data()
+    await ctx.send(embed=Embed(title="✅ Канал заявок компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="итогикомпанийканал")
+@commands.has_permissions(administrator=True)
+async def итогикомпанийканал(ctx, channel: discord.TextChannel):
+    companies_data["result_channel"] = channel.id
+    save_companies_data()
+    await ctx.send(embed=Embed(title="✅ Канал итогов компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
 
 
 class RatingModal(Modal):
@@ -6610,6 +8471,14 @@ def get_country_type(country_name: str) -> str:
     return "Государство"
 
 
+def get_region_owner_country(region_name: str) -> str | None:
+    data = country_stats.get(region_name)
+    if not isinstance(data, dict):
+        return None
+    parent = str(data.get("owner_country") or "").strip()
+    return parent or None
+
+
 def get_country_population_for_season(country_name: str, season_name: str):
     data = country_stats.get(country_name)
     if not isinstance(data, dict):
@@ -7217,6 +9086,7 @@ async def наказания(ctx):
 
 # ================== ROLE INCOME ==================
 @bot.command()
+@commands.cooldown(1, 1800, commands.BucketType.user)
 async def коллект(ctx):
     user_id = str(ctx.author.id)
     user = ensure_user(user_id)
@@ -7252,54 +9122,17 @@ async def коллект(ctx):
         collected_roles.append((role.mention, amount))
         role_income.setdefault("last_claim", {}).setdefault(user_id, {})[rid] = now
 
-    investment_profit_total = 0
-    investment_lines = []
-    invs = ensure_investments(user_id)
-    now_ts = int(time.time())
-    for inv in invs:
-        if inv.get("status") != "active":
-            continue
-        bank_key = inv.get("bank", "")
-        bank_cfg = INVESTMENT_BANKS.get(bank_key, {})
-        bank_name = inv.get("bank_name", bank_cfg.get("name", "Банк"))
-        next_at = int(inv.get("next_at", now_ts))
-        amount_inv = int(inv.get("amount", 0))
-        if now_ts < next_at:
-            investment_lines.append(
-                f"• Вывод с {bank_name}: через {format_seconds_left(next_at - now_ts)}"
-            )
-            continue
-
-        if bank_key == "neo-bank" and random.random() < float(
-            bank_cfg.get("delay_chance", 0)
-        ):
-            inv["next_at"] = now_ts + 86400
-            investment_lines.append(f"• Инвестиция с {bank_name} задержана на сутки")
-            continue
-        if bank_key == "fantom-bank" and random.random() < float(
-            bank_cfg.get("burn_chance", 0)
-        ):
-            inv["status"] = "burned"
-            investment_lines.append(f"• {bank_name} вас обманул, инвестиция сгорела")
-            continue
-
-        profit = int(round(amount_inv * float(bank_cfg.get("profit_pct", 0)) / 100.0))
-        investment_profit_total += profit
-        inv["next_at"] = now_ts + 86400
-        investment_lines.append(f"• Вывод с {bank_name}: +{fmt_money(profit)}")
-
-    gross_income_pool = max(0, total_earned) + max(0, investment_profit_total)
+    gross_income_pool = max(0, total_earned)
     frozen_added, freeze_lines, _ = apply_freeze_roles_for_member(
         ctx.guild, ctx.author, now, gross_income_pool
     )
-    final_cash_delta = total_earned + investment_profit_total - frozen_added
+    final_cash_delta = total_earned - frozen_added
     user["наличка"] += final_cash_delta
 
     save_json(BALANCES_FILE, balances)
     save_json(ROLE_INCOME_FILE, role_income)
-    save_investments()
 
-    if not collected_roles and not freeze_lines and not investment_lines:
+    if not collected_roles and not freeze_lines:
         if cooldown_wait:
             wait_lines = "\n".join(
                 f"• {role_mention}: через {format_seconds_left(left)}"
@@ -7342,8 +9175,6 @@ async def коллект(ctx):
     if freeze_lines:
         desc += f"\n\n**Заморозка средств:**\n" + "\n".join(freeze_lines)
         desc += f"\n\nИтого заморожено: **{fmt_money(frozen_added)}**"
-    if investment_lines:
-        desc += "\n\n**Инвестиции:**\n" + "\n".join(investment_lines)
 
     await ctx.send(
         embed=Embed(title="💰 Коллект выполнен", description=desc, color=0x00FF00)
@@ -7408,6 +9239,8 @@ class TopModeSelect(Select):
             SelectOption(label="Топ по населению", value="population", emoji="👥"),
             SelectOption(label="Топ по армии", value="army", emoji="🪖"),
             SelectOption(label="Топ по постам", value="posts", emoji="📰"),
+            SelectOption(label="Топ компаний (цена)", value="companies_price", emoji="🏢"),
+            SelectOption(label="Топ по репутации", value="reputation", emoji="⭐"),
         ]
         super().__init__(
             placeholder="Выберите тип топа", min_values=1, max_values=1, options=options
@@ -7464,6 +9297,30 @@ class TopView(View):
                 ),
                 "📰 Топ по постам",
             )
+        if self.mode == "reputation":
+            users = player_state.get("users", {})
+            return (
+                sorted(
+                    (
+                        (uid, int((users.get(uid) or {}).get("reputation", 0)))
+                        for uid in users.keys()
+                    ),
+                    key=lambda x: x[1],
+                    reverse=True,
+                ),
+                "⭐ Топ по репутации",
+            )
+        if self.mode == "companies_price":
+            companies = []
+            for company in companies_data.setdefault("companies", {}).values():
+                update_company_derived_fields(company)
+                companies.append((
+                    str(company.get("name") or "Без названия"),
+                    int(company_estimated_price(company)),
+                    str(company.get("owner_id") or "0"),
+                ))
+            companies.sort(key=lambda x: x[1], reverse=True)
+            return companies, "🏢 Топ компаний по цене"
         data = []
         for uid, user in balances.items():
             if uid == "валюта" or not isinstance(user, dict):
@@ -7485,9 +9342,14 @@ class TopView(View):
         chunk = pages[self.page]
         desc = ""
         start = self.page * 10 + 1
-        for idx, (uid, val) in enumerate(chunk, start=start):
-            suffix = currency if self.mode == "economy" else ""
-            desc += f"{idx}. <@{uid}> — {fmt_num(val)} {suffix}\n".rstrip() + "\n"
+        for idx, row in enumerate(chunk, start=start):
+            if self.mode == "companies_price":
+                company_name, val, owner_id = row
+                desc += f"{idx}. **{company_name}** — {fmt_num(val)} {currency} (владелец: <@{owner_id}>)\n"
+            else:
+                uid, val = row
+                suffix = currency if self.mode == "economy" else ""
+                desc += f"{idx}. <@{uid}> — {fmt_num(val)} {suffix}\n".rstrip() + "\n"
         em = Embed(title=title, description=desc, color=0x3498DB)
         em.set_footer(text=f"Страница {self.page + 1}/{len(pages)}")
 
@@ -7496,6 +9358,8 @@ class TopView(View):
             "population": "Топ по населению",
             "army": "Топ по армии",
             "posts": "Топ по постам",
+            "companies_price": "Топ компаний (цена)",
+            "reputation": "Топ по репутации",
         }
         current = mode_map.get(self.mode, "")
         for option in self.mode_select.options:
@@ -7814,37 +9678,46 @@ async def заморозкавывести(ctx, member: discord.Member, amount: 
     )
 
 
-@bot.command(name="кдгод")
+@bot.command(name="рпгодканал", aliases=["кдгод"])
 @commands.has_permissions(administrator=True)
-async def кдгод(ctx, duration: str):
+async def рпгодканал(ctx, channel: discord.TextChannel, year: int, cooldown: str):
     try:
-        secs = parse_interval(duration)
+        secs = parse_interval(cooldown)
     except Exception as e:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description=f"Неверный формат времени: {e}",
-                color=0xFF0000,
-            )
-        )
+        await ctx.send(embed=Embed(title="❌ Ошибка", description=f"Неверный формат времени: {e}", color=0xFF0000))
         return
 
     if secs < 60:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description="Минимальный интервал — 60 секунд.",
-                color=0xFF0000,
-            )
-        )
+        await ctx.send(embed=Embed(title="❌ Ошибка", description="Минимальный интервал — 60 секунд.", color=0xFF0000))
         return
 
-    settings["happiness_tick_seconds"] = int(secs)
-    save_json(SETTINGS_FILE, settings)
+    now_ts = int(time.time())
+    rp = investments.setdefault("rp_year", {})
+    rp["channel_id"] = channel.id
+    rp["year"] = int(year)
+    rp["cooldown"] = int(secs)
+    rp["next_tick_at"] = now_ts + int(secs)
+
+    msg = None
+    old_msg_id = rp.get("message_id")
+    if old_msg_id:
+        try:
+            msg = await channel.fetch_message(int(old_msg_id))
+        except Exception:
+            msg = None
+    quarter = int(((int(secs) - max(0, rp["next_tick_at"] - now_ts)) * 4) / int(secs)) % 4
+    em = format_rp_year_embed(int(year), quarter)
+    if msg:
+        await msg.edit(embed=em)
+    else:
+        sent = await channel.send(embed=em)
+        rp["message_id"] = sent.id
+
+    save_investments()
     await ctx.send(
         embed=Embed(
-            title="✅ КД счастья обновлён",
-            description=f"Автоснятие счастья теперь происходит раз в **{format_interval(secs)}**.",
+            title="✅ RP-год настроен",
+            description=f"Канал: {channel.mention}\nГод: **{year}**\nКД года: **{format_interval(secs)}**",
             color=0x00FF00,
         )
     )
@@ -8416,6 +10289,123 @@ async def auto_role_income_loop():
             save_json(BALANCES_FILE, balances)
             save_passive_flows()
 
+        # Автоначисление инвестиций (без ручного !коллект)
+        inv_changed = False
+        balances_changed = False
+        now_ts = int(time.time())
+        for inv_id, inv in list(investments.setdefault("active_investments", {}).items()):
+            status = str(inv.get("status", "active"))
+            if status != "active":
+                continue
+
+            user_id = str(inv.get("user_id") or "")
+            if not user_id:
+                continue
+
+            start_at = int(inv.get("start_at", now_ts))
+            if now_ts < start_at:
+                continue
+
+            cooldown = max(60, int(inv.get("cooldown", 3600)))
+            next_at = int(inv.get("next_at", start_at))
+            if now_ts < next_at:
+                continue
+
+            total_return = max(0, int(inv.get("total_return", 0)))
+            cycles_total = max(1, int(inv.get("cycles_total", 1)))
+            cycles_paid = max(0, int(inv.get("cycles_paid", 0)))
+            paid_amount = max(0, int(inv.get("paid_amount", 0)))
+
+            if cycles_paid >= cycles_total or paid_amount >= total_return:
+                inv["status"] = "expired"
+                investments["active_investments"][str(inv_id)] = inv
+                inv_changed = True
+                continue
+
+            cycles_due = max(1, (now_ts - next_at) // cooldown + 1)
+            cycles_to_pay = min(cycles_due, cycles_total - cycles_paid)
+            if cycles_to_pay <= 0:
+                continue
+
+            base_part = total_return // cycles_total
+            remainder = total_return % cycles_total
+            payout_now = 0
+            for i in range(cycles_to_pay):
+                cycle_index = cycles_paid + i
+                payout_now += base_part + (1 if cycle_index < remainder else 0)
+
+            inv["cycles_paid"] = cycles_paid + cycles_to_pay
+            inv["paid_amount"] = paid_amount + payout_now
+            inv["next_at"] = next_at + cycles_to_pay * cooldown
+
+            expires_at = inv.get("expires_at")
+            if expires_at is not None and now_ts >= int(expires_at):
+                inv["status"] = "expired"
+            if inv["cycles_paid"] >= cycles_total or inv["paid_amount"] >= total_return:
+                inv["status"] = "expired"
+
+            investments["active_investments"][str(inv_id)] = inv
+            inv_changed = True
+
+            if payout_now > 0:
+                user = ensure_user(user_id)
+                user["наличка"] = int(user.get("наличка", 0)) + int(payout_now)
+                balances_changed = True
+
+        if inv_changed:
+            save_investments()
+        if balances_changed:
+            save_json(BALANCES_FILE, balances)
+
+        # Автоначисление компаний
+        comp_changed = False
+        balances_changed_comp = False
+        now_comp = int(time.time())
+        for company in companies_data.setdefault("companies", {}).values():
+            owner_id = str(company.get("owner_id") or "")
+            if not owner_id:
+                continue
+            update_company_derived_fields(company)
+            user = ensure_user(owner_id)
+
+            income_cd = max(60, int(company.get("income_cooldown", 3600)))
+            last_income = int(company.get("last_income_at", now_comp))
+            if now_comp - last_income >= income_cd:
+                cycles = (now_comp - last_income) // income_cd
+                income_raw = str(company.get("income_amount", "0"))
+                for _ in range(max(0, cycles)):
+                    try:
+                        inc = parse_money_value(income_raw, int(user.get("наличка", 0)))
+                    except Exception:
+                        inc = 0
+                    if inc:
+                        user["наличка"] = int(user.get("наличка", 0)) + int(inc)
+                        balances_changed_comp = True
+                company["last_income_at"] = last_income + cycles * income_cd
+                comp_changed = True
+
+            expense_cd = max(60, int(company.get("expense_cooldown", 86400)))
+            last_expense = int(company.get("last_expense_at", now_comp))
+            if now_comp - last_expense >= expense_cd:
+                cycles = (now_comp - last_expense) // expense_cd
+                expense_raw = str(company.get("expense_amount", "0"))
+                for _ in range(max(0, cycles)):
+                    try:
+                        exp = parse_money_value(expense_raw, int(user.get("наличка", 0)))
+                    except Exception:
+                        exp = 0
+                    if exp:
+                        user["наличка"] = int(user.get("наличка", 0)) - int(exp)
+                        balances_changed_comp = True
+                company["last_expense_at"] = last_expense + cycles * expense_cd
+                comp_changed = True
+
+        if comp_changed:
+            save_companies_data()
+        if balances_changed_comp:
+            save_json(BALANCES_FILE, balances)
+
+
         status_until = settings.get("status_until")
         if status_until is not None and int(time.time()) >= int(status_until):
             settings["status_emoji"] = None
@@ -8426,6 +10416,64 @@ async def auto_role_income_loop():
                 await bot.change_presence(activity=None)
             except Exception:
                 pass
+
+        # RP-год: автоматическое обновление одного сообщения + триггер инвестиций по году
+        rp = investments.setdefault("rp_year", {})
+        rp_channel_id = rp.get("channel_id")
+        rp_year = rp.get("year")
+        rp_cooldown = max(60, int(rp.get("cooldown", 86400)))
+        next_tick_at = rp.get("next_tick_at")
+        if rp_channel_id and rp_year is not None:
+            rp_channel = guild.get_channel(int(rp_channel_id))
+            if rp_channel:
+                now_rp = int(time.time())
+                if next_tick_at is None:
+                    rp["next_tick_at"] = now_rp + rp_cooldown
+                    next_tick_at = rp["next_tick_at"]
+
+                progressed_year = False
+                while now_rp >= int(next_tick_at):
+                    rp_year = int(rp.get("year", rp_year)) + 1
+                    rp["year"] = rp_year
+                    next_tick_at = int(next_tick_at) + rp_cooldown
+                    rp["next_tick_at"] = next_tick_at
+                    progressed_year = True
+
+                    for inv_id, inv in investments.setdefault("active_investments", {}).items():
+                        if str(inv.get("status")) != "pending_year":
+                            continue
+                        pending_year = inv.get("pending_year")
+                        if pending_year is not None and int(pending_year) <= rp_year:
+                            inv["status"] = "active"
+                            inv["start_at"] = now_rp
+                            inv["next_at"] = now_rp
+                            inv["expires_at"] = now_rp + int(inv.get("duration", rp_cooldown))
+                            investments["active_investments"][str(inv_id)] = inv
+
+                elapsed = max(0, rp_cooldown - max(0, int(next_tick_at) - now_rp))
+                quarter = int((elapsed * 4) / rp_cooldown) % 4
+                em = format_rp_year_embed(int(rp.get("year", rp_year)), quarter)
+                msg = None
+                msg_id = rp.get("message_id")
+                if msg_id:
+                    try:
+                        msg = await rp_channel.fetch_message(int(msg_id))
+                    except Exception:
+                        msg = None
+                if msg:
+                    try:
+                        await msg.edit(embed=em)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        sent = await rp_channel.send(embed=em)
+                        rp["message_id"] = sent.id
+                    except Exception:
+                        pass
+
+                if progressed_year:
+                    save_investments()
 
         # Счастье / население / содержание войск (каждые 12ч)
         pop = load_json(POPULATION_FILE, {})
@@ -9156,113 +11204,6 @@ async def купить(ctx, количество: int, *, item_key: str):
     )
 
 
-@bot.command(name="инвестировать")
-async def инвестировать(ctx, сумма: int, *, bank_name: str):
-    user_id = str(ctx.author.id)
-    user = ensure_user(user_id)
-
-    if сумма <= 0:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description="Сумма инвестиции должна быть больше нуля.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    matches = resolve_item_key(bank_name)
-    bank_matches = [m for m in matches if m.lower() in INVESTMENT_BANKS]
-
-    if not bank_matches:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description="Банк не найден. Доступно: **Alta-Bank**, **Neo-Bank**, **Fantom-Bank**.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    selected_key = bank_matches[0]
-    if len(bank_matches) > 1:
-        options = "\n".join(
-            f"{i+1} — {name}" for i, name in enumerate(bank_matches[:10])
-        )
-        await ctx.send(
-            embed=Embed(
-                title="🔎 Найдены совпадения",
-                description=f"Уточните номер банка:\n{options}",
-                color=0x3498DB,
-            )
-        )
-
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
-
-        try:
-            msg = await bot.wait_for("message", check=check, timeout=60)
-            idx = int(msg.content.strip()) - 1
-            selected_key = bank_matches[idx]
-        except Exception:
-            await ctx.send(
-                embed=Embed(
-                    title="❌ Ошибка",
-                    description="Не удалось выбрать банк по номеру.",
-                    color=0xFF0000,
-                )
-            )
-            return
-
-    user_items = inventory.get(user_id, {})
-    if int(user_items.get(selected_key, 0)) <= 0:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Нет банка",
-                description=f"Для инвестирования в **{selected_key}** у вас должен быть хотя бы **1 × {selected_key}** в инвентаре.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    if get_available_cash(user) < сумма:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Недостаточно средств",
-                description=f"Для инвестирования нужно **{сумма} {currency}**, а доступно **{get_available_cash(user)} {currency}**.",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    user["наличка"] -= сумма
-    cfg = INVESTMENT_BANKS[selected_key.lower()]
-    ensure_investments(user_id).append(
-        {
-            "bank": selected_key.lower(),
-            "bank_name": cfg["name"],
-            "amount": сумма,
-            "next_at": int(time.time()) + 86400,
-            "status": "active",
-        }
-    )
-
-    save_json(BALANCES_FILE, balances)
-    save_investments()
-
-    await ctx.send(
-        embed=Embed(
-            title="🏦 Инвестиция оформлена",
-            description=(
-                f"{ctx.author.mention}, вы инвестировали **{сумма} {currency}** в **{selected_key}**.\n"
-                f"Банк не расходуется: требуется только наличие **1 × {selected_key}**.\n"
-                f"Результат будет доступен через **24ч** в команде `!коллект`."
-            ),
-            color=0x00FF00,
-        )
-    )
-
-
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def пополнитьпредмет(ctx, количество: int, *, item_key: str):
@@ -9851,11 +11792,20 @@ async def использовать(ctx, *args):
                 )
             )
             return
-        if get_server_item_qty(user_id, selected_key) < 1:
+
+        server_qty = get_server_item_qty(user_id, selected_key)
+        regular_qty = int(user_items.get(selected_key, 0))
+        total_qty = server_qty + regular_qty
+        if total_qty < 1:
             await ctx.send(
                 embed=Embed(
                     title="❌ Ошибка",
-                    description="У вас нет активного `Альта бокса` в серверном инвентаре.",
+                    description=(
+                        "У вас нет `Альта бокса`.\n"
+                        "Если вы выдавали через старый формат `!выдать @игрок 1 альта бокс`, "
+                        "предмет лежит в обычном инвентаре; используйте новый формат выдачи "
+                        'с временем: `!выдать "игроки/роль/игрок" "альта бокс" "1д"`.'
+                    ),
                     color=0xFF0000,
                 )
             )
@@ -9882,7 +11832,18 @@ async def использовать(ctx, *args):
         picked = random.choices(
             [r[0] for r in rewards], weights=[r[1] for r in rewards], k=1
         )[0]
-        consume_server_item(user_id, selected_key, 1)
+        if server_qty >= 1:
+            consumed = consume_server_item(user_id, selected_key, 1)
+            if not consumed and regular_qty > 0:
+                user_items[selected_key] = max(0, regular_qty - 1)
+                if user_items[selected_key] <= 0:
+                    del user_items[selected_key]
+                save_inventory()
+        else:
+            user_items[selected_key] = max(0, regular_qty - 1)
+            if user_items[selected_key] <= 0:
+                del user_items[selected_key]
+            save_inventory()
         await ctx.send(
             embed=Embed(
                 title="🌈 Альта бокс открыт!",
@@ -10032,6 +11993,20 @@ async def выдать(ctx, target: str, количество_или_предм�
         item_key = " ".join(rest).strip()
         selected_key = await pick_item_key_by_query(ctx, item_key)
         if not selected_key:
+            return
+
+        if selected_key.lower() == "альта бокс":
+            # resolved merge: для Альта бокса в старом режиме выдачи всегда даём подсказку по TTL-формату
+            await ctx.send(
+                embed=Embed(
+                    title="⚠️ Нужен формат с временем",
+                    description=(
+                        "`Альта бокс` нельзя выдавать старым количественным форматом.\n"
+                        'Используйте: `!выдать "игроки/роль/игрок" "альта бокс" "1д"`.'
+                    ),
+                    color=0xFFA500,
+                )
+            )
             return
 
         user_id = str(member.id)
@@ -10210,9 +12185,10 @@ async def wipe_all(ctx):
         "inventory": inventory.copy(),
         "population": load_json(POPULATION_FILE, {}),
         "passive_flows": passive_flows.copy(),
-        "season_user_progress": seasons_data.get("user_progress", {}).copy(),
+        "season_user_progress": seasons_data.get("season_user_progress", {}).copy(),
         "player_state": player_state.copy(),
         "investments": investments.copy(),
+        "companies": companies_data.copy(),
         "country_owners": country_owners.copy(),
     }
     save_json(WIPE_BACKUP_FILE, backup)
@@ -10253,7 +12229,7 @@ async def wipe_all(ctx):
             save_json(POPULATION_FILE, {})
             passive_flows["users"] = {}
             save_passive_flows()
-            seasons_data["user_progress"] = {}
+            seasons_data["season_user_progress"] = {}
             save_seasons_data()
             pre_reg_roles_map = {
                 str(uid): list((data or {}).get("pre_reg_role_ids", []))
@@ -10262,10 +12238,15 @@ async def wipe_all(ctx):
             }
             player_state["users"] = {}
             investments["users"] = {}
+            companies_data["companies"] = {}
+            companies_data["requests"] = {}
+            companies_data["next_company_id"] = 1
+            companies_data["next_request_id"] = 1
             country_owners["country_to_user"] = {}
             country_owners["user_to_country"] = {}
             save_player_state()
             save_investments()
+            save_companies_data()
             save_country_owners()
 
             for m in ctx.guild.members:
@@ -10285,7 +12266,7 @@ async def wipe_all(ctx):
                 await interaction.message.edit(
                     embed=Embed(
                         title="💥 ГЛОБАЛЬНЫЙ ВАЙП ВЫПОЛНЕН",
-                        description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер и счётчик постов.",
+                        description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер, компании и счётчик постов.",
                         color=0x00FF00,
                     ),
                     view=None,
@@ -10360,7 +12341,7 @@ async def undo_wipe(ctx):
     passive_flows.update(backup.get("passive_flows", {"users": {}}))
     passive_flows.setdefault("users", {})
     save_passive_flows()
-    seasons_data["user_progress"] = backup.get("season_user_progress", {})
+    seasons_data["season_user_progress"] = backup.get("season_user_progress", {})
     save_seasons_data()
     player_state.clear()
     player_state.update(backup.get("player_state", {"users": {}}))
@@ -10370,6 +12351,27 @@ async def undo_wipe(ctx):
     investments.update(backup.get("investments", {"users": {}}))
     investments.setdefault("users", {})
     save_investments()
+    companies_data.clear()
+    companies_data.update(
+        backup.get(
+            "companies",
+            {
+                "companies": {},
+                "requests": {},
+                "next_company_id": 1,
+                "next_request_id": 1,
+                "requests_channel": companies_data.get("requests_channel"),
+                "result_channel": companies_data.get("result_channel"),
+            },
+        )
+    )
+    companies_data.setdefault("companies", {})
+    companies_data.setdefault("requests", {})
+    companies_data.setdefault("next_company_id", 1)
+    companies_data.setdefault("next_request_id", 1)
+    companies_data.setdefault("requests_channel", None)
+    companies_data.setdefault("result_channel", None)
+    save_companies_data()
     country_owners.clear()
     country_owners.update(
         backup.get("country_owners", {"country_to_user": {}, "user_to_country": {}})
@@ -10381,7 +12383,7 @@ async def undo_wipe(ctx):
     await ctx.send(
         embed=Embed(
             title="♻️ ВАЙП ОТМЕНЁН",
-            description="Данные восстановлены (включая прогресс сфер).",
+            description="Данные восстановлены (включая прогресс сфер и компании).",
             color=0x00FF00,
         )
     )
@@ -10400,8 +12402,12 @@ async def wipe_player(ctx, member: discord.Member):
     user_has_state = user_id in player_state.setdefault("users", {}) and bool(
         player_state["users"].get(user_id)
     )
-    user_has_season = user_id in seasons_data.setdefault("user_progress", {})
+    user_has_season = any(user_id in m for m in seasons_data.setdefault("season_user_progress", {}).values())
     user_has_investments = bool(investments.setdefault("users", {}).get(user_id))
+    user_has_companies = any(
+        str(c.get("owner_id")) == user_id
+        for c in companies_data.setdefault("companies", {}).values()
+    )
     user_has_country = user_id in country_owners.setdefault("user_to_country", {})
 
     if not any(
@@ -10413,6 +12419,7 @@ async def wipe_player(ctx, member: discord.Member):
             user_has_state,
             user_has_season,
             user_has_investments,
+            user_has_companies,
             user_has_country,
         ]
     ):
@@ -10452,13 +12459,27 @@ async def wipe_player(ctx, member: discord.Member):
                 "inventory": inventory.get(user_id, {}),
                 "population": population.get(user_id, 0),
                 "passive_entries": get_passive_entries(user_id).copy(),
-                "season_progress": seasons_data.get("user_progress", {})
-                .get(user_id, {})
-                .copy(),
+                "season_progress": get_user_progress_for_season(user_id, seasons_data.get("active_season")).copy(),
                 "player_state": player_state.setdefault("users", {})
                 .get(user_id, {})
                 .copy(),
                 "investments": ensure_investments(user_id).copy(),
+                "companies": {
+                    cid: c
+                    for cid, c in companies_data.setdefault("companies", {}).items()
+                    if str(c.get("owner_id")) == user_id
+                },
+                "company_requests": {
+                    rid: r
+                    for rid, r in companies_data.setdefault("requests", {}).items()
+                    if user_id
+                    in {
+                        str(r.get("author_id", "")),
+                        str(r.get("owner_id", "")),
+                        str(r.get("buyer_id", "")),
+                        str(r.get("decision_user_id", "")),
+                    }
+                },
                 "country": country_owners.get("user_to_country", {}).get(user_id),
             }
             save_json(WIPE_BACKUP_FILE, backup)
@@ -10479,12 +12500,30 @@ async def wipe_player(ctx, member: discord.Member):
             players = load_json(PLAYER_STATS_FILE, {})
             players.pop(user_id, None)
             passive_flows.setdefault("users", {}).pop(user_id, None)
-            seasons_data.setdefault("user_progress", {}).pop(user_id, None)
+            
+            for _season_map in seasons_data.setdefault("season_user_progress", {}).values():
+                _season_map.pop(user_id, None)
             state = ensure_player_state(user_id)
             pre_reg_roles = list(state.get("pre_reg_role_ids", []))
             state["posts_count"] = 0
             player_state.setdefault("users", {}).pop(user_id, None)
             investments.setdefault("users", {}).pop(user_id, None)
+            companies_data["companies"] = {
+                cid: c
+                for cid, c in companies_data.setdefault("companies", {}).items()
+                if str(c.get("owner_id")) != user_id
+            }
+            companies_data["requests"] = {
+                rid: r
+                for rid, r in companies_data.setdefault("requests", {}).items()
+                if user_id
+                not in {
+                    str(r.get("author_id", "")),
+                    str(r.get("owner_id", "")),
+                    str(r.get("buyer_id", "")),
+                    str(r.get("decision_user_id", "")),
+                }
+            }
             old_country = country_owners.setdefault("user_to_country", {}).pop(
                 user_id, None
             )
@@ -10499,6 +12538,7 @@ async def wipe_player(ctx, member: discord.Member):
             save_seasons_data()
             save_player_state()
             save_investments()
+            save_companies_data()
             save_country_owners()
 
             try:
@@ -10513,7 +12553,7 @@ async def wipe_player(ctx, member: discord.Member):
                 await interaction.message.edit(
                     embed=Embed(
                         title="🔥 ВАЙП ИГРОКА ВЫПОЛНЕН",
-                        description=f"Данные {member.mention}, пассивные операции и прогресс сфер обнулены.",
+                        description=f"Данные {member.mention}, пассивные операции, прогресс сфер и компании обнулены.",
                         color=0xFF0000,
                     ),
                     view=None,
@@ -10543,16 +12583,20 @@ async def wipe_player(ctx, member: discord.Member):
 @bot.command(name="создатьстат")
 @commands.has_permissions(administrator=True)
 async def создатьстат(ctx):
-    draft = {"country": "", "type": "Государство", "season": "", "population": 0}
+    draft = {"country": "", "type": "Государство", "season": "", "population": 0, "owner_country": ""}
     types = ["Государство", "Регион", "ЧВК", "Организация", "Повстанцы", "Террористы"]
 
     def build_embed():
         embed = Embed(title="🧾 Создание стата", color=0x3498DB)
+        owner_line = ""
+        if draft["type"] == "Регион":
+            owner_line = f"\n**Государство-владелец:** {draft['owner_country'] or '—'}"
         embed.description = (
             f"**Название:** {draft['country'] or '—'}\n"
             f"**Тип:** {draft['type']}\n"
             f"**Сезон:** {draft['season'] or '—'}\n"
             f"**Население:** {fmt_num(draft['population']) if draft['population'] else '—'}"
+            f"{owner_line}"
         )
         return embed
 
@@ -10579,10 +12623,18 @@ async def создатьстат(ctx):
                 required=True,
                 default=(str(draft["population"]) if draft["population"] else ""),
             )
+            self.owner_country_in = TextInput(
+                label="Государство-владелец (для региона)",
+                required=False,
+                max_length=120,
+                default=draft.get("owner_country", ""),
+                placeholder="Обязательно для типа Регион",
+            )
             self.add_item(self.country_in)
             self.add_item(self.type_in)
             self.add_item(self.season_in)
             self.add_item(self.pop_in)
+            self.add_item(self.owner_country_in)
 
         async def on_submit(self, interaction: Interaction):
             country_type = next(
@@ -10609,6 +12661,25 @@ async def создатьстат(ctx):
             draft["type"] = country_type
             draft["season"] = str(self.season_in.value).strip()
             draft["population"] = max(0, pop_val)
+            draft["owner_country"] = str(self.owner_country_in.value).strip()
+
+            if draft["type"] == "Регион":
+                parent_name = resolve_country_name(draft["owner_country"])
+                if not parent_name:
+                    await interaction.response.send_message(
+                        "❌ Создание региона невозможно: государство-владелец не найдено в статах.",
+                        ephemeral=True,
+                    )
+                    return
+                if get_country_type(parent_name) != "Государство":
+                    await interaction.response.send_message(
+                        "❌ Владелец региона должен быть типа `Государство`.",
+                        ephemeral=True,
+                    )
+                    return
+                draft["owner_country"] = parent_name
+            else:
+                draft["owner_country"] = ""
             await interaction.response.edit_message(embed=build_embed(), view=view)
 
     class StatView(View):
@@ -10639,12 +12710,27 @@ async def создатьстат(ctx):
                     "❌ Такой сезон не создан. Сначала !создатьсезон.", ephemeral=True
                 )
                 return
+            if draft["type"] == "Регион":
+                parent_name = resolve_country_name(draft.get("owner_country", ""))
+                if not parent_name or get_country_type(parent_name) != "Государство":
+                    await interaction.response.send_message(
+                        "❌ Создание региона невозможно до создания государства-владельца.",
+                        ephemeral=True,
+                    )
+                    return
+                draft["owner_country"] = parent_name
+
             set_country_population_for_season(
                 draft["country"],
                 draft["season"],
                 int(draft["population"]),
                 draft["type"],
             )
+            record = country_stats.setdefault(draft["country"], {})
+            if draft["type"] == "Регион":
+                record["owner_country"] = draft["owner_country"]
+            else:
+                record.pop("owner_country", None)
             save_json(COUNTRY_STATS_FILE, country_stats)
             await interaction.response.edit_message(
                 embed=Embed(
@@ -10724,16 +12810,64 @@ async def статы(ctx):
         )
         return
 
+    country_to_user, _ = get_occupied_country_map()
     lines = []
-    for country_name in sorted(country_stats.keys(), key=lambda x: str(x).casefold()):
-        season_population = get_country_population_for_season(
-            country_name, active_season
-        )
+
+    countries = [
+        name
+        for name in country_stats.keys()
+        if get_country_type(name) == "Государство"
+    ]
+    for country_name in sorted(countries, key=lambda x: str(x).casefold()):
+        season_population = get_country_population_for_season(country_name, active_season)
+        if season_population is None:
+            continue
+
+        attached_regions = []
+        detached_regions = []
+        cut_population = 0
+
+        for region_name in country_stats.keys():
+            if get_country_type(region_name) != "Регион":
+                continue
+            owner_country = get_region_owner_country(region_name)
+            if not owner_country or str(owner_country).casefold() != str(country_name).casefold():
+                continue
+
+            region_pop = get_country_population_for_season(region_name, active_season)
+            if region_pop is None:
+                continue
+
+            owner_uid = country_to_user.get(region_name)
+            if owner_uid:
+                detached_regions.append((region_name, int(region_pop), owner_uid))
+                cut_population += int(region_pop)
+            else:
+                attached_regions.append((region_name, int(region_pop)))
+
+        display_population = max(0, int(season_population) - cut_population)
+        lines.append(f"• **{country_name}** — {display_population}\n↳ *Государство*")
+
+        if attached_regions:
+            reg_line = ", ".join([f"{rn} ({rp})" for rn, rp in attached_regions])
+            lines.append(f"  └ В составе: {reg_line}")
+
+        if detached_regions:
+            reg_line = ", ".join([f"{rn} ({rp}, <@{uid}>)" for rn, rp, uid in detached_regions])
+            lines.append(f"  └ Отделено игрокам: {reg_line}")
+
+    extras = []
+    for entity_name in sorted(country_stats.keys(), key=lambda x: str(x).casefold()):
+        entity_type = get_country_type(entity_name)
+        if entity_type in ("Государство", "Регион"):
+            continue
+        season_population = get_country_population_for_season(entity_name, active_season)
         if season_population is not None:
-            country_type = get_country_type(country_name)
-            lines.append(
-                f"• **{country_name}** — {season_population}\n↳ *{country_type}*"
-            )
+            extras.append(f"• **{entity_name}** — {season_population}\n↳ *{entity_type}*")
+
+    if extras:
+        lines.append("\n**Прочие формирования:**")
+        lines.extend(extras)
 
     if not lines:
         await ctx.send(
@@ -11125,14 +13259,15 @@ async def профиль(ctx, member: discord.Member = None):
 
         @discord.ui.button(label="Экономика игрока", style=ButtonStyle.primary)
         async def player_economy(self, interaction: Interaction, button: Button):
-            progress_map = seasons_data.setdefault("user_progress", {}).get(
-                str(self.target_member.id), {}
-            )
-            reached = [
-                (sphere_name, int(level))
-                for sphere_name, level in progress_map.items()
-                if int(level) > 0
-            ]
+            active = seasons_data.get("active_season")
+            progress_map = get_user_progress_for_season(str(self.target_member.id), active)
+            reached = []
+            for sphere_id, level in progress_map.items():
+                lvl = int(level)
+                if lvl <= 0:
+                    continue
+                sp = seasons_data.setdefault("spheres", {}).get(str(sphere_id), {})
+                reached.append((sp.get("name", str(sphere_id)), lvl))
 
             if not reached:
                 await interaction.response.send_message(
@@ -11158,6 +13293,12 @@ async def профиль(ctx, member: discord.Member = None):
                 ),
                 ephemeral=True,
             )
+
+        @discord.ui.button(label="Компании игрока", style=ButtonStyle.secondary)
+        async def player_companies(self, interaction: Interaction, button: Button):
+            await interaction.response.defer(ephemeral=True)
+            await show_companies_menu(ctx, self.target_member, viewer_id=interaction.user.id)
+            await interaction.followup.send("✅ Список компаний отправлен в канал.", ephemeral=True)
 
     await ctx.send(embed=embed, view=PlayerEconomyView(member))
 
@@ -11187,7 +13328,6 @@ async def statistics(ctx):
     )
     embed.add_field(name="🏘 Общее население", value=str(total_population), inline=False)
     await ctx.send(embed=embed)
-
 
 # ================== START ==================
 if __name__ == "__main__":
