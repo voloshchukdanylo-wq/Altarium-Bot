@@ -659,8 +659,7 @@ def update_company_derived_fields(company: dict):
 def company_estimated_price(company: dict) -> int:
     min_value = int(company.get("min_value", 0) or 0)
     first_invest = int(company.get("first_invest", 0) or 0)
-    ad_bonus = int(company.get("advert_level", 1)) * 500_000
-    return max(min_value, first_invest) + ad_bonus
+    return min_value if min_value > 0 else first_invest
 
 
 def build_company_embed(company: dict, idx: int, total: int):
@@ -2134,6 +2133,12 @@ async def меню(ctx):
                     description="Управление компаниями",
                 ),
                 SelectOption(
+                    label="Работа",
+                    value="work",
+                    emoji="💼",
+                    description="Выполнить !работа (общий КД)",
+                ),
+                SelectOption(
                     label="Собрать прибыль (коллект)",
                     value="collect",
                     emoji="💰",
@@ -2174,6 +2179,20 @@ async def меню(ctx):
                 await серверныйинвентарь(ctx)
             elif selected == "spheres":
                 await сферы(ctx)
+            elif selected == "work":
+                work_cmd = bot.get_command("работа")
+                if work_cmd is None:
+                    await interaction.followup.send("❌ Команда !работа не найдена.", ephemeral=True)
+                    return
+                try:
+                    await ctx.invoke(work_cmd)
+                except commands.CommandOnCooldown as e:
+                    retry = int(e.retry_after)
+                    await interaction.followup.send(
+                        f"⏳ Работа на кулдауне: подождите {retry // 60} мин {retry % 60} сек.",
+                        ephemeral=True,
+                    )
+                    return
             elif selected == "collect":
                 collect_cmd = bot.get_command("коллект")
                 if collect_cmd is None:
@@ -6237,7 +6256,7 @@ class InvestmentActionModal(Modal):
 
         req["status"] = "approved"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.mention}"
+        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.display_name}"
         req["investment_id"] = inv_id
         save_json(BALANCES_FILE, balances)
         save_investments()
@@ -6282,7 +6301,7 @@ class InvestmentRejectModal(Modal):
         reason = str(self.reason.value).strip()
         req["status"] = "rejected"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.mention}\nПричина: {reason}"
+        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.display_name}\nПричина: {reason}"
         req["reject_reason"] = reason
         save_investments()
 
@@ -6797,13 +6816,16 @@ class CompanyOwnerDecisionView(View):
 class CompanyApplyChangesModal(Modal):
     def __init__(self, req_id: str):
         self.req_id = str(req_id)
+        req = companies_data.get("requests", {}).get(self.req_id, {})
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")), {}) if req else {}
         super().__init__(title="Изменения компании", timeout=600)
-        self.expense_amount = TextInput(label="1. Сменить сумму затрат", required=False, max_length=100, default="скип")
-        self.expense_cd = TextInput(label="2. Сменить кулдаун затрат", required=False, max_length=100, default="скип")
-        self.income_amount = TextInput(label="3. Сменить сумму дохода", required=False, max_length=100, default="скип")
-        self.income_cd = TextInput(label="4. Сменить кулдаун дохода", required=False, max_length=100, default="скип")
-        self.min_value = TextInput(label="5. Сменить минимальную стоимость", required=False, max_length=100, default="скип")
-        for i in (self.expense_amount, self.expense_cd, self.income_amount, self.income_cd, self.min_value):
+        self.expense_amount = TextInput(label="1. Сменить сумму затрат", required=False, max_length=100, default=str(company.get("expense_amount", "")))
+        self.expense_cd = TextInput(label="2. Сменить кулдаун затрат", required=False, max_length=100, default=format_interval(int(company.get("expense_cooldown", 86400))))
+        self.income_amount = TextInput(label="3. Сменить сумму дохода", required=False, max_length=100, default=str(company.get("income_amount", "")))
+        self.income_cd = TextInput(label="4. Сменить кулдаун дохода", required=False, max_length=100, default=format_interval(int(company.get("income_cooldown", 3600))))
+        self.min_value = TextInput(label="5. Сменить минимальную стоимость", required=False, max_length=100, default=str(company.get("min_value", "")))
+        self.advert_level = TextInput(label="6. Повысить уровень рекламы", required=False, max_length=100, default=str(company.get("advert_level", 1)))
+        for i in (self.expense_amount, self.expense_cd, self.income_amount, self.income_cd, self.min_value, self.advert_level):
             self.add_item(i)
 
     async def on_submit(self, interaction: Interaction):
@@ -6813,27 +6835,25 @@ class CompanyApplyChangesModal(Modal):
             return
 
         change_lines = []
-        req["review_changes"] = req.get("review_changes", {})
+        req["review_changes"] = {}
+
         def _val(x):
             return str(x.value).strip()
 
-        if _val(self.expense_amount).lower() != "скип":
-            req["review_changes"]["expense_amount"] = _val(self.expense_amount)
-            change_lines.append(f"Затраты: {_val(self.expense_amount)}")
-        if _val(self.expense_cd).lower() != "скип":
-            req["review_changes"]["expense_cooldown"] = _val(self.expense_cd)
-            change_lines.append(f"КД затрат: {_val(self.expense_cd)}")
-        if _val(self.income_amount).lower() != "скип":
-            req["review_changes"]["income_amount"] = _val(self.income_amount)
-            change_lines.append(f"Доход: {_val(self.income_amount)}")
-        if _val(self.income_cd).lower() != "скип":
-            req["review_changes"]["income_cooldown"] = _val(self.income_cd)
-            change_lines.append(f"КД дохода: {_val(self.income_cd)}")
-        if _val(self.min_value).lower() != "скип":
-            req["review_changes"]["min_value"] = _val(self.min_value)
-            change_lines.append(f"Минимальная стоимость: {_val(self.min_value)}")
+        def _apply_change(key: str, value: str, label: str):
+            if not value:
+                return
+            req["review_changes"][key] = value
+            change_lines.append(f"{label}: {value}")
 
-        req["status_text"] = "📝 Изменения подготовлены:\n" + ("\n".join(change_lines) if change_lines else "нет")
+        _apply_change("expense_amount", _val(self.expense_amount), "Затраты")
+        _apply_change("expense_cooldown", _val(self.expense_cd), "КД затрат")
+        _apply_change("income_amount", _val(self.income_amount), "Доход")
+        _apply_change("income_cooldown", _val(self.income_cd), "КД дохода")
+        _apply_change("min_value", _val(self.min_value), "Минимальная стоимость")
+        _apply_change("advert_level", _val(self.advert_level), "Уровень рекламы")
+
+        req["status_text"] = "📝 Изменения подготовлены:\n" + ("\n".join(change_lines) if change_lines else "изменений нет")
         req["processed_by"] = str(interaction.user.id)
         save_companies_data()
         await interaction.response.send_message("✅ Изменения сохранены. Нажмите 'Подтвердить изменения'.", ephemeral=True)
@@ -6853,7 +6873,7 @@ class CompanyRejectModal(Modal):
             return
         req["status"] = "rejected"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.mention}\nПричина: {self.reason.value}"
+        req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.display_name}\nПричина: {self.reason.value}"
         save_companies_data()
 
         result_channel = await get_channel_safe(companies_data.get("result_channel"))
@@ -6916,7 +6936,7 @@ class CompanyReviewView(View):
                 "advert_level": 1,
                 "income_amount": str(max(100000, int(first_invest * 0.05) if first_invest > 0 else 100000)),
                 "income_cooldown": 3600,
-                "expense_amount": "0",
+                "expense_amount": str(max(10000, int(first_invest * 0.01) if first_invest > 0 else 10000)),
                 "expense_cooldown": 86400,
                 "min_value": int(first_invest),
                 "last_income_at": int(time.time()),
@@ -6982,7 +7002,7 @@ class CompanyReviewView(View):
 
         req["status"] = "approved"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.mention}"
+        req["status_text"] = f"✅ Одобрено\nРассмотрел: {interaction.user.display_name}"
         req["summary"] = "\n".join(summary)
         save_companies_data()
 
