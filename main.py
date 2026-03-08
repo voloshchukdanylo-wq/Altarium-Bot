@@ -1195,6 +1195,38 @@ async def ask_with_cancel(
     return None, True
 
 
+async def restore_company_request_views():
+    """Восстанавливает кнопки у незавершённых заявок компаний после рестарта бота."""
+    requests_map = companies_data.get("requests", {})
+    if not isinstance(requests_map, dict) or not requests_map:
+        return
+
+    for req_id, req in requests_map.items():
+        if not isinstance(req, dict):
+            continue
+        status = str(req.get("status") or "")
+
+        if status in ("pending", "pending_moderation"):
+            ch = await get_channel_safe(req.get("request_channel_id"))
+            mid = req.get("request_message_id")
+            if ch and mid:
+                try:
+                    msg = await ch.fetch_message(int(mid))
+                    await msg.edit(view=CompanyReviewView(str(req_id)))
+                except Exception:
+                    pass
+
+        if status in ("pending_owner", "pending_buyer"):
+            dm_ch = await get_channel_safe(req.get("decision_channel_id"))
+            dm_mid = req.get("decision_message_id")
+            if dm_ch and dm_mid:
+                try:
+                    msg = await dm_ch.fetch_message(int(dm_mid))
+                    await msg.edit(view=CompanyOwnerDecisionView(str(req_id)))
+                except Exception:
+                    pass
+
+
 # ================== CHECKS & EVENTS ==================
 @bot.check
 async def only_allowed_guild(ctx):
@@ -1221,6 +1253,7 @@ async def on_ready():
         bot.add_view(PartnershipPanelView())
         bot.add_view(InvestmentPanelView())
         persistent_views_registered = True
+    await restore_company_request_views()
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
     status_until = settings.get("status_until")
@@ -6542,11 +6575,14 @@ class CompanyBuyModal(Modal):
         owner = interaction.guild.get_member(int(req["owner_id"])) if interaction.guild else None
         if owner:
             try:
-                await owner.send(
+                dm_msg = await owner.send(
                     content=f"📩 Новое предложение о покупке вашей компании **{company.get('name')}** от {interaction.user.mention}",
                     embed=build_company_request_embed(req),
                     view=CompanyOwnerDecisionView(str(req_id)),
                 )
+                req["decision_channel_id"] = dm_msg.channel.id
+                req["decision_message_id"] = dm_msg.id
+                save_companies_data()
             except Exception:
                 pass
 
@@ -6608,11 +6644,14 @@ class CompanySellModal(Modal):
         buyer_member = interaction.guild.get_member(int(buyer_id)) if interaction.guild else None
         if buyer_member:
             try:
-                await buyer_member.send(
+                dm_msg = await buyer_member.send(
                     content=f"📩 Вам предложили покупку компании **{company.get('name')}** от {interaction.user.mention}",
                     embed=build_company_request_embed(req),
                     view=CompanyOwnerDecisionView(str(req_id)),
                 )
+                req["decision_channel_id"] = dm_msg.channel.id
+                req["decision_message_id"] = dm_msg.id
+                save_companies_data()
             except Exception:
                 pass
 
