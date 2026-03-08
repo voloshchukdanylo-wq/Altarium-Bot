@@ -6898,7 +6898,14 @@ class CompanyReviewView(View):
             company_id = str(int(companies_data.get("next_company_id", 1)))
             companies_data["next_company_id"] = int(company_id) + 1
             founded = investments.get("rp_year", {}).get("year") or "—"
-            first_invest = parse_money_value(str(payload.get("Первый вклад", "0")), ensure_user(author_id).get("наличка", 0))
+            try:
+                first_invest = parse_money_value(str(payload.get("Первый вклад", "0")), ensure_user(author_id).get("наличка", 0))
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Неверный формат `Первый вклад` в заявке. Укажите сумму числом, например `10000000` или `10кк`.",
+                    ephemeral=True,
+                )
+                return
             company = {
                 "id": company_id,
                 "owner_id": author_id,
@@ -6929,7 +6936,14 @@ class CompanyReviewView(View):
             buyer_id = str(req.get("author_id")) if req_type == "buy" else str(req.get("buyer_id"))
             seller_id = str(req.get("owner_id")) if req_type == "buy" else str(req.get("author_id"))
             raw_price = payload.get("Предложение") if req_type == "buy" else payload.get("Цена")
-            price = parse_money_value(str(raw_price), ensure_user(buyer_id).get("наличка", 0))
+            try:
+                price = parse_money_value(str(raw_price), ensure_user(buyer_id).get("наличка", 0))
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Неверный формат цены в заявке покупки/продажи компании.",
+                    ephemeral=True,
+                )
+                return
             if ensure_user(buyer_id).get("наличка", 0) < price:
                 await interaction.response.send_message("❌ У покупателя недостаточно средств.", ephemeral=True)
                 return
@@ -6955,7 +6969,14 @@ class CompanyReviewView(View):
             if "income_cooldown" in changes:
                 company["income_cooldown"] = max(60, parse_interval(str(changes["income_cooldown"])))
             if "min_value" in changes:
-                company["min_value"] = parse_money_value(str(changes["min_value"]), ensure_user(author_id).get("наличка", 0))
+                try:
+                    company["min_value"] = parse_money_value(str(changes["min_value"]), ensure_user(author_id).get("наличка", 0))
+                except Exception:
+                    await interaction.response.send_message(
+                        "❌ Неверный формат `минимальной стоимости` в изменениях компании.",
+                        ephemeral=True,
+                    )
+                    return
             update_company_derived_fields(company)
             summary.append("Обновлены параметры компании: " + (", ".join(changes.keys()) if changes else "без изменений"))
 
