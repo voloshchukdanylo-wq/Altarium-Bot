@@ -7066,7 +7066,13 @@ class CompanyReviewView(View):
 
     @discord.ui.button(label="🛠 Подготовить изменения", style=ButtonStyle.primary, custom_id="company:prepare")
     async def prepare(self, interaction: Interaction, button: Button):
-        await interaction.response.send_modal(CompanyApplyChangesModal(self.req_id))
+        try:
+            await interaction.response.send_modal(CompanyApplyChangesModal(self.req_id))
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Не удалось открыть форму изменений (лимит полей Discord). Попробуйте ещё раз.",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="✅ Подтвердить изменения", style=ButtonStyle.success, custom_id="company:approve")
     async def approve(self, interaction: Interaction, button: Button):
