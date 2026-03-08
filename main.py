@@ -139,7 +139,7 @@ passive_flows = load_json(PASSIVE_FLOW_FILE, {"users": {}})
 command_access = load_json(COMMAND_ACCESS_FILE, {"commands": {}})
 seasons_data = load_json(
     SEASONS_FILE,
-    {"seasons": {}, "active_season": None, "spheres": {}, "user_progress": {}},
+    {"seasons": {}, "active_season": None, "spheres": {}, "user_progress": {}, "season_user_progress": {}},
 )
 sphere_requests = load_json(
     SPHERE_REQUESTS_FILE,
@@ -285,6 +285,12 @@ companies_data.setdefault("next_company_id", 1)
 companies_data.setdefault("next_request_id", 1)
 companies_data.setdefault("requests_channel", None)
 companies_data.setdefault("result_channel", None)
+seasons_data.setdefault("seasons", {})
+seasons_data.setdefault("active_season", None)
+seasons_data.setdefault("spheres", {})
+seasons_data.setdefault("season_user_progress", {})
+if seasons_data.get("user_progress") and seasons_data.get("active_season"):
+    seasons_data["season_user_progress"].setdefault(str(seasons_data.get("active_season")), dict(seasons_data.get("user_progress", {})))
 
 items_data.setdefault("categories", {}).setdefault("1", "Гражданские")
 items_data.setdefault("categories", {}).setdefault("2", "Военные")
@@ -920,7 +926,8 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     players = load_json(PLAYER_STATS_FILE, {})
     players.pop(user_id, None)
     passive_flows.setdefault("users", {}).pop(user_id, None)
-    seasons_data.setdefault("user_progress", {}).pop(user_id, None)
+    for _season_map in seasons_data.setdefault("season_user_progress", {}).values():
+        _season_map.pop(user_id, None)
     state = ensure_player_state(user_id)
     state["posts_count"] = 0
     player_state.setdefault("users", {}).pop(user_id, None)
@@ -2853,31 +2860,64 @@ def get_active_spheres():
     ]
 
 
-def get_user_sphere_level(user_id: str, sphere_name: str) -> int:
-    return int(
-        seasons_data.setdefault("user_progress", {})
-        .setdefault(user_id, {})
-        .get(sphere_name, 0)
-    )
+def build_sphere_id(season_name: str, sphere_name: str) -> str:
+    return f"{str(season_name).strip()}::{str(sphere_name).strip().lower()}"
 
 
-def get_user_sphere_level_by_requirement(user_id: str, sphere_name: str) -> int:
-    """Возвращает уровень сферы по требованию с учетом регистра/пробелов в названии."""
-    progress = seasons_data.setdefault("user_progress", {}).setdefault(user_id, {})
-    if sphere_name in progress:
-        return int(progress.get(sphere_name, 0))
+def get_season_progress_map(season_name: str | None = None) -> dict:
+    season = str(season_name or seasons_data.get("active_season") or "").strip()
+    if not season:
+        return {}
+    seasons_data.setdefault("season_user_progress", {})
+    season_map = seasons_data["season_user_progress"].setdefault(season, {})
+    if not isinstance(season_map, dict):
+        seasons_data["season_user_progress"][season] = {}
+        season_map = seasons_data["season_user_progress"][season]
+    return season_map
 
-    normalized = str(sphere_name).strip().casefold()
-    for name, level in progress.items():
-        if str(name).strip().casefold() == normalized:
+
+def get_user_progress_for_season(user_id: str, season_name: str | None = None) -> dict:
+    return get_season_progress_map(season_name).setdefault(str(user_id), {})
+
+
+def get_user_sphere_level(user_id: str, sphere_id_or_name: str, season_name: str | None = None) -> int:
+    progress = get_user_progress_for_season(user_id, season_name)
+    key = str(sphere_id_or_name)
+    if key in progress:
+        return int(progress.get(key, 0))
+
+    normalized = str(sphere_id_or_name).strip().casefold()
+    target_season = str(season_name or seasons_data.get("active_season") or "")
+    for sid, level in progress.items():
+        sp = seasons_data.setdefault("spheres", {}).get(str(sid), {})
+        if target_season and str(sp.get("season")) != target_season:
+            continue
+        if str(sp.get("name", "")).strip().casefold() == normalized:
             return int(level)
     return 0
 
 
-def set_user_sphere_level(user_id: str, sphere_name: str, level: int):
-    seasons_data.setdefault("user_progress", {}).setdefault(user_id, {})[
-        sphere_name
-    ] = level
+def resolve_sphere_id_by_name(sphere_name: str, season_name: str | None = None) -> str | None:
+    normalized = str(sphere_name).strip().casefold()
+    target_season = str(season_name or seasons_data.get("active_season") or "")
+    for sid, sp in seasons_data.setdefault("spheres", {}).items():
+        if target_season and str(sp.get("season")) != target_season:
+            continue
+        if str(sp.get("name", "")).strip().casefold() == normalized:
+            return str(sid)
+    return None
+
+
+def get_user_sphere_level_by_requirement(user_id: str, sphere_name: str, season_name: str | None = None) -> int:
+    """Возвращает уровень сферы по требованию с учетом сезона и регистра."""
+    sid = resolve_sphere_id_by_name(sphere_name, season_name)
+    if sid:
+        return get_user_sphere_level(user_id, sid, season_name)
+    return 0
+
+
+def set_user_sphere_level(user_id: str, sphere_id: str, level: int, season_name: str | None = None):
+    get_user_progress_for_season(user_id, season_name)[str(sphere_id)] = int(level)
     save_seasons_data()
 
 
@@ -3015,6 +3055,7 @@ async def установитьсезон(ctx, year: str):
             return
 
     seasons_data["active_season"] = selected
+    get_season_progress_map(selected)
     save_seasons_data()
     await ctx.send(
         embed=Embed(
@@ -3028,18 +3069,35 @@ async def установитьсезон(ctx, year: str):
 @bot.command(name="удалитьсферу")
 @commands.has_permissions(administrator=True)
 async def удалитьсферу(ctx, *, sphere_name: str):
-    key = sphere_name.strip().lower()
-    sphere = seasons_data.get("spheres", {}).get(key)
-    if not sphere:
+    query = sphere_name.strip().casefold()
+    active = seasons_data.get("active_season")
+    matches = [
+        (k, v)
+        for k, v in seasons_data.get("spheres", {}).items()
+        if str(v.get("season")) == str(active)
+        and query in str(v.get("name", "")).strip().casefold()
+    ]
+    if not matches:
         await ctx.send(
             embed=Embed(
-                title="❌ Ошибка", description="Сфера не найдена.", color=0xFF0000
+                title="❌ Ошибка", description="Сфера не найдена в активном сезоне.", color=0xFF0000
             )
         )
         return
+    if len(matches) > 1:
+        lines = "\n".join([f"• {v.get('name')}" for _, v in matches[:10]])
+        await ctx.send(
+            embed=Embed(
+                title="⚠️ Несколько сфер",
+                description=f"Уточните название:\n{lines}",
+                color=0xFFA500,
+            )
+        )
+        return
+    key, sphere = matches[0]
     del seasons_data["spheres"][key]
-    for uid, progress in seasons_data.setdefault("user_progress", {}).items():
-        progress.pop(sphere.get("name"), None)
+    for _, progress in get_season_progress_map(active).items():
+        progress.pop(str(key), None)
     save_seasons_data()
     await ctx.send(
         embed=Embed(
@@ -3066,9 +3124,9 @@ async def удалитьсезон(ctx, year: str):
     ]
     for k in to_del:
         del seasons_data["spheres"][k]
+    seasons_data.setdefault("season_user_progress", {}).pop(str(year), None)
     if seasons_data.get("active_season") == year:
         seasons_data["active_season"] = None
-    seasons_data["user_progress"] = {}
     save_seasons_data()
     await ctx.send(
         embed=Embed(
@@ -3454,7 +3512,16 @@ async def создатьсферу(ctx):
         )
         return
 
-    key = name.lower()
+    key = build_sphere_id(season_year, name)
+    if key in seasons_data.setdefault("spheres", {}):
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description=f"Сфера **{name}** уже существует в сезоне **{season_year}**.",
+                color=0xFF0000,
+            )
+        )
+        return
     seasons_data.setdefault("spheres", {})[key] = {
         "id": key,
         "name": name,
@@ -3574,7 +3641,7 @@ async def редактсферу(ctx):
 
     old_name = sphere.get("name", sphere_key)
     old_key = sphere_key
-    new_key = new_name.lower()
+    new_key = build_sphere_id(new_season, new_name)
 
     updated_sphere = {
         "id": new_key,
@@ -3587,15 +3654,17 @@ async def редактсферу(ctx):
         seasons_data.setdefault("spheres", {}).pop(old_key, None)
     seasons_data.setdefault("spheres", {})[new_key] = updated_sphere
 
-    if new_name != old_name:
-        for _, progress_map in seasons_data.setdefault("user_progress", {}).items():
-            if old_name in progress_map and new_name not in progress_map:
-                progress_map[new_name] = progress_map.pop(old_name)
-            elif old_name in progress_map and new_name in progress_map:
-                progress_map[new_name] = max(
-                    int(progress_map[new_name]), int(progress_map.pop(old_name))
-                )
+    if old_key != new_key or old_name != new_name or sphere.get("season") != new_season:
+        old_season = str(sphere.get("season"))
+        old_map = get_season_progress_map(old_season)
+        new_map = get_season_progress_map(new_season)
+        for uid, progress_map in old_map.items():
+            if old_key in progress_map:
+                val = int(progress_map.pop(old_key))
+                target = new_map.setdefault(uid, {})
+                target[new_key] = max(int(target.get(new_key, 0)), val)
 
+    if new_name != old_name:
         for sp in seasons_data.setdefault("spheres", {}).values():
             for lvl in sp.get("levels", []):
                 for req in lvl.get("requirements", []):
@@ -3855,7 +3924,7 @@ class SphereReviewView(View):
             return
 
         user["наличка"] -= price
-        set_user_sphere_level(str(req["user_id"]), sphere["name"], req["level"])
+        set_user_sphere_level(str(req["user_id"]), req["sphere_id"], req["level"], sphere.get("season"))
         save_json(BALANCES_FILE, balances)
 
         guild = interaction.guild
@@ -3981,7 +4050,7 @@ async def принять_заявку(ctx, request_id: str):
         return
 
     user["наличка"] -= price
-    set_user_sphere_level(str(req["user_id"]), sphere["name"], int(req["level"]))
+    set_user_sphere_level(str(req["user_id"]), req["sphere_id"], int(req["level"]), sphere.get("season"))
     save_json(BALANCES_FILE, balances)
 
     member = ctx.guild.get_member(req["user_id"])
@@ -4129,7 +4198,7 @@ class SphereLevelsView(View):
     async def buy(self, interaction: Interaction, button: Button):
         sphere = seasons_data["spheres"][self.sphere_id]
         wanted_level = self.index + 1
-        current = get_user_sphere_level(str(interaction.user.id), sphere["name"])
+        current = get_user_sphere_level(str(interaction.user.id), sphere["id"], sphere.get("season"))
         if wanted_level != current + 1:
             await interaction.response.send_message(
                 "Можно покупать только следующий уровень по очереди.", ephemeral=True
@@ -4138,7 +4207,7 @@ class SphereLevelsView(View):
         reqs = sphere["levels"][self.index].get("requirements", [])
         for req in reqs:
             current_req_level = get_user_sphere_level_by_requirement(
-                str(interaction.user.id), req["sphere"]
+                str(interaction.user.id), req["sphere"], sphere.get("season")
             )
             required_level = int(req["level"])
             if current_req_level < required_level:
@@ -4202,8 +4271,15 @@ async def сферы(ctx):
 @commands.has_permissions(administrator=True)
 async def понизитьсферу(ctx, member: discord.Member):
     user_id = str(member.id)
-    progress = seasons_data.setdefault("user_progress", {}).setdefault(user_id, {})
-    current = [(name, int(level)) for name, level in progress.items() if int(level) > 0]
+    active = seasons_data.get("active_season")
+    progress = get_user_progress_for_season(user_id, active)
+    current = []
+    for sid, level in progress.items():
+        lvl = int(level)
+        if lvl <= 0:
+            continue
+        sp = seasons_data.setdefault("spheres", {}).get(str(sid), {})
+        current.append((str(sid), sp.get("name", str(sid)), lvl))
     if not current:
         await ctx.send(
             embed=Embed(
@@ -4239,13 +4315,14 @@ async def понизитьсферу(ctx, member: discord.Member):
         if ":" not in raw:
             raise ValueError("Неверный формат")
         sphere_name, level_text = [x.strip() for x in raw.split(":", 1)]
-        if sphere_name not in progress:
-            raise ValueError("Сфера не найдена у игрока")
+        sid = resolve_sphere_id_by_name(sphere_name, active)
+        if not sid or sid not in progress:
+            raise ValueError("Сфера не найдена у игрока в активном сезоне")
         new_level = int(level_text)
-        old_level = int(progress.get(sphere_name, 0))
+        old_level = int(progress.get(sid, 0))
         if new_level < 0 or new_level >= old_level:
             raise ValueError("Новый уровень должен быть меньше текущего и не ниже 0")
-        progress[sphere_name] = new_level
+        progress[sid] = new_level
         save_seasons_data()
     except Exception as e:
         await ctx.send(
@@ -4260,7 +4337,7 @@ async def понизитьсферу(ctx, member: discord.Member):
     await ctx.send(
         embed=Embed(
             title="✅ Сфера понижена",
-            description=f"{member.mention}: **{sphere_name}** → уровень **{new_level}**.",
+            description=f"{member.mention}: **{sphere_name}** (сезон {active}) → уровень **{new_level}**.",
             color=0x00FF00,
         )
     )
@@ -11828,7 +11905,7 @@ async def wipe_all(ctx):
         "inventory": inventory.copy(),
         "population": load_json(POPULATION_FILE, {}),
         "passive_flows": passive_flows.copy(),
-        "season_user_progress": seasons_data.get("user_progress", {}).copy(),
+        "season_user_progress": seasons_data.get("season_user_progress", {}).copy(),
         "player_state": player_state.copy(),
         "investments": investments.copy(),
         "companies": companies_data.copy(),
@@ -11872,7 +11949,7 @@ async def wipe_all(ctx):
             save_json(POPULATION_FILE, {})
             passive_flows["users"] = {}
             save_passive_flows()
-            seasons_data["user_progress"] = {}
+            seasons_data["season_user_progress"] = {}
             save_seasons_data()
             pre_reg_roles_map = {
                 str(uid): list((data or {}).get("pre_reg_role_ids", []))
@@ -11984,7 +12061,7 @@ async def undo_wipe(ctx):
     passive_flows.update(backup.get("passive_flows", {"users": {}}))
     passive_flows.setdefault("users", {})
     save_passive_flows()
-    seasons_data["user_progress"] = backup.get("season_user_progress", {})
+    seasons_data["season_user_progress"] = backup.get("season_user_progress", {})
     save_seasons_data()
     player_state.clear()
     player_state.update(backup.get("player_state", {"users": {}}))
@@ -12045,7 +12122,7 @@ async def wipe_player(ctx, member: discord.Member):
     user_has_state = user_id in player_state.setdefault("users", {}) and bool(
         player_state["users"].get(user_id)
     )
-    user_has_season = user_id in seasons_data.setdefault("user_progress", {})
+    user_has_season = any(user_id in m for m in seasons_data.setdefault("season_user_progress", {}).values())
     user_has_investments = bool(investments.setdefault("users", {}).get(user_id))
     user_has_companies = any(
         str(c.get("owner_id")) == user_id
@@ -12102,9 +12179,7 @@ async def wipe_player(ctx, member: discord.Member):
                 "inventory": inventory.get(user_id, {}),
                 "population": population.get(user_id, 0),
                 "passive_entries": get_passive_entries(user_id).copy(),
-                "season_progress": seasons_data.get("user_progress", {})
-                .get(user_id, {})
-                .copy(),
+                "season_progress": get_user_progress_for_season(user_id, seasons_data.get("active_season")).copy(),
                 "player_state": player_state.setdefault("users", {})
                 .get(user_id, {})
                 .copy(),
@@ -12145,7 +12220,9 @@ async def wipe_player(ctx, member: discord.Member):
             players = load_json(PLAYER_STATS_FILE, {})
             players.pop(user_id, None)
             passive_flows.setdefault("users", {}).pop(user_id, None)
-            seasons_data.setdefault("user_progress", {}).pop(user_id, None)
+            
+            for _season_map in seasons_data.setdefault("season_user_progress", {}).values():
+                _season_map.pop(user_id, None)
             state = ensure_player_state(user_id)
             pre_reg_roles = list(state.get("pre_reg_role_ids", []))
             state["posts_count"] = 0
@@ -12808,14 +12885,15 @@ async def профиль(ctx, member: discord.Member = None):
 
         @discord.ui.button(label="Экономика игрока", style=ButtonStyle.primary)
         async def player_economy(self, interaction: Interaction, button: Button):
-            progress_map = seasons_data.setdefault("user_progress", {}).get(
-                str(self.target_member.id), {}
-            )
-            reached = [
-                (sphere_name, int(level))
-                for sphere_name, level in progress_map.items()
-                if int(level) > 0
-            ]
+            active = seasons_data.get("active_season")
+            progress_map = get_user_progress_for_season(str(self.target_member.id), active)
+            reached = []
+            for sphere_id, level in progress_map.items():
+                lvl = int(level)
+                if lvl <= 0:
+                    continue
+                sp = seasons_data.setdefault("spheres", {}).get(str(sphere_id), {})
+                reached.append((sp.get("name", str(sphere_id)), lvl))
 
             if not reached:
                 await interaction.response.send_message(
