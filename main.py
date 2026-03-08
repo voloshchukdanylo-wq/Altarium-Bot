@@ -6297,6 +6297,38 @@ def company_ping_roles_line(guild: discord.Guild):
     return " ".join(mentions).strip()
 
 
+async def get_channel_safe(channel_id):
+    if not channel_id:
+        return None
+    try:
+        cid = int(channel_id)
+    except (TypeError, ValueError):
+        return None
+    ch = bot.get_channel(cid)
+    if ch:
+        return ch
+    try:
+        fetched = await bot.fetch_channel(cid)
+        return fetched if isinstance(fetched, discord.abc.Messageable) else None
+    except Exception:
+        return None
+
+
+def find_companies_by_name(query: str, owner_id: str | None = None):
+    q = str(query or "").strip().lower()
+    all_companies = list(companies_data.setdefault("companies", {}).values())
+    if owner_id is not None:
+        all_companies = [c for c in all_companies if str(c.get("owner_id")) == str(owner_id)]
+    if q == "*":
+        return all_companies
+    if not q:
+        return []
+    exact = [c for c in all_companies if str(c.get("name", "")).strip().lower() == q]
+    if exact:
+        return exact
+    return [c for c in all_companies if q in str(c.get("name", "")).strip().lower()]
+
+
 def build_company_request_embed(req: dict, color=0x3498DB):
     em = Embed(title=f"🏢 Заявка компании #{req.get('id')} ({req.get('type')})", color=color)
     em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
@@ -6360,11 +6392,11 @@ class CompanyCreateModal(Modal):
 class CompanyBuyModal(Modal):
     def __init__(self):
         super().__init__(title="Купить компанию", timeout=600)
-        self.company_id = TextInput(label="ID компании", required=True, max_length=20)
+        self.company_name = TextInput(label="Название компании (можно частично)", required=True, max_length=120)
         self.post_url = TextInput(label="Пост", required=True, max_length=400)
         self.offer = TextInput(label="Сколько денег предлагаете", required=True, max_length=100)
         self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
-        for item in (self.company_id, self.post_url, self.offer, self.reason):
+        for item in (self.company_name, self.post_url, self.offer, self.reason):
             self.add_item(item)
 
     async def on_submit(self, interaction: Interaction):
@@ -6373,10 +6405,18 @@ class CompanyBuyModal(Modal):
             await interaction.response.send_message("❌ Купить компанию могут только зарегистрированные игроки.", ephemeral=True)
             return
 
-        company = companies_data.setdefault("companies", {}).get(str(self.company_id.value).strip())
-        if not company:
-            await interaction.response.send_message("❌ Компания с таким ID не найдена.", ephemeral=True)
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=None)
+        if not matches:
+            await interaction.response.send_message("❌ Компания с таким названием не найдена.", ephemeral=True)
             return
+        if len(matches) > 1:
+            names = "\n".join([f"• {c.get('name', 'Без названия')} (владелец: <@{c.get('owner_id')}>)" for c in matches[:10]])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько компаний. Уточните название и подтвердите выбор:\n" + names,
+                ephemeral=True,
+            )
+            return
+        company = matches[0]
         if str(company.get("owner_id")) == buyer_id:
             await interaction.response.send_message("❌ Вы уже владелец этой компании.", ephemeral=True)
             return
@@ -6388,7 +6428,8 @@ class CompanyBuyModal(Modal):
             "type": "buy",
             "author_id": buyer_id,
             "owner_id": str(company.get("owner_id")),
-            "company_id": str(self.company_id.value).strip(),
+            "decision_user_id": str(company.get("owner_id")),
+            "company_id": str(company.get("id")),
             "status": "pending_owner",
             "status_text": "⏳ Ожидает решения владельца",
             "payload": {
@@ -6418,20 +6459,28 @@ class CompanyBuyModal(Modal):
 class CompanySellModal(Modal):
     def __init__(self):
         super().__init__(title="Продать компанию", timeout=600)
-        self.company_id = TextInput(label="ID компании", required=True, max_length=20)
+        self.company_name = TextInput(label="Название компании (можно частично)", required=True, max_length=120)
         self.buyer_id = TextInput(label="ID покупателя", required=True, max_length=30)
         self.post_url = TextInput(label="Пост", required=True, max_length=400)
         self.price = TextInput(label="Цена продажи", required=True, max_length=100)
         self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph, required=True, max_length=1000)
-        for item in (self.company_id, self.buyer_id, self.post_url, self.price, self.reason):
+        for item in (self.company_name, self.buyer_id, self.post_url, self.price, self.reason):
             self.add_item(item)
 
     async def on_submit(self, interaction: Interaction):
         owner_id = str(interaction.user.id)
-        company = companies_data.setdefault("companies", {}).get(str(self.company_id.value).strip())
-        if not company or str(company.get("owner_id")) != owner_id:
-            await interaction.response.send_message("❌ Вы не владелец указанной компании.", ephemeral=True)
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
+        if not matches:
+            await interaction.response.send_message("❌ У вас нет компании с таким названием.", ephemeral=True)
             return
+        if len(matches) > 1:
+            names = "\n".join([f"• {c.get('name', 'Без названия')}" for c in matches[:10]])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько ваших компаний. Уточните название:\n" + names,
+                ephemeral=True,
+            )
+            return
+        company = matches[0]
 
         buyer_id = str(self.buyer_id.value).strip().replace("<@", "").replace(">", "").replace("!", "")
         if not buyer_id.isdigit() or not is_registered_player(buyer_id):
@@ -6445,9 +6494,10 @@ class CompanySellModal(Modal):
             "type": "sell",
             "author_id": owner_id,
             "buyer_id": buyer_id,
-            "company_id": str(self.company_id.value).strip(),
-            "status": "pending_moderation",
-            "status_text": "⏳ На рассмотрении модерации",
+            "decision_user_id": buyer_id,
+            "company_id": str(company.get("id")),
+            "status": "pending_buyer",
+            "status_text": "⏳ Ожидает решения второй стороны",
             "payload": {
                 "Пост": str(self.post_url.value).strip(),
                 "Цена": str(self.price.value).strip(),
@@ -6458,34 +6508,45 @@ class CompanySellModal(Modal):
         companies_data.setdefault("requests", {})[str(req_id)] = req
         save_companies_data()
 
-        req_channel_id = companies_data.get("requests_channel")
-        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
-        if req_channel:
-            content = f"<@{owner_id}> <@{buyer_id}> " + (company_ping_roles_line(interaction.guild) or "")
-            msg = await req_channel.send(content=content.strip(), embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
-            req["request_channel_id"] = msg.channel.id
-            req["request_message_id"] = msg.id
-            save_companies_data()
+        buyer_member = interaction.guild.get_member(int(buyer_id)) if interaction.guild else None
+        if buyer_member:
+            try:
+                await buyer_member.send(
+                    content=f"📩 Вам предложили покупку компании **{company.get('name')}** от {interaction.user.mention}",
+                    embed=build_company_request_embed(req),
+                    view=CompanyOwnerDecisionView(str(req_id)),
+                )
+            except Exception:
+                pass
 
-        await interaction.response.send_message("✅ Заявка на продажу отправлена в канал компаний.", ephemeral=True)
+        save_companies_data()
+        await interaction.response.send_message("✅ Предложение отправлено второй стороне в ЛС.", ephemeral=True)
 
 
 class CompanyUpgradeModal(Modal):
     def __init__(self):
         super().__init__(title="Улучшить компанию", timeout=600)
-        self.company_id = TextInput(label="ID компании", required=True, max_length=20)
+        self.company_name = TextInput(label="Название компании (можно частично)", required=True, max_length=120)
         self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
         self.invest = TextInput(label="Вклад денег", required=True, max_length=100)
-        for item in (self.company_id, self.post_url, self.invest):
+        for item in (self.company_name, self.post_url, self.invest):
             self.add_item(item)
 
     async def on_submit(self, interaction: Interaction):
         owner_id = str(interaction.user.id)
-        cid = str(self.company_id.value).strip()
-        company = companies_data.setdefault("companies", {}).get(cid)
-        if not company or str(company.get("owner_id")) != owner_id:
-            await interaction.response.send_message("❌ Вы не владелец указанной компании.", ephemeral=True)
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
+        if not matches:
+            await interaction.response.send_message("❌ У вас нет компании с таким названием.", ephemeral=True)
             return
+        if len(matches) > 1:
+            names = "\n".join([f"• {c.get('name', 'Без названия')}" for c in matches[:10]])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько ваших компаний. Уточните название:\n" + names,
+                ephemeral=True,
+            )
+            return
+        company = matches[0]
+        cid = str(company.get("id"))
 
         req_id = int(companies_data.get("next_request_id", 1))
         companies_data["next_request_id"] = req_id + 1
@@ -6530,9 +6591,14 @@ class CompanyOwnerRejectModal(Modal):
             await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
             return
         req["status"] = "rejected_by_owner"
-        req["status_text"] = f"❌ Отклонено владельцем. Причина: {self.reason.value}"
+        req["status_text"] = f"❌ Отклонено владельцем\nПартнер: {interaction.user.mention}\nПричина: {self.reason.value}"
         req["owner_reason"] = str(self.reason.value).strip()
         save_companies_data()
+
+        result_channel = await get_channel_safe(companies_data.get("result_channel"))
+        if result_channel:
+            mentions = [f"<@{req.get('author_id')}>", f"<@{req.get('owner_id')}>", f"<@{interaction.user.id}>"]
+            await result_channel.send(content=" ".join(sorted(set(mentions))), embed=build_company_request_embed(req, color=0xE74C3C))
         await interaction.response.send_message("✅ Предложение отклонено.", ephemeral=True)
 
 
@@ -6547,18 +6613,19 @@ class CompanyOwnerDecisionView(View):
         if not req:
             await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
             return
-        if str(req.get("owner_id")) != str(interaction.user.id):
-            await interaction.response.send_message("❌ Только владелец может принять.", ephemeral=True)
+        decision_user_id = str(req.get("decision_user_id") or req.get("owner_id") or req.get("buyer_id") or "")
+        if decision_user_id != str(interaction.user.id):
+            await interaction.response.send_message("❌ Только вторая сторона сделки может принять.", ephemeral=True)
             return
 
         req["status"] = "pending_moderation"
         req["status_text"] = f"⏳ Владелец согласовал. Ожидает модерацию\nПартнер: {interaction.user.mention}"
 
-        req_channel_id = companies_data.get("requests_channel")
-        req_channel = interaction.guild.get_channel(int(req_channel_id)) if req_channel_id else None
+        req_channel = await get_channel_safe(companies_data.get("requests_channel"))
         if req_channel:
-            content = f"<@{req.get('author_id')}> <@{req.get('owner_id')}> " + (company_ping_roles_line(interaction.guild) or "")
-            msg = await req_channel.send(content=content.strip(), embed=build_company_request_embed(req), view=CompanyReviewView(self.req_id))
+            second_party = str(req.get("owner_id") or req.get("buyer_id") or "")
+            content = (f"<@{req.get('author_id')}> " + (f"<@{second_party}> " if second_party else "") + company_ping_roles_line(req_channel.guild)).strip()
+            msg = await req_channel.send(content=content or None, embed=build_company_request_embed(req), view=CompanyReviewView(self.req_id))
             req["request_channel_id"] = msg.channel.id
             req["request_message_id"] = msg.id
 
@@ -6568,7 +6635,11 @@ class CompanyOwnerDecisionView(View):
     @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:owner_reject")
     async def reject(self, interaction: Interaction, button: Button):
         req = companies_data.get("requests", {}).get(self.req_id)
-        if not req or str(req.get("owner_id")) != str(interaction.user.id):
+        if not req:
+            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return
+        decision_user_id = str(req.get("decision_user_id") or req.get("owner_id") or req.get("buyer_id") or "")
+        if decision_user_id != str(interaction.user.id):
             await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
             return
         await interaction.response.send_modal(CompanyOwnerRejectModal(self.req_id))
@@ -6636,10 +6707,14 @@ class CompanyRejectModal(Modal):
         req["status_text"] = f"❌ Отклонено\nРассмотрел: {interaction.user.mention}\nПричина: {self.reason.value}"
         save_companies_data()
 
-        result_channel_id = companies_data.get("result_channel")
-        result_channel = interaction.guild.get_channel(int(result_channel_id)) if result_channel_id else None
+        result_channel = await get_channel_safe(companies_data.get("result_channel"))
         if result_channel:
-            await result_channel.send(content=f"<@{req.get('author_id')}>", embed=build_company_request_embed(req, color=0xE74C3C))
+            mentions = [f"<@{req.get('author_id')}>", f"<@{interaction.user.id}>"]
+            if req.get("owner_id"):
+                mentions.append(f"<@{req.get('owner_id')}>")
+            if req.get("buyer_id"):
+                mentions.append(f"<@{req.get('buyer_id')}>")
+            await result_channel.send(content=" ".join(sorted(set(mentions))), embed=build_company_request_embed(req, color=0xE74C3C))
         await interaction.response.edit_message(embed=build_company_request_embed(req, color=0xE74C3C), view=None)
 
 
@@ -6694,7 +6769,7 @@ class CompanyReviewView(View):
             }
             update_company_derived_fields(company)
             companies_data.setdefault("companies", {})[company_id] = company
-            summary.append(f"Создана компания ID {company_id}: {company.get('name')}")
+            summary.append(f"Создана компания {company.get('name')}")
 
         elif req_type in ("buy", "sell"):
             company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
@@ -6775,7 +6850,14 @@ class CompanyActionsSelect(Select):
         v = self.values[0]
         if v == "create":
             await interaction.response.send_modal(CompanyCreateModal())
-        elif v == "buy":
+            return
+
+        owned_companies = find_companies_by_name("*", owner_id=str(interaction.user.id))
+        if not owned_companies:
+            await interaction.response.send_message("❌ Эти действия доступны только владельцу своих компаний.", ephemeral=True)
+            return
+
+        if v == "buy":
             await interaction.response.send_modal(CompanyBuyModal())
         elif v == "sell":
             await interaction.response.send_modal(CompanySellModal())
