@@ -5730,11 +5730,7 @@ class PartnershipRejectModal(Modal):
             pass
 
         await interaction.response.edit_message(
-            embed=Embed(
-                title="❌ Заявка отклонена",
-                description=f"Заявка #{self.req_id} отклонена.",
-                color=0xAA0000,
-            ),
+            embed=build_partnership_request_embed(req, status_text=req["status_text"], color=discord.Color.red().value),
             view=None,
         )
 
@@ -5802,11 +5798,7 @@ class PartnershipReviewView(View):
             pass
 
         await interaction.response.edit_message(
-            embed=Embed(
-                title="✅ Заявка принята",
-                description=f"Заявка #{self.req_id} принята и опубликована в партнерках.",
-                color=0x00FF00,
-            ),
+            embed=build_partnership_request_embed(req, status_text=req["status_text"], color=discord.Color.green().value),
             view=None,
         )
 
@@ -6616,7 +6608,10 @@ class CompanyOwnerRejectModal(Modal):
         if result_channel:
             mentions = [f"<@{req.get('author_id')}>", f"<@{req.get('owner_id')}>", f"<@{interaction.user.id}>"]
             await result_channel.send(content=" ".join(sorted(set(mentions))), embed=build_company_request_embed(req, color=0xE74C3C))
-        await interaction.response.send_message("✅ Предложение отклонено.", ephemeral=True)
+        await interaction.response.edit_message(
+            embed=build_company_request_embed(req, color=0xE74C3C),
+            view=None,
+        )
 
 
 class CompanyOwnerDecisionView(View):
@@ -6635,8 +6630,12 @@ class CompanyOwnerDecisionView(View):
             await interaction.response.send_message("❌ Только вторая сторона сделки может принять.", ephemeral=True)
             return
 
+        if req.get("status") not in ("pending_owner", "pending_buyer"):
+            await interaction.response.send_message("❌ Эта заявка уже обработана.", ephemeral=True)
+            return
+
         req["status"] = "pending_moderation"
-        req["status_text"] = f"⏳ Владелец согласовал. Ожидает модерацию\nПартнер: {interaction.user.mention}"
+        req["status_text"] = f"⏳ Вторая сторона согласовала. Ожидает модерацию\nПартнер: {interaction.user.mention}"
 
         req_channel = await get_channel_safe(companies_data.get("requests_channel"))
         if req_channel:
@@ -6647,7 +6646,10 @@ class CompanyOwnerDecisionView(View):
             req["request_message_id"] = msg.id
 
         save_companies_data()
-        await interaction.response.send_message("✅ Отправлено на модерацию компаний.", ephemeral=True)
+        await interaction.response.edit_message(
+            embed=build_company_request_embed(req, color=0xF1C40F),
+            view=None,
+        )
 
     @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:owner_reject")
     async def reject(self, interaction: Interaction, button: Button):
@@ -6658,6 +6660,9 @@ class CompanyOwnerDecisionView(View):
         decision_user_id = str(req.get("decision_user_id") or req.get("owner_id") or req.get("buyer_id") or "")
         if decision_user_id != str(interaction.user.id):
             await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return
+        if req.get("status") not in ("pending_owner", "pending_buyer"):
+            await interaction.response.send_message("❌ Эта заявка уже обработана.", ephemeral=True)
             return
         await interaction.response.send_modal(CompanyOwnerRejectModal(self.req_id))
 
