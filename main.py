@@ -6866,9 +6866,14 @@ class CompanyApplyChangesModal(Modal):
         self.expense_cd = TextInput(label="2. Сменить кулдаун затрат", required=False, max_length=100, default=format_interval(int(company.get("expense_cooldown", 86400))))
         self.income_amount = TextInput(label="3. Сменить сумму дохода", required=False, max_length=100, default=str(company.get("income_amount", "")))
         self.income_cd = TextInput(label="4. Сменить кулдаун дохода", required=False, max_length=100, default=format_interval(int(company.get("income_cooldown", 3600))))
-        self.min_value = TextInput(label="5. Сменить минимальную стоимость", required=False, max_length=100, default=str(company.get("min_value", "")))
-        self.advert_level = TextInput(label="6. Повысить уровень рекламы", required=False, max_length=100, default=str(company.get("advert_level", 1)))
-        for i in (self.expense_amount, self.expense_cd, self.income_amount, self.income_cd, self.min_value, self.advert_level):
+        self.value_advert = TextInput(
+            label="5. Мин. стоимость / уровень рекламы",
+            required=False,
+            max_length=100,
+            default=f"{company.get('min_value', '')} / {company.get('advert_level', 1)}",
+            placeholder="например: 5000000 / 3",
+        )
+        for i in (self.expense_amount, self.expense_cd, self.income_amount, self.income_cd, self.value_advert):
             self.add_item(i)
 
     async def on_submit(self, interaction: Interaction):
@@ -6893,8 +6898,17 @@ class CompanyApplyChangesModal(Modal):
         _apply_change("expense_cooldown", _val(self.expense_cd), "КД затрат")
         _apply_change("income_amount", _val(self.income_amount), "Доход")
         _apply_change("income_cooldown", _val(self.income_cd), "КД дохода")
-        _apply_change("min_value", _val(self.min_value), "Минимальная стоимость")
-        _apply_change("advert_level", _val(self.advert_level), "Уровень рекламы")
+
+        value_advert_raw = _val(self.value_advert)
+        if value_advert_raw:
+            parts = [p.strip() for p in value_advert_raw.split("/")]
+            if len(parts) == 1:
+                _apply_change("min_value", parts[0], "Минимальная стоимость")
+            else:
+                if parts[0]:
+                    _apply_change("min_value", parts[0], "Минимальная стоимость")
+                if parts[1]:
+                    _apply_change("advert_level", parts[1], "Уровень рекламы")
 
         req["status_text"] = "📝 Изменения подготовлены:\n" + ("\n".join(change_lines) if change_lines else "изменений нет")
         req["processed_by"] = str(interaction.user.id)
