@@ -925,6 +925,22 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     state["posts_count"] = 0
     player_state.setdefault("users", {}).pop(user_id, None)
     investments.setdefault("users", {}).pop(user_id, None)
+    companies_data["companies"] = {
+        cid: c
+        for cid, c in companies_data.setdefault("companies", {}).items()
+        if str(c.get("owner_id")) != user_id
+    }
+    companies_data["requests"] = {
+        rid: r
+        for rid, r in companies_data.setdefault("requests", {}).items()
+        if user_id
+        not in {
+            str(r.get("author_id", "")),
+            str(r.get("owner_id", "")),
+            str(r.get("buyer_id", "")),
+            str(r.get("decision_user_id", "")),
+        }
+    }
     old_country = country_owners.setdefault("user_to_country", {}).pop(user_id, None)
     if old_country:
         country_owners.setdefault("country_to_user", {}).pop(old_country, None)
@@ -936,6 +952,7 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     save_seasons_data()
     save_player_state()
     save_investments()
+    save_companies_data()
     save_country_owners()
 
     if guild is not None:
@@ -11769,6 +11786,7 @@ async def wipe_all(ctx):
         "season_user_progress": seasons_data.get("user_progress", {}).copy(),
         "player_state": player_state.copy(),
         "investments": investments.copy(),
+        "companies": companies_data.copy(),
         "country_owners": country_owners.copy(),
     }
     save_json(WIPE_BACKUP_FILE, backup)
@@ -11818,10 +11836,15 @@ async def wipe_all(ctx):
             }
             player_state["users"] = {}
             investments["users"] = {}
+            companies_data["companies"] = {}
+            companies_data["requests"] = {}
+            companies_data["next_company_id"] = 1
+            companies_data["next_request_id"] = 1
             country_owners["country_to_user"] = {}
             country_owners["user_to_country"] = {}
             save_player_state()
             save_investments()
+            save_companies_data()
             save_country_owners()
 
             for m in ctx.guild.members:
@@ -11841,7 +11864,7 @@ async def wipe_all(ctx):
                 await interaction.message.edit(
                     embed=Embed(
                         title="💥 ГЛОБАЛЬНЫЙ ВАЙП ВЫПОЛНЕН",
-                        description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер и счётчик постов.",
+                        description="Обнулены балансы, инвентари, население, пассивные операции, прогресс сфер, компании и счётчик постов.",
                         color=0x00FF00,
                     ),
                     view=None,
@@ -11926,6 +11949,27 @@ async def undo_wipe(ctx):
     investments.update(backup.get("investments", {"users": {}}))
     investments.setdefault("users", {})
     save_investments()
+    companies_data.clear()
+    companies_data.update(
+        backup.get(
+            "companies",
+            {
+                "companies": {},
+                "requests": {},
+                "next_company_id": 1,
+                "next_request_id": 1,
+                "requests_channel": companies_data.get("requests_channel"),
+                "result_channel": companies_data.get("result_channel"),
+            },
+        )
+    )
+    companies_data.setdefault("companies", {})
+    companies_data.setdefault("requests", {})
+    companies_data.setdefault("next_company_id", 1)
+    companies_data.setdefault("next_request_id", 1)
+    companies_data.setdefault("requests_channel", None)
+    companies_data.setdefault("result_channel", None)
+    save_companies_data()
     country_owners.clear()
     country_owners.update(
         backup.get("country_owners", {"country_to_user": {}, "user_to_country": {}})
@@ -11937,7 +11981,7 @@ async def undo_wipe(ctx):
     await ctx.send(
         embed=Embed(
             title="♻️ ВАЙП ОТМЕНЁН",
-            description="Данные восстановлены (включая прогресс сфер).",
+            description="Данные восстановлены (включая прогресс сфер и компании).",
             color=0x00FF00,
         )
     )
@@ -11958,6 +12002,10 @@ async def wipe_player(ctx, member: discord.Member):
     )
     user_has_season = user_id in seasons_data.setdefault("user_progress", {})
     user_has_investments = bool(investments.setdefault("users", {}).get(user_id))
+    user_has_companies = any(
+        str(c.get("owner_id")) == user_id
+        for c in companies_data.setdefault("companies", {}).values()
+    )
     user_has_country = user_id in country_owners.setdefault("user_to_country", {})
 
     if not any(
@@ -11969,6 +12017,7 @@ async def wipe_player(ctx, member: discord.Member):
             user_has_state,
             user_has_season,
             user_has_investments,
+            user_has_companies,
             user_has_country,
         ]
     ):
@@ -12015,6 +12064,22 @@ async def wipe_player(ctx, member: discord.Member):
                 .get(user_id, {})
                 .copy(),
                 "investments": ensure_investments(user_id).copy(),
+                "companies": {
+                    cid: c
+                    for cid, c in companies_data.setdefault("companies", {}).items()
+                    if str(c.get("owner_id")) == user_id
+                },
+                "company_requests": {
+                    rid: r
+                    for rid, r in companies_data.setdefault("requests", {}).items()
+                    if user_id
+                    in {
+                        str(r.get("author_id", "")),
+                        str(r.get("owner_id", "")),
+                        str(r.get("buyer_id", "")),
+                        str(r.get("decision_user_id", "")),
+                    }
+                },
                 "country": country_owners.get("user_to_country", {}).get(user_id),
             }
             save_json(WIPE_BACKUP_FILE, backup)
@@ -12041,6 +12106,22 @@ async def wipe_player(ctx, member: discord.Member):
             state["posts_count"] = 0
             player_state.setdefault("users", {}).pop(user_id, None)
             investments.setdefault("users", {}).pop(user_id, None)
+            companies_data["companies"] = {
+                cid: c
+                for cid, c in companies_data.setdefault("companies", {}).items()
+                if str(c.get("owner_id")) != user_id
+            }
+            companies_data["requests"] = {
+                rid: r
+                for rid, r in companies_data.setdefault("requests", {}).items()
+                if user_id
+                not in {
+                    str(r.get("author_id", "")),
+                    str(r.get("owner_id", "")),
+                    str(r.get("buyer_id", "")),
+                    str(r.get("decision_user_id", "")),
+                }
+            }
             old_country = country_owners.setdefault("user_to_country", {}).pop(
                 user_id, None
             )
@@ -12055,6 +12136,7 @@ async def wipe_player(ctx, member: discord.Member):
             save_seasons_data()
             save_player_state()
             save_investments()
+            save_companies_data()
             save_country_owners()
 
             try:
@@ -12069,7 +12151,7 @@ async def wipe_player(ctx, member: discord.Member):
                 await interaction.message.edit(
                     embed=Embed(
                         title="🔥 ВАЙП ИГРОКА ВЫПОЛНЕН",
-                        description=f"Данные {member.mention}, пассивные операции и прогресс сфер обнулены.",
+                        description=f"Данные {member.mention}, пассивные операции, прогресс сфер и компании обнулены.",
                         color=0xFF0000,
                     ),
                     view=None,
