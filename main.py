@@ -11150,6 +11150,9 @@ async def auto_role_income_loop():
     now = int(time.time())
     for guild in bot.guilds:
         if guild.id != ALLOWED_GUILD:
+            print(
+                f"[AUTO_LOOP] Пропуск guild={guild.id}: не совпадает с ALLOWED_GUILD={ALLOWED_GUILD}"
+            )
             continue
 
         channel_id = settings.get("autocollect_channel")
@@ -11162,6 +11165,7 @@ async def auto_role_income_loop():
                 None,
             )
         if not channel:
+            print(f"[AUTO_LOOP] Пропуск guild={guild.id}: нет доступного канала для отправки")
             continue
 
         for member in guild.members:
@@ -11178,9 +11182,16 @@ async def auto_role_income_loop():
                 last_map = role_income.setdefault("last_claim", {}).setdefault(
                     user_id, {}
                 )
-                last = last_map.get(rid, now)
+                cooldown = max(1, int(data.get("cooldown", 1)))
+                if rid not in last_map:
+                    # Первое автоначисление: не ждём полный кулдаун
+                    last_map[rid] = now - cooldown
+                    print(
+                        f"[AUTO_LOOP] Инициализация last_claim: user={user_id} role={rid} last={last_map[rid]}"
+                    )
+                last = int(last_map.get(rid, now))
 
-                if now - last >= int(data["cooldown"]):
+                if now - last >= cooldown:
                     try:
                         amount = parse_money_value(
                             str(data["amount"]), ensure_user(user_id)["наличка"]
@@ -11191,6 +11202,9 @@ async def auto_role_income_loop():
                     add_balance(user_id, amount)
                     total_earned += amount
                     roles_earned.append(role.name)
+                    print(
+                        f"[AUTO_LOOP] Автоколлект: guild={guild.id} user={user_id} role={rid} amount={amount}"
+                    )
 
             if total_earned != 0:
                 save_json(ROLE_INCOME_FILE, role_income)
@@ -11224,8 +11238,14 @@ async def auto_role_income_loop():
                     continue
                 if "last_run" not in entry:
                     last_ts = int(entry.get("last_ts", 0) or 0)
-                    entry["last_run"] = last_ts if last_ts > 0 else now_ts
+                    # Первое автоначисление/автосписание: сразу на первом проходе
+                    entry["last_run"] = (
+                        last_ts if last_ts > 0 else now_ts - cooldown
+                    )
                     changed = True
+                    print(
+                        f"[AUTO_LOOP] Инициализация passive last_run: user={user_id} entry={entry.get('description', 'без описания')} last_run={entry['last_run']}"
+                    )
                 last_run = int(entry.get("last_run", now_ts))
                 if now_ts - last_run < cooldown:
                     continue
@@ -11249,6 +11269,9 @@ async def auto_role_income_loop():
 
                 entry["last_run"] = last_run + cycles * cooldown
                 changed = True
+                print(
+                    f"[AUTO_LOOP] Пассивный поток: guild={guild.id} user={user_id} type={entry.get('type', 'income')} delta={int(delta)} cycles={cycles}"
+                )
                 await log_economy_change(
                     guild,
                     user_id,
