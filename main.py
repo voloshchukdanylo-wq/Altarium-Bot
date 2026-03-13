@@ -11159,6 +11159,10 @@ async def auto_role_income_loop():
         channel = guild.get_channel(channel_id) if channel_id else None
         me = guild.me or guild.get_member(bot.user.id)
 
+        if me is None:
+            print(f"[AUTO_LOOP] Пропуск guild={guild.id}: не удалось получить бота как member")
+            continue
+
         if not channel or not channel.permissions_for(me).send_messages:
             channel = next(
                 (c for c in guild.text_channels if c.permissions_for(me).send_messages),
@@ -11175,14 +11179,24 @@ async def auto_role_income_loop():
             roles_earned = []
 
             for rid, data in role_income.get("roles", {}).items():
-                role = guild.get_role(int(rid))
+                try:
+                    role = guild.get_role(int(rid))
+                except (TypeError, ValueError):
+                    print(f"[AUTO_LOOP] Некорректный role_id в role_income: rid={rid!r}")
+                    continue
                 if not role or role not in member.roles or not data.get("auto", True):
                     continue
 
                 last_map = role_income.setdefault("last_claim", {}).setdefault(
                     user_id, {}
                 )
-                cooldown = max(1, int(data.get("cooldown", 1)))
+                try:
+                    cooldown = max(1, int(data.get("cooldown", 1)))
+                except (TypeError, ValueError):
+                    print(
+                        f"[AUTO_LOOP] Некорректный cooldown в role_income: rid={rid} value={data.get('cooldown')!r}"
+                    )
+                    continue
                 if rid not in last_map:
                     # Первое автоначисление: не ждём полный кулдаун
                     last_map[rid] = now - cooldown
@@ -11215,6 +11229,12 @@ async def auto_role_income_loop():
                         description=desc,
                         color=0x00FF00,
                     )
+                )
+                await log_economy_change(
+                    guild,
+                    member.id,
+                    "Автоколлект (роли)",
+                    cash_delta=total_earned,
                 )
 
         # Пассивные доходы/расходы от куратора
@@ -11555,6 +11575,11 @@ async def auto_role_income_loop():
             save_json(POPULATION_FILE, pop)
             save_player_state()
             save_json(BALANCES_FILE, balances)
+
+
+@auto_role_income_loop.error
+async def auto_role_income_loop_error(exc):
+    print(f"[AUTO_LOOP] Критическая ошибка цикла автоколлекта: {exc}")
 
 
 # ================== ITEMS / SHOP ==================
