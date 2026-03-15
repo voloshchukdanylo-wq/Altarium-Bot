@@ -14928,3 +14928,4 @@ async def statistics(ctx):
 if __name__ == "__main__":
     keep_alive()
     bot.run(os.getenv("TOKEN"))
+    bot.run(os.getenv("TOKEN"))
