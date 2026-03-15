@@ -1157,6 +1157,29 @@ def resolve_item_key(query: str):
     return contains
 
 
+def resolve_member_query(guild: discord.Guild, raw: str) -> discord.Member | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    mention_match = re.fullmatch(r"<@!?(\d+)>", text)
+    if mention_match:
+        text = mention_match.group(1)
+
+    if text.isdigit():
+        return guild.get_member(int(text))
+
+    lowered = text.lower()
+    for member in guild.members:
+        if member.name.lower() == lowered:
+            return member
+        if member.display_name.lower() == lowered:
+            return member
+        if str(member).lower() == lowered:
+            return member
+    return None
+
+
 class CommandDenied(commands.CheckFailure):
     """Raised when custom deny rule blocks command usage."""
 
@@ -2402,6 +2425,24 @@ async def меню(ctx):
                     emoji="🏢",
                     description="Управление компаниями",
                 ),
+                SelectOption(
+                    label="Передать деньги игроку",
+                    value="transfer_money",
+                    emoji="💸",
+                    description="Перевод игроку по @юзу или ID",
+                ),
+                SelectOption(
+                    label="Назначить тайные переговоры",
+                    value="secret_ticket",
+                    emoji="🎫",
+                    description="Создать приватный тикет с игроком",
+                ),
+                SelectOption(
+                    label="Продать игроку предмет",
+                    value="sell_item",
+                    emoji="💼",
+                    description="Предложение в ЛС с кнопками принять/отклонить",
+                ),
             ]
             super().__init__(
                 placeholder="Выберите действие...",
@@ -2423,6 +2464,15 @@ async def меню(ctx):
                 await show_companies_menu(ctx, interaction.user, viewer_id=interaction.user.id)
                 if not interaction.response.is_done():
                     await interaction.response.defer(ephemeral=True)
+                return
+            if selected == "transfer_money":
+                await interaction.response.send_modal(TransferMoneyModal())
+                return
+            if selected == "secret_ticket":
+                await interaction.response.send_modal(SecretTalkModal())
+                return
+            if selected == "sell_item":
+                await interaction.response.send_modal(SellItemModal())
                 return
 
             await interaction.response.defer(ephemeral=True)
@@ -2453,6 +2503,114 @@ async def меню(ctx):
                 )
                 return False
             return True
+
+    class TransferMoneyModal(Modal, title="Передать деньги игроку"):
+        target = TextInput(label="Игрок (@юз или ID)", placeholder="@Игрок или 123456789")
+        amount = TextInput(label="Сумма", placeholder="5000 или 25%")
+
+        async def on_submit(self, interaction: Interaction):
+            member = resolve_member_query(ctx.guild, self.target.value)
+            if not member:
+                await interaction.response.send_message(
+                    "❌ Игрок не найден. Укажите @упоминание, ID или точный ник.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                f"✅ Отправляю перевод для {member.mention}.", ephemeral=True
+            )
+            await передать(ctx, member, self.amount.value)
+
+    class SecretTalkModal(Modal, title="Назначить тайные переговоры"):
+        ticket_name = TextInput(
+            label="Название тикета",
+            placeholder="Например: Переговоры по союзу",
+            max_length=80,
+        )
+        target = TextInput(label="С кем провести переговоры (@юз или ID)")
+
+        async def on_submit(self, interaction: Interaction):
+            member = resolve_member_query(ctx.guild, self.target.value)
+            if not member:
+                await interaction.response.send_message(
+                    "❌ Игрок не найден. Укажите @упоминание, ID или точный ник.",
+                    ephemeral=True,
+                )
+                return
+            if member.id == interaction.user.id:
+                await interaction.response.send_message(
+                    "❌ Нельзя создать переговоры с самим собой.", ephemeral=True
+                )
+                return
+
+            overwrites = {
+                ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.user: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                ),
+                member: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                ),
+                ctx.guild.me: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                ),
+            }
+            ticket_slug = re.sub(r"[^a-zа-я0-9-]+", "-", self.ticket_name.value.lower()).strip("-")
+            if not ticket_slug:
+                ticket_slug = "переговоры"
+            channel_name = f"{ticket_slug}-{interaction.user.display_name}-{member.display_name}".lower().replace(" ", "-")[:90]
+            category = ctx.channel.category if isinstance(ctx.channel, discord.TextChannel) else None
+            ticket_channel = await ctx.guild.create_text_channel(
+                channel_name,
+                overwrites=overwrites,
+                category=category,
+                reason=f"Тайные переговоры: {interaction.user} и {member}",
+            )
+            await ticket_channel.send(
+                embed=Embed(
+                    title="🤝 Тайные переговоры",
+                    description=(
+                        f"{interaction.user.mention} и {member.mention}, это приватный канал для переговоров."
+                    ),
+                    color=0x5865F2,
+                )
+            )
+            await interaction.response.send_message(
+                f"✅ Переговоры назначены: {ticket_channel.mention}", ephemeral=True
+            )
+
+    class SellItemModal(Modal, title="Продать игроку предмет"):
+        target = TextInput(label="Покупатель (@юз или ID)")
+        item_name = TextInput(label="Название предмета (можно частично)")
+        qty = TextInput(label="Количество", placeholder="1")
+        price = TextInput(label="Предложенная цена", placeholder="15000 или 10%")
+
+        async def on_submit(self, interaction: Interaction):
+            member = resolve_member_query(ctx.guild, self.target.value)
+            if not member:
+                await interaction.response.send_message(
+                    "❌ Игрок не найден. Укажите @упоминание, ID или точный ник.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                qty_value = int(self.qty.value.strip())
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Количество должно быть целым числом.", ephemeral=True
+                )
+                return
+            if qty_value <= 0:
+                await interaction.response.send_message(
+                    "❌ Количество должно быть больше нуля.", ephemeral=True
+                )
+                return
+
+            await interaction.response.send_message(
+                f"✅ Отправляю предложение продажи для {member.mention}.",
+                ephemeral=True,
+            )
+            await продать(ctx, member, qty_value, self.item_name.value, self.price.value)
 
     await ctx.send(
         embed=Embed(
@@ -11133,7 +11291,6 @@ async def продать(
             )
             self.stop()
 
-    await ctx.send(f"{member.mention}")
     offer = Embed(title="💼 Предложение сделки", color=0x3498DB)
     offer.description = (
         f"{ctx.author.mention} предлагает продать вам предмет.\n\n"
@@ -11142,7 +11299,28 @@ async def продать(
         f"**Цена:** {fmt_money(price_value)}"
     )
     offer.set_footer(text="Нажмите кнопку ниже: принять или отклонить.")
-    await ctx.send(embed=offer, view=TradeOfferView())
+    try:
+        await member.send(embed=offer, view=TradeOfferView())
+    except discord.Forbidden:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Невозможно отправить предложение",
+                description=(
+                    f"Не удалось отправить ЛС пользователю {member.mention}. "
+                    "Попросите открыть личные сообщения и повторите попытку."
+                ),
+                color=0xFF0000,
+            )
+        )
+        return
+
+    await ctx.send(
+        embed=Embed(
+            title="📨 Предложение отправлено",
+            description=f"Предложение продажи отправлено в ЛС пользователю {member.mention}.",
+            color=0x00FF00,
+        )
+    )
 
 
 @tasks.loop(seconds=60)
