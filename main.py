@@ -220,6 +220,8 @@ companies_data = load_json(
         "next_request_id": 1,
         "requests_channel": None,
         "result_channel": None,
+        "create_role_id": None,
+        "advert_attacks": {},
     },
 )
 events_data = load_json(
@@ -302,6 +304,8 @@ companies_data.setdefault("next_company_id", 1)
 companies_data.setdefault("next_request_id", 1)
 companies_data.setdefault("requests_channel", None)
 companies_data.setdefault("result_channel", None)
+companies_data.setdefault("create_role_id", None)
+companies_data.setdefault("advert_attacks", {})
 seasons_data.setdefault("seasons", {})
 seasons_data.setdefault("active_season", None)
 seasons_data.setdefault("spheres", {})
@@ -576,6 +580,7 @@ def ensure_player_state(user_id: str):
             "last_mobilization_cost_tick": int(time.time()),
             "posts_count": 0,
             "reputation": 0,
+            "science": 0,
             "pre_reg_role_ids": [],
             "work_last_at": 0,
         },
@@ -590,6 +595,7 @@ def ensure_player_state(user_id: str):
     state.setdefault("last_mobilization_cost_tick", int(time.time()))
     state.setdefault("posts_count", 0)
     state.setdefault("reputation", 0)
+    state.setdefault("science", 0)
     state.setdefault("work_last_at", 0)
     state.setdefault("pre_reg_role_ids", [])
     return state
@@ -707,6 +713,9 @@ def update_company_derived_fields(company: dict):
     company.setdefault("min_value", first_invest)
     company.setdefault("last_income_at", int(time.time()))
     company.setdefault("last_expense_at", int(time.time()))
+    company.setdefault("autobuy", [])
+    company.setdefault("active_ad_attack_until", 0)
+    company.setdefault("active_ad_attack_target", None)
 
 
 def company_estimated_price(company: dict) -> int:
@@ -722,6 +731,42 @@ def company_year_amount(amount_raw: str, cooldown_secs: int, fallback_base: int 
     except Exception:
         amount = 0
     return int((max(0, int(amount)) * 31_536_000) / cooldown)
+
+
+COMPANY_SPECIALIZATIONS = {
+    "1": "Добыча",
+    "2": "Производство",
+    "3": "Наука",
+    "4": "Исследования",
+    "5": "Торговля",
+    "6": "Логистика",
+    "7": "Строительство",
+}
+
+
+def resolve_company_specialization(raw_value: str) -> str:
+    token = str(raw_value or "").strip()
+    if token in COMPANY_SPECIALIZATIONS:
+        return COMPANY_SPECIALIZATIONS[token]
+    lowered = token.casefold()
+    for value in COMPANY_SPECIALIZATIONS.values():
+        if lowered == value.casefold():
+            return value
+    raise ValueError("invalid_specialization")
+
+
+def get_company_competitors(company: dict):
+    spec = str(company.get("specialization") or "").strip().casefold()
+    cid = str(company.get("id"))
+    if not spec or not cid:
+        return []
+    result = []
+    for other in companies_data.setdefault("companies", {}).values():
+        if str(other.get("id")) == cid:
+            continue
+        if str(other.get("specialization") or "").strip().casefold() == spec:
+            result.append(other)
+    return result
 
 
 def build_company_embed(company: dict, idx: int, total: int):
@@ -744,6 +789,17 @@ def build_company_embed(company: dict, idx: int, total: int):
     em.add_field(name="Доходы (за цикл)", value=f"{company.get('income_amount', '0')} / {format_interval(income_cd)}", inline=True)
     em.add_field(name="Оценка цены компании", value=f"{est_price:,}", inline=False)
     em.add_field(name="Владелец", value=f"<@{company.get('owner_id')}>", inline=False)
+    competitors = get_company_competitors(company)
+    if competitors:
+        comp_lines = [
+            f"• **{c.get('name', 'Без названия')}** — <@{c.get('owner_id')}>"
+            for c in competitors[:10]
+        ]
+        if len(competitors) > 10:
+            comp_lines.append(f"… и ещё {len(competitors)-10}")
+        em.add_field(name="⚔️ Конкуренты", value="\n".join(comp_lines), inline=False)
+    else:
+        em.add_field(name="⚔️ Конкуренты", value="Нет", inline=False)
     return em
 
 
@@ -1194,6 +1250,7 @@ SYSTEM_COMMAND_GROUPS = {
     "компании": {
         "компании",
         "редакткомпанию",
+        "компаниироль",
         "заявкикомпаний",
         "итогикомпанийканал",
     },
@@ -5412,8 +5469,9 @@ class NegotiationRoomView(View):
             return
 
         await interaction.response.send_message(
-            "✅ Переговоры завершены. Канал удаляется...", ephemeral=True
+            "✅ Переговоры завершены. Канал будет удалён через 5 секунд.", ephemeral=True
         )
+        await asyncio.sleep(5)
         try:
             await interaction.channel.delete(
                 reason=f"Переговоры завершены организатором {interaction.user}"
@@ -6009,6 +6067,49 @@ class VerdictHappinessModal(Modal):
         )
 
 
+class VerdictScienceModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = verdicts_data.get("requests", {}).get(self.req_id, {})
+        uid = str(req.get("author_id", ""))
+        current = int(ensure_player_state(uid).get("science", 0)) if uid else 0
+        super().__init__(title="Изменить науку", timeout=300)
+        self.value = TextInput(label="Новый уровень науки", required=True, default=str(current))
+        self.reason = TextInput(label="Комментарий", required=False, default="по вердикту")
+        self.add_item(self.value)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        uid = str(req.get("author_id"))
+        member = interaction.guild.get_member(int(uid)) if interaction.guild and str(uid).isdigit() else None
+        mention = member.mention if member else f"<@{uid}>"
+        try:
+            val = int(float(str(self.value.value).replace(",", ".")))
+        except Exception:
+            await interaction.response.send_message("❌ Наука должна быть числом.", ephemeral=True)
+            return
+        val = max(0, val)
+        req.setdefault("draft", {}).setdefault("ops", []).append(
+            {
+                "kind": "science",
+                "member_id": uid,
+                "value": val,
+                "label": f"Наука {mention} -> {val}",
+            }
+        )
+        save_verdicts_data()
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(
+            embed=pages[0],
+            view=VerdictPagesView(pages, interaction.user.id),
+            ephemeral=True,
+        )
+
+
 class VerdictPassiveModal(Modal):
     def __init__(self, req_id: str, flow_type: str):
         self.req_id = str(req_id)
@@ -6164,6 +6265,7 @@ class VerdictReviewSelect(Select):
             SelectOption(label="Начислить деньги", value="money_add", emoji="💰"),
             SelectOption(label="Изменить репутацию", value="rep", emoji="⭐"),
             SelectOption(label="Изменить уровень счастья", value="happy", emoji="🙂"),
+            SelectOption(label="Изменить науку", value="science", emoji="🔬"),
             SelectOption(label="Предпросмотр", value="preview", emoji="👀"),
             SelectOption(label="Отправить итог", value="finalize", emoji="✅"),
         ]
@@ -6214,6 +6316,8 @@ class VerdictReviewSelect(Select):
                     ensure_player_state(uid)["happiness"] = max(
                         0, min(100, int(op.get("value", 50)))
                     )
+                elif kind == "science":
+                    ensure_player_state(uid)["science"] = max(0, int(op.get("value", 0)))
                 elif kind == "passive":
                     get_passive_entries(uid).append(
                         {
@@ -6275,6 +6379,9 @@ class VerdictReviewSelect(Select):
             return
         if choice == "happy":
             await interaction.response.send_modal(VerdictHappinessModal(self.req_id))
+            return
+        if choice == "science":
+            await interaction.response.send_modal(VerdictScienceModal(self.req_id))
             return
         if choice == "passive_income":
             await interaction.response.send_modal(
@@ -7207,7 +7314,7 @@ class CompanyCreateModal(Modal):
         super().__init__(title="Создание компании", timeout=600)
         self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
         self.company_name = TextInput(label="Название компании", required=True, max_length=120)
-        self.specialization = TextInput(label="Специализация", required=True, max_length=200)
+        self.specialization = TextInput(label="Специализация (номер)", required=True, max_length=20)
         self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100)
         self.add_item(self.post_url)
         self.add_item(self.company_name)
@@ -7216,8 +7323,29 @@ class CompanyCreateModal(Modal):
 
     async def on_submit(self, interaction: Interaction):
         author_id = str(interaction.user.id)
+        required_role_id = companies_data.get("create_role_id")
+        if required_role_id:
+            role = interaction.guild.get_role(int(required_role_id)) if interaction.guild and str(required_role_id).isdigit() else None
+            if not role or role not in getattr(interaction.user, "roles", []):
+                role_text = role.mention if role else f"`{required_role_id}`"
+                await interaction.response.send_message(
+                    f"❌ Для создания компании нужна роль {role_text}.",
+                    ephemeral=True,
+                )
+                return
+
         if not is_registered_player(author_id):
             await interaction.response.send_message("❌ Компании доступны только зарегистрированным игрокам (`!рег`).", ephemeral=True)
+            return
+
+        try:
+            specialization_name = resolve_company_specialization(str(self.specialization.value))
+        except Exception:
+            available = "\n".join(f"{num}. {name}" for num, name in COMPANY_SPECIALIZATIONS.items())
+            await interaction.response.send_message(
+                f"❌ Неверная специализация. Укажите номер из списка:\n{available}",
+                ephemeral=True,
+            )
             return
 
         user = ensure_user(author_id)
@@ -7263,7 +7391,7 @@ class CompanyCreateModal(Modal):
             "payload": {
                 "Ссылка на пост": str(self.post_url.value).strip(),
                 "Название": str(self.company_name.value).strip(),
-                "Специализация": str(self.specialization.value).strip(),
+                "Специализация": specialization_name,
                 "Первый вклад": raw_first_invest,
             },
             "first_invest_charged": int(first_invest),
@@ -7516,6 +7644,53 @@ class CompanyUpgradeModal(Modal):
         await interaction.response.send_message("✅ Заявка на улучшение отправлена.", ephemeral=True)
 
 
+class CompanyAdvertAttackModal(Modal):
+    def __init__(self):
+        super().__init__(title="Рекламная атака", timeout=600)
+        self.my_company = TextInput(label="Ваша компания", required=True, max_length=120)
+        self.target_company = TextInput(label="Компания-цель", required=True, max_length=120)
+        self.duration = TextInput(label="Длительность (например 2ч)", required=True, max_length=100, default="2ч")
+        self.add_item(self.my_company)
+        self.add_item(self.target_company)
+        self.add_item(self.duration)
+
+    async def on_submit(self, interaction: Interaction):
+        owner_id = str(interaction.user.id)
+        mine = find_companies_by_name(str(self.my_company.value), owner_id=owner_id)
+        if not mine:
+            await interaction.response.send_message("❌ Ваша компания не найдена.", ephemeral=True)
+            return
+        target = find_companies_by_name(str(self.target_company.value), owner_id=None)
+        if not target:
+            await interaction.response.send_message("❌ Компания-цель не найдена.", ephemeral=True)
+            return
+        attacker = mine[0]
+        victim = target[0]
+        if str(victim.get("owner_id")) == owner_id:
+            await interaction.response.send_message("❌ Нельзя атаковать собственную компанию.", ephemeral=True)
+            return
+        if str(attacker.get("specialization", "")).casefold() != str(victim.get("specialization", "")).casefold():
+            await interaction.response.send_message("❌ Рекламная атака доступна только по конкурентам из той же специализации.", ephemeral=True)
+            return
+        if int(attacker.get("advert_level", 1)) <= int(victim.get("advert_level", 1)):
+            await interaction.response.send_message("❌ Для атаки уровень рекламы должен быть выше, чем у цели.", ephemeral=True)
+            return
+        try:
+            duration = max(60, parse_interval(str(self.duration.value).strip()))
+        except Exception:
+            await interaction.response.send_message("❌ Неверный формат длительности.", ephemeral=True)
+            return
+
+        now_ts = int(time.time())
+        attacker["active_ad_attack_until"] = now_ts + duration
+        attacker["active_ad_attack_target"] = str(victim.get("id"))
+        save_companies_data()
+        await interaction.response.send_message(
+            f"✅ Атака активирована: **{attacker.get('name')}** → **{victim.get('name')}** на {format_interval(duration)}.",
+            ephemeral=True,
+        )
+
+
 class CompanyOwnerRejectModal(Modal):
     def __init__(self, req_id: str):
         self.req_id = str(req_id)
@@ -7711,6 +7886,40 @@ class CompanyValueChangeModal(Modal):
         _append_company_review_change(req, "min_value", str(self.value.value).strip(), "Оценка цены", interaction.user)
         save_companies_data()
         await interaction.response.send_message("✅ Оценка компании сохранена.", ephemeral=True)
+
+
+class CompanyCreatePayloadEditModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = companies_data.get("requests", {}).get(self.req_id, {})
+        payload = req.get("payload", {}) if req else {}
+        super().__init__(title="Редактирование заявки создания", timeout=600)
+        self.company_name = TextInput(label="Название компании", required=True, max_length=120, default=str(payload.get("Название", ""))[:120])
+        self.specialization = TextInput(label="Специализация (номер)", required=True, max_length=20)
+        self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100, default=str(payload.get("Первый вклад", ""))[:100])
+        self.add_item(self.company_name)
+        self.add_item(self.specialization)
+        self.add_item(self.first_invest)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        try:
+            specialization_name = resolve_company_specialization(str(self.specialization.value))
+        except Exception:
+            await interaction.response.send_message("❌ Неверная специализация: укажите её номер.", ephemeral=True)
+            return
+
+        payload = req.setdefault("payload", {})
+        payload["Название"] = str(self.company_name.value).strip()
+        payload["Специализация"] = specialization_name
+        payload["Первый вклад"] = str(self.first_invest.value).strip()
+        req["status_text"] = f"📝 Данные создания отредактированы: {interaction.user.display_name}"
+        req["processed_by"] = str(interaction.user.id)
+        save_companies_data()
+        await interaction.response.send_message("✅ Параметры заявки на создание обновлены.", ephemeral=True)
 
 
 class CompanyRejectModal(Modal):
@@ -7996,6 +8205,7 @@ class CompanyReviewActionSelect(Select):
     def __init__(self, req_id: str):
         self.req_id = str(req_id)
         options = [
+            SelectOption(label="Изменить данные создания", value="create_edit", emoji="🧾"),
             SelectOption(label="Сменить доход (и КД)", value="income", emoji="📈"),
             SelectOption(label="Сменить траты (и КД)", value="expense", emoji="📉"),
             SelectOption(label="Сменить уровень рекламы", value="advert", emoji="📣"),
@@ -8033,6 +8243,13 @@ class CompanyReviewActionSelect(Select):
             )
             return
 
+        if choice == "create_edit":
+            if str(req.get("type")) != "create":
+                await interaction.response.send_message("❌ Это действие доступно только для заявок на создание.", ephemeral=True)
+                return
+            await interaction.response.send_modal(CompanyCreatePayloadEditModal(view.req_id))
+            return
+
         if choice == "income":
             await interaction.response.send_modal(CompanyIncomeChangeModal(view.req_id))
             return
@@ -8053,6 +8270,22 @@ class CompanyReviewActionSelect(Select):
             return
 
 
+class CompanyCreateInfoView(View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Это меню не для вас.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Открыть форму создания", style=ButtonStyle.primary)
+    async def open_modal(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(CompanyCreateModal())
+
+
 class CompanyActionsSelect(Select):
     def __init__(self):
         options = [
@@ -8060,13 +8293,23 @@ class CompanyActionsSelect(Select):
             SelectOption(label="Купить компанию", value="buy", emoji="🛒"),
             SelectOption(label="Продать компанию", value="sell", emoji="💼"),
             SelectOption(label="Улучшить компанию", value="upgrade", emoji="🛠"),
+            SelectOption(label="Рекламная атака", value="attack", emoji="📢"),
         ]
         super().__init__(placeholder="Действия с компаниями", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: Interaction):
         v = self.values[0]
         if v == "create":
-            await interaction.response.send_modal(CompanyCreateModal())
+            available = "\n".join(f"`{num}` — {name}" for num, name in COMPANY_SPECIALIZATIONS.items())
+            await interaction.response.send_message(
+                embed=Embed(
+                    title="📚 Специализации компаний",
+                    description=f"Перед созданием выберите номер специализации:\n\n{available}",
+                    color=0x3498DB,
+                ),
+                view=CompanyCreateInfoView(interaction.user.id),
+                ephemeral=True,
+            )
             return
 
         if v == "buy":
@@ -8082,6 +8325,8 @@ class CompanyActionsSelect(Select):
             await interaction.response.send_modal(CompanySellModal())
         elif v == "upgrade":
             await interaction.response.send_modal(CompanyUpgradeModal())
+        elif v == "attack":
+            await interaction.response.send_modal(CompanyAdvertAttackModal())
 
 
 class CompaniesMenuView(View):
@@ -8231,6 +8476,39 @@ class CompanyDirectValueModal(Modal):
         await interaction.response.send_message("✅ Оценка компании обновлена.", ephemeral=True)
 
 
+class CompanyAutoBuyModal(Modal):
+    def __init__(self, company_id: str):
+        self.company_id = str(company_id)
+        super().__init__(title="Автопокупка предмета", timeout=600)
+        self.item_key = TextInput(label="Название предмета", required=True, max_length=120)
+        self.quantity = TextInput(label="Количество за цикл", required=True, max_length=20, default="1")
+        self.cooldown = TextInput(label="Кулдаун (например 30м, 4ч)", required=True, max_length=100, default="24ч")
+        self.add_item(self.item_key)
+        self.add_item(self.quantity)
+        self.add_item(self.cooldown)
+
+    async def on_submit(self, interaction: Interaction):
+        company = companies_data.get("companies", {}).get(self.company_id)
+        if not company:
+            await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+            return
+        matches = resolve_item_key(str(self.item_key.value))
+        if not matches:
+            await interaction.response.send_message("❌ Предмет не найден.", ephemeral=True)
+            return
+        item_key = matches[0]
+        try:
+            qty = max(1, int(str(self.quantity.value).strip()))
+            cd = max(60, parse_interval(str(self.cooldown.value).strip()))
+        except Exception:
+            await interaction.response.send_message("❌ Неверный формат количества или кулдауна.", ephemeral=True)
+            return
+        autobuy = company.setdefault("autobuy", [])
+        autobuy.append({"item_key": item_key, "quantity": qty, "cooldown": cd, "last_at": 0})
+        save_companies_data()
+        await interaction.response.send_message("✅ Правило автопокупки добавлено.", ephemeral=True)
+
+
 class CompanyDirectEditSelect(Select):
     def __init__(self, company_id: str):
         self.company_id = str(company_id)
@@ -8239,6 +8517,7 @@ class CompanyDirectEditSelect(Select):
             SelectOption(label="Сменить траты (и КД)", value="expense", emoji="📉"),
             SelectOption(label="Сменить уровень рекламы", value="advert", emoji="📣"),
             SelectOption(label="Сменить оценку цены", value="value", emoji="💎"),
+            SelectOption(label="Настроить автопокупку", value="autobuy", emoji="🛍️"),
         ]
         super().__init__(placeholder="Выберите параметр компании", min_values=1, max_values=1, options=options)
 
@@ -8255,6 +8534,9 @@ class CompanyDirectEditSelect(Select):
             return
         if choice == "value":
             await interaction.response.send_modal(CompanyDirectValueModal(self.company_id))
+            return
+        if choice == "autobuy":
+            await interaction.response.send_modal(CompanyAutoBuyModal(self.company_id))
             return
 
 
@@ -8339,6 +8621,20 @@ async def заявкикомпаний(ctx, channel: discord.TextChannel):
     companies_data["requests_channel"] = channel.id
     save_companies_data()
     await ctx.send(embed=Embed(title="✅ Канал заявок компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
+
+
+@bot.command(name="компаниироль")
+@commands.has_permissions(administrator=True)
+async def компаниироль(ctx, role: discord.Role):
+    companies_data["create_role_id"] = role.id
+    save_companies_data()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Роль для создания компаний установлена",
+            description=f"Теперь создавать компании могут только участники с ролью {role.mention}.",
+            color=0x00FF00,
+        )
+    )
 
 
 @bot.command(name="итогикомпанийканал")
@@ -11265,6 +11561,19 @@ async def продать(
             )
             done.add_field(name="Цена", value=fmt_money(price_value), inline=False)
             await interaction.response.edit_message(embed=done, view=None)
+            seller_notice = Embed(
+                title="✅ Ваш предмет продан",
+                description=(
+                    f"Покупатель: {member.mention}\n"
+                    f"Предмет: **{selected_key} × {количество}**\n"
+                    f"Сумма: **{fmt_money(price_value)}**"
+                ),
+                color=0x00FF00,
+            )
+            try:
+                await ctx.author.send(content=ctx.author.mention, embed=seller_notice)
+            except Exception:
+                pass
             await log_economy_change(
                 ctx.guild,
                 member.id,
@@ -11281,6 +11590,18 @@ async def продать(
 
         @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger)
         async def decline(self, interaction: Interaction, button: Button):
+            seller_notice = Embed(
+                title="❌ Продажа не состоялась",
+                description=(
+                    f"Покупатель {member.mention} отклонил предложение по предмету "
+                    f"**{selected_key} × {количество}**."
+                ),
+                color=0xFF0000,
+            )
+            try:
+                await ctx.author.send(content=ctx.author.mention, embed=seller_notice)
+            except Exception:
+                pass
             await interaction.response.edit_message(
                 embed=Embed(
                     title="❌ Сделка отклонена",
@@ -11579,8 +11900,28 @@ async def auto_role_income_loop():
                     except Exception:
                         inc = 0
                     if inc:
-                        user["наличка"] = int(user.get("наличка", 0)) + int(inc)
-                        total_income += int(inc)
+                        owner_gain = int(inc)
+                        victim_company_id = str(company.get("id") or "")
+                        active_attackers = []
+                        for attacker in companies_data.setdefault("companies", {}).values():
+                            if str(attacker.get("owner_id") or "") == owner_id:
+                                continue
+                            if str(attacker.get("active_ad_attack_target") or "") != victim_company_id:
+                                continue
+                            if now_comp > int(attacker.get("active_ad_attack_until", 0) or 0):
+                                continue
+                            if int(attacker.get("advert_level", 1)) <= int(company.get("advert_level", 1)):
+                                continue
+                            active_attackers.append(attacker)
+                        if active_attackers:
+                            attacker = max(active_attackers, key=lambda c: int(c.get("advert_level", 1)))
+                            stolen = max(1, int(owner_gain * 0.15))
+                            owner_gain -= stolen
+                            attacker_owner_id = str(attacker.get("owner_id") or "")
+                            if attacker_owner_id:
+                                ensure_user(attacker_owner_id)["наличка"] = int(ensure_user(attacker_owner_id).get("наличка", 0)) + stolen
+                        user["наличка"] = int(user.get("наличка", 0)) + owner_gain
+                        total_income += owner_gain
                         balances_changed_comp = True
                 company["last_income_at"] = last_income + cycles * income_cd
                 comp_changed = True
@@ -11617,10 +11958,52 @@ async def auto_role_income_loop():
                         cash_delta=-total_expense,
                     )
 
+            autobuy_rules = company.get("autobuy", []) if isinstance(company.get("autobuy"), list) else []
+            for rule in autobuy_rules:
+                try:
+                    item_key = str(rule.get("item_key") or "")
+                    qty = max(1, int(rule.get("quantity", 1)))
+                    cooldown = max(60, int(rule.get("cooldown", 86400)))
+                    last_at = int(rule.get("last_at", 0) or 0)
+                except Exception:
+                    continue
+                if now_comp - last_at < cooldown:
+                    continue
+                item = items_data.get("items", {}).get(item_key)
+                if not item or not bool(item.get("can_buy", True)):
+                    rule["last_at"] = now_comp
+                    comp_changed = True
+                    continue
+                if item.get("stock", 0) != -1 and int(item.get("stock", 0)) < qty:
+                    rule["last_at"] = now_comp
+                    comp_changed = True
+                    continue
+                total_price = int(item.get("price", 0)) * qty
+                if int(user.get("наличка", 0)) < total_price:
+                    rule["last_at"] = now_comp
+                    comp_changed = True
+                    continue
+                user["наличка"] = int(user.get("наличка", 0)) - total_price
+                balances_changed_comp = True
+                inventory.setdefault(owner_id, {})
+                inventory[owner_id][item_key] = int(inventory[owner_id].get(item_key, 0)) + qty
+                if item.get("stock", 0) != -1:
+                    item["stock"] = int(item.get("stock", 0)) - qty
+                rule["last_at"] = now_comp
+                comp_changed = True
+                await log_economy_change(
+                    guild,
+                    owner_id,
+                    f"Автопокупка компании «{company.get('name', 'Без названия')}»: {item_key} x{qty}",
+                    cash_delta=-total_price,
+                )
+
         if comp_changed:
             save_companies_data()
         if balances_changed_comp:
             save_json(BALANCES_FILE, balances)
+            save_inventory()
+            save_items()
 
 
         status_until = settings.get("status_until")
@@ -14456,6 +14839,7 @@ async def профиль(ctx, member: discord.Member = None):
     happiness = int(state.get("happiness", 50))
     soldiers = int(state.get("soldiers", 0))
     reputation = int(state.get("reputation", 0))
+    science = int(state.get("science", 0))
     news_count = int(state.get("news_published", 0))
     coins_value = int(user.get("коины", 0))
 
@@ -14483,6 +14867,7 @@ async def профиль(ctx, member: discord.Member = None):
     embed.add_field(name="🙂 Счастье", value=f"{happiness}%", inline=True)
     embed.add_field(name="🪖 Войска", value=str(soldiers), inline=True)
     embed.add_field(name="⭐ Репутация", value=str(reputation), inline=True)
+    embed.add_field(name="🔬 Наука", value=str(science), inline=True)
 
     class PlayerEconomyView(View):
         def __init__(self, target_member: discord.Member):
