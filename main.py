@@ -14941,30 +14941,19 @@ async def профиль(ctx, member: discord.Member = None):
         color=0x3498DB,
         description=">>> **Профиль игрока**\n• Аккуратная сводка по ключевым параметрам ниже.",
     )
-    embed.add_field(
-        name="💰 Общий баланс",
-        value=fmt_money(user["наличка"] + user["банк"]),
-        inline=False,
-    )
-    embed.add_field(
-        name="🪙 Серверная валюта",
-        value=f"{fmt_num(coins_value)} {settings.get('coin_currency', 'Alta-коин')}",
-        inline=False,
-    )
-    embed.add_field(name="📝 Описание", value=admin_description or "—", inline=False)
-    embed.add_field(name="🏘 Население", value=fmt_num(population_value), inline=False)
-    embed.add_field(
-        name="📰 Опубликовано новостей", value=str(news_count), inline=False
-    )
-    embed.add_field(
-        name="🛡️ Щит",
-        value=(format_seconds_left(shield_left) if shield_left > 0 else "нет"),
-        inline=False,
-    )
-    embed.add_field(name="🙂 Счастье", value=f"{happiness}%", inline=False)
-    embed.add_field(name="🪖 Войска", value=fmt_num(soldiers), inline=False)
-    embed.add_field(name="⭐ Репутация", value=fmt_num(reputation), inline=False)
-    embed.add_field(name="🔬 Наука", value=fmt_num(science), inline=False)
+    profile_lines = [
+        f"**💰 Общий баланс:** {fmt_money(user['наличка'] + user['банк'])}",
+        f"**🪙 Серверная валюта:** {fmt_num(coins_value)} {settings.get('coin_currency', 'Alta-коин')}",
+        f"**📝 Описание:** {admin_description or '—'}",
+        f"**🏘 Население:** {fmt_num(population_value)}",
+        f"**📰 Опубликовано новостей:** {news_count}",
+        f"**🛡️ Щит:** {format_seconds_left(shield_left) if shield_left > 0 else 'нет'}",
+        f"**🙂 Счастье:** {happiness}%",
+        f"**🪖 Войска:** {fmt_num(soldiers)}",
+        f"**⭐ Репутация:** {fmt_num(reputation)}",
+        f"**🔬 Наука:** {fmt_num(science)}",
+    ]
+    embed.add_field(name="📌 Показатели", value="\n".join(profile_lines), inline=False)
 
     class PlayerEconomyView(View):
         def __init__(self, target_member: discord.Member):
