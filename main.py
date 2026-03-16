@@ -12231,13 +12231,13 @@ async def auto_role_income_loop():
                     comp_changed = True
                     continue
                 if item.get("stock", 0) != -1 and int(item.get("stock", 0)) < qty:
-                    rule["last_at"] = now_comp
-                    comp_changed = True
+                    # Если товара не хватает, не переводим правило в КД:
+                    # автопокупка попробует снова на следующем тике.
                     continue
                 total_price = int(item.get("price", 0)) * qty
                 if int(user.get("наличка", 0)) < total_price:
-                    rule["last_at"] = now_comp
-                    comp_changed = True
+                    # Недостаточно налички — просто пропускаем без сдвига last_at,
+                    # чтобы автопокупка возобновилась сразу после пополнения баланса.
                     continue
                 user["наличка"] = int(user.get("наличка", 0)) - total_price
                 balances_changed_comp = True
