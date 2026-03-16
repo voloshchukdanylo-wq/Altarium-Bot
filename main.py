@@ -716,6 +716,8 @@ def update_company_derived_fields(company: dict):
     company.setdefault("autobuy", [])
     company.setdefault("active_ad_attack_until", 0)
     company.setdefault("active_ad_attack_target", None)
+    company.setdefault("active_ad_attack_percent", 0)
+    company.setdefault("ad_attack_cooldown_until", 0)
 
 
 def company_estimated_price(company: dict) -> int:
@@ -778,11 +780,12 @@ def build_company_embed(company: dict, idx: int, total: int):
         title=f"🏢 Компания {idx}/{total}",
         color=0x2ECC71,
         description=(
-            f"**Название компании:** {company.get('name', '—')}\n"
-            f"**Специализация:** {company.get('specialization', '—')}\n"
-            f"**Дата основания:** {company.get('founded_year', '—')}\n"
-            f"**Уровень компании:** {company.get('level', '—')}\n"
-            f"**Уровень рекламы:** {company.get('advert_level', 1)}"
+            ">>> **Карточка компании**\n"
+            f"• **Название:** {company.get('name', '—')}\n"
+            f"  ↳ **Специализация:** {company.get('specialization', '—')}\n"
+            f"  ↳ **Дата основания:** {company.get('founded_year', '—')}\n"
+            f"  ↳ **Уровень компании:** {company.get('level', '—')}\n"
+            f"  ↳ **Уровень рекламы:** {company.get('advert_level', 1)}"
         ),
     )
     em.add_field(name="Траты (за цикл)", value=f"{company.get('expense_amount', '0')} / {format_interval(expense_cd)}", inline=True)
@@ -1217,6 +1220,8 @@ def resolve_member_query(guild: discord.Guild, raw: str) -> discord.Member | Non
     text = (raw or "").strip()
     if not text:
         return None
+    if text.startswith("@") and not text.startswith("<@"):
+        text = text[1:].strip()
 
     mention_match = re.fullmatch(r"<@!?(\d+)>", text)
     if mention_match:
@@ -5433,6 +5438,8 @@ def resolve_member_query(guild: discord.Guild, query: str):
     token = (query or "").strip()
     if not token:
         return None
+    if token.startswith("@") and not token.startswith("<@"):
+        token = token[1:].strip()
 
     # mention / id
     digits = token
@@ -7308,7 +7315,11 @@ def find_companies_by_name(query: str, owner_id: str | None = None):
 
 
 def build_company_request_embed(req: dict, color=0x3498DB):
-    em = Embed(title=f"🏢 Заявка компании #{req.get('id')} ({req.get('type')})", color=color)
+    em = Embed(
+        title=f"🏢 Заявка компании #{req.get('id')} ({req.get('type')})",
+        color=color,
+        description=">>> **Сводка заявки**\n• Ниже указаны автор, статус и параметры.",
+    )
     em.add_field(name="Автор", value=f"<@{req.get('author_id')}>", inline=False)
     em.add_field(name="Статус", value=req.get("status_text", "⏳ На рассмотрении"), inline=False)
     payload = req.get("payload", {})
@@ -7688,13 +7699,53 @@ class CompanyAdvertAttackModal(Modal):
         except Exception:
             await interaction.response.send_message("❌ Неверный формат длительности.", ephemeral=True)
             return
+        duration = min(duration, 12 * 3600)
 
         now_ts = int(time.time())
+        next_attack_at = int(attacker.get("ad_attack_cooldown_until", 0) or 0)
+        if now_ts < next_attack_at:
+            await interaction.response.send_message(
+                f"❌ КД рекламной атаки ещё не прошло: {format_seconds_left(next_attack_at - now_ts)}.",
+                ephemeral=True,
+            )
+            return
+
+        attacker_level = int(attacker.get("advert_level", 1) or 1)
+        victim_level = int(victim.get("advert_level", 1) or 1)
+        level_diff = max(1, attacker_level - victim_level)
+        steal_percent = min(15, level_diff)
+
         attacker["active_ad_attack_until"] = now_ts + duration
         attacker["active_ad_attack_target"] = str(victim.get("id"))
+        attacker["active_ad_attack_percent"] = steal_percent
+        attacker["ad_attack_cooldown_until"] = now_ts + (3 * 24 * 3600)
         save_companies_data()
+
+        victim_owner_id = str(victim.get("owner_id") or "")
+        if interaction.guild and victim_owner_id.isdigit():
+            victim_member = interaction.guild.get_member(int(victim_owner_id))
+            if victim_member:
+                try:
+                    await victim_member.send(
+                        embed=Embed(
+                            title="⚠️ Атака на вашу компанию",
+                            description=(
+                                f">>> Компания **{victim.get('name', 'Без названия')}** атакована.\n"
+                                f"• Атакующий: **{attacker.get('name', 'Без названия')}**\n"
+                                f"  ↳ Кража дохода: **{steal_percent}%**\n"
+                                f"  ↳ Длительность: **{format_interval(duration)}**"
+                            ),
+                            color=0xE67E22,
+                        )
+                    )
+                except Exception:
+                    pass
+
         await interaction.response.send_message(
-            f"✅ Атака активирована: **{attacker.get('name')}** → **{victim.get('name')}** на {format_interval(duration)}.",
+            (
+                f"✅ Атака активирована: **{attacker.get('name')}** → **{victim.get('name')}** на {format_interval(duration)}.\n"
+                f"Кража дохода: **{steal_percent}%** (максимум 15%). КД следующей атаки: **3д**."
+            ),
             ephemeral=True,
         )
 
@@ -8067,6 +8118,19 @@ class CompanyReviewView(View):
                 "last_expense_at": int(time.time()),
                 "created_at": int(time.time()),
             }
+            changes = req.get("review_changes", {})
+            if "expense_amount" in changes:
+                company["expense_amount"] = str(changes["expense_amount"])
+            if "expense_cooldown" in changes:
+                company["expense_cooldown"] = max(60, parse_interval(str(changes["expense_cooldown"])))
+            if "income_amount" in changes:
+                company["income_amount"] = str(changes["income_amount"])
+            if "income_cooldown" in changes:
+                company["income_cooldown"] = max(60, parse_interval(str(changes["income_cooldown"])))
+            if "min_value" in changes:
+                company["min_value"] = parse_money_value(str(changes["min_value"]), max(1, int(first_invest)))
+            if "advert_level" in changes:
+                company["advert_level"] = max(1, int(str(changes["advert_level"]).strip()))
             update_company_derived_fields(company)
             companies_data.setdefault("companies", {})[company_id] = company
             summary.append(f"Создана компания {company.get('name')}")
@@ -8244,9 +8308,9 @@ class CompanyReviewActionSelect(Select):
             return
 
         choice = self.values[0]
-        if choice in {"income", "expense", "advert", "value"} and str(req.get("type")) != "upgrade":
+        if choice in {"income", "expense", "advert", "value"} and str(req.get("type")) not in {"upgrade", "create"}:
             await interaction.response.send_message(
-                "❌ Ручные изменения параметров доступны только для заявок на улучшение компании.",
+                "❌ Ручные изменения параметров доступны только для заявок на создание или улучшение компании.",
                 ephemeral=True,
             )
             return
@@ -11923,11 +11987,32 @@ async def auto_role_income_loop():
                             active_attackers.append(attacker)
                         if active_attackers:
                             attacker = max(active_attackers, key=lambda c: int(c.get("advert_level", 1)))
-                            stolen = max(1, int(owner_gain * 0.15))
+                            steal_percent = int(attacker.get("active_ad_attack_percent", 15) or 15)
+                            steal_percent = max(1, min(15, steal_percent))
+                            stolen = max(1, int(owner_gain * (steal_percent / 100.0)))
                             owner_gain -= stolen
                             attacker_owner_id = str(attacker.get("owner_id") or "")
                             if attacker_owner_id:
                                 ensure_user(attacker_owner_id)["наличка"] = int(ensure_user(attacker_owner_id).get("наличка", 0)) + stolen
+
+                            victim_member = guild.get_member(int(owner_id)) if owner_id.isdigit() else None
+                            if victim_member:
+                                try:
+                                    attack_left = max(0, int(attacker.get("active_ad_attack_until", 0) or 0) - now_comp)
+                                    await victim_member.send(
+                                        embed=Embed(
+                                            title="💸 Доход компании частично украден",
+                                            description=(
+                                                f">>> Компания **{company.get('name', 'Без названия')}** под атакой.\n"
+                                                f"• Украдено: **{fmt_num(stolen)} {currency}**\n"
+                                                f"  ↳ Процент кражи: **{steal_percent}%**\n"
+                                                f"  ↳ Осталось времени атаки: **{format_seconds_left(attack_left) if attack_left > 0 else 'завершена'}**"
+                                            ),
+                                            color=0xE67E22,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
                         user["наличка"] = int(user.get("наличка", 0)) + owner_gain
                         total_income += owner_gain
                         balances_changed_comp = True
@@ -14851,7 +14936,11 @@ async def профиль(ctx, member: discord.Member = None):
     news_count = int(state.get("news_published", 0))
     coins_value = int(user.get("коины", 0))
 
-    embed = Embed(title=f"📊 Профиль {member.display_name}", color=0x3498DB)
+    embed = Embed(
+        title=f"📊 Профиль {member.display_name}",
+        color=0x3498DB,
+        description=">>> **Профиль игрока**\n• Аккуратная сводка по ключевым параметрам ниже.",
+    )
     embed.add_field(
         name="💰 Общий баланс",
         value=fmt_money(user["наличка"] + user["банк"]),
@@ -14863,19 +14952,19 @@ async def профиль(ctx, member: discord.Member = None):
         inline=False,
     )
     embed.add_field(name="📝 Описание", value=admin_description or "—", inline=False)
-    embed.add_field(name="🏘 Население", value=str(population_value), inline=False)
+    embed.add_field(name="🏘 Население", value=fmt_num(population_value), inline=False)
     embed.add_field(
         name="📰 Опубликовано новостей", value=str(news_count), inline=False
     )
     embed.add_field(
         name="🛡️ Щит",
         value=(format_seconds_left(shield_left) if shield_left > 0 else "нет"),
-        inline=True,
+        inline=False,
     )
-    embed.add_field(name="🙂 Счастье", value=f"{happiness}%", inline=True)
-    embed.add_field(name="🪖 Войска", value=str(soldiers), inline=True)
-    embed.add_field(name="⭐ Репутация", value=str(reputation), inline=True)
-    embed.add_field(name="🔬 Наука", value=str(science), inline=True)
+    embed.add_field(name="🙂 Счастье", value=f"{happiness}%", inline=False)
+    embed.add_field(name="🪖 Войска", value=fmt_num(soldiers), inline=False)
+    embed.add_field(name="⭐ Репутация", value=fmt_num(reputation), inline=False)
+    embed.add_field(name="🔬 Наука", value=fmt_num(science), inline=False)
 
     class PlayerEconomyView(View):
         def __init__(self, target_member: discord.Member):
