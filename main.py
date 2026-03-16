@@ -1530,7 +1530,15 @@ async def only_allowed_guild(ctx):
 
 @bot.check
 async def check_custom_command_denies(ctx):
-    if ctx.command and has_custom_command_deny(ctx.author, ctx.command.qualified_name):
+    if not ctx.command:
+        return True
+
+    # Явно выданный доступ через !разрешить должен иметь приоритет,
+    # иначе пользователь получает ошибку даже после выдачи доступа.
+    if has_custom_command_access(ctx.author, ctx.command.qualified_name):
+        return True
+
+    if has_custom_command_deny(ctx.author, ctx.command.qualified_name):
         raise CommandDenied("Вам запрещено использовать эту команду.")
     return True
 
