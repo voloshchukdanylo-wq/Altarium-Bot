@@ -2667,7 +2667,8 @@ async def меню(ctx):
                         f"{interaction.user.mention} и {member.mention}, это приватный канал для переговоров."
                     ),
                     color=0x5865F2,
-                )
+                ),
+                view=SecretTalkCloseView({interaction.user.id, member.id}),
             )
             await interaction.response.send_message(
                 f"✅ Переговоры назначены: {ticket_channel.mention}", ephemeral=True
@@ -5531,6 +5532,44 @@ class NegotiationRoomView(View):
         await interaction.response.send_message(
             "Вы вышли из переговоров. Доступ к каналу закрыт.", ephemeral=True
         )
+
+
+class SecretTalkCloseView(View):
+    def __init__(self, allowed_user_ids: set[int]):
+        super().__init__(timeout=None)
+        self.allowed_user_ids = {int(user_id) for user_id in allowed_user_ids}
+
+    @discord.ui.button(label="Закрыть переговоры и удалить канал", style=ButtonStyle.danger)
+    async def close_channel(self, interaction: Interaction, button: Button):
+        channel = interaction.channel
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ Не удалось определить канал.", ephemeral=True
+            )
+            return
+
+        has_manage_channels = False
+        if isinstance(interaction.user, discord.Member):
+            has_manage_channels = interaction.user.guild_permissions.manage_channels
+
+        if interaction.user.id not in self.allowed_user_ids and not has_manage_channels:
+            await interaction.response.send_message(
+                "❌ Только участники переговоров или модератор могут закрыть канал.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "✅ Переговоры закрыты. Канал будет удалён через 5 секунд.",
+            ephemeral=True,
+        )
+        await asyncio.sleep(5)
+        try:
+            await channel.delete(
+                reason=f"Переговоры закрыты пользователем {interaction.user}"
+            )
+        except Exception:
+            pass
 
 
 class NegotiationCreateModal(Modal):
