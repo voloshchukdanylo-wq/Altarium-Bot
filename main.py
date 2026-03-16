@@ -2022,7 +2022,10 @@ async def on_command_error(ctx, error):
             "отклонить": "!отклонить 12 недостаточно подтверждений",
             "баланс": "!баланс @Игрок",
             "счастьестоп": "!счастьестоп @Игрок 24ч",
-            "счастьевыдать": "!счастьевыдать @Игрок 70%",
+            "счастьевыдать": "!счастье @Игрок 70",
+            "счастье": "!счастье @Игрок 70",
+            "репутация": "!репутация @Игрок 25",
+            "наука": "!наука @Игрок 40",
             "мобилизировать": "!мобилизировать 1000",
             "распустить": "!распустить 500",
             "сеттикет": "!сеттикет",
@@ -2234,6 +2237,9 @@ async def хелп(ctx):
             "занятстраны",
             "свободстраны",
             "счастьевыдать",
+            "счастье",
+            "репутация",
+            "наука",
             "счастьестоп",
             "мобилизировать",
             "распустить",
@@ -2306,6 +2312,9 @@ async def хелп(ctx):
         "разрешить": "Выдать доступ роли/пользователю к команде.",
         "запретить": "Запретить доступ роли/пользователю к команде.",
         "разрешения": "Показать таблицу выданных прав.",
+        "счастье": "Установить уровень счастья игрока (0-100).",
+        "репутация": "Установить значение репутации игрока.",
+        "наука": "Установить значение науки игрока.",
     }
 
     def summarize_roles(cat_name: str):
@@ -9509,6 +9518,130 @@ async def счастьевыдать(ctx, member: discord.Member, amount: str):
     )
 
 
+def _parse_target_member(guild: discord.Guild, player_query: str):
+    member = resolve_member_query(guild, player_query)
+    if member:
+        return member
+    return parse_member_ref(guild, player_query)
+
+
+@bot.command(name="счастье")
+@commands.has_permissions(administrator=True)
+async def счастье(ctx, игрок: str, число: str):
+    member = _parse_target_member(ctx.guild, игрок)
+    if not member:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Игрок не найден. Укажите упоминание, ID или точный ник.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    st = ensure_player_state(str(member.id))
+    current = int(st.get("happiness", 50))
+    try:
+        val = int(float(str(число).strip().replace("%", "")))
+    except Exception:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Введите целое число для счастья (например `70`).",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    st["happiness"] = max(0, min(100, val))
+    save_player_state()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Счастье обновлено",
+            description=f"{member.mention}: {current}% → {st['happiness']}%",
+            color=0x00FF00,
+        )
+    )
+
+
+@bot.command(name="репутация")
+@commands.has_permissions(administrator=True)
+async def репутация(ctx, игрок: str, число: str):
+    member = _parse_target_member(ctx.guild, игрок)
+    if not member:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Игрок не найден. Укажите упоминание, ID или точный ник.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    try:
+        val = int(float(число))
+    except Exception:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Введите целое число для репутации.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    st = ensure_player_state(str(member.id))
+    current = int(st.get("reputation", 0))
+    st["reputation"] = val
+    save_player_state()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Репутация обновлена",
+            description=f"{member.mention}: {fmt_num(current)} → {fmt_num(st['reputation'])}",
+            color=0x00FF00,
+        )
+    )
+
+
+@bot.command(name="наука")
+@commands.has_permissions(administrator=True)
+async def наука(ctx, игрок: str, число: str):
+    member = _parse_target_member(ctx.guild, игрок)
+    if not member:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Игрок не найден. Укажите упоминание, ID или точный ник.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    try:
+        val = int(float(число))
+    except Exception:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Введите целое число для науки.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    st = ensure_player_state(str(member.id))
+    current = int(st.get("science", 0))
+    st["science"] = max(0, val)
+    save_player_state()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Наука обновлена",
+            description=f"{member.mention}: {fmt_num(current)} → {fmt_num(st['science'])}",
+            color=0x00FF00,
+        )
+    )
+
+
 @bot.command(name="мобилизировать")
 async def мобилизировать(ctx, amount: int):
     if amount <= 0:
@@ -10724,6 +10857,7 @@ class TopModeSelect(Select):
             SelectOption(label="Топ по постам", value="posts", emoji="📰"),
             SelectOption(label="Топ компаний (цена)", value="companies_price", emoji="🏢"),
             SelectOption(label="Топ по репутации", value="reputation", emoji="⭐"),
+            SelectOption(label="Топ по науке", value="science", emoji="🔬"),
         ]
         super().__init__(
             placeholder="Выберите тип топа", min_values=1, max_values=1, options=options
@@ -10793,6 +10927,19 @@ class TopView(View):
                 ),
                 "⭐ Топ по репутации",
             )
+        if self.mode == "science":
+            users = player_state.get("users", {})
+            return (
+                sorted(
+                    (
+                        (uid, int((users.get(uid) or {}).get("science", 0)))
+                        for uid in users.keys()
+                    ),
+                    key=lambda x: x[1],
+                    reverse=True,
+                ),
+                "🔬 Топ по науке",
+            )
         if self.mode == "companies_price":
             companies = []
             for company in companies_data.setdefault("companies", {}).values():
@@ -10843,6 +10990,7 @@ class TopView(View):
             "posts": "Топ по постам",
             "companies_price": "Топ компаний (цена)",
             "reputation": "Топ по репутации",
+            "science": "Топ по науке",
         }
         current = mode_map.get(self.mode, "")
         for option in self.mode_select.options:
