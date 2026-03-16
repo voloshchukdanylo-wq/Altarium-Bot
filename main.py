@@ -7,6 +7,7 @@ import time
 import asyncio
 from threading import Thread
 
+import aiohttp
 import discord
 from discord import ButtonStyle, Embed, Interaction, SelectOption
 from discord.ext import commands, tasks
@@ -1927,6 +1928,20 @@ async def on_command_error(ctx, error):
     ):
         # Временная ошибка на стороне Discord API (например, 503 overflow).
         # Повторно выбрасывать её не нужно, чтобы не спамить трассировками.
+        return
+
+    if isinstance(error, aiohttp.ClientOSError) or isinstance(
+        invoke_error, aiohttp.ClientOSError
+    ):
+        # Кратковременный разрыв соединения с Discord API.
+        # Игнорируем, чтобы не засорять логи трассировками при авто-восстановлении.
+        return
+
+    if isinstance(error, ConnectionResetError) or isinstance(
+        invoke_error, ConnectionResetError
+    ):
+        # Сброс TCP-соединения внешней стороной (Errno 104).
+        # Для бота это обычно временный сетевой сбой.
         return
 
     if isinstance(error, commands.CommandOnCooldown):
