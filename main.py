@@ -1591,9 +1591,18 @@ async def on_ready():
             if isinstance(req, dict) and req.get("status") == "sent":
                 bot.add_view(EventPlayerView(str(req_id), page=0))
         persistent_views_registered = True
-    await restore_company_request_views()
-    await restore_verdict_request_views()
-    await restore_event_views()
+    try:
+        await restore_company_request_views()
+    except Exception as e:
+        print(f"[READY] restore_company_request_views failed: {e}")
+    try:
+        await restore_verdict_request_views()
+    except Exception as e:
+        print(f"[READY] restore_verdict_request_views failed: {e}")
+    try:
+        await restore_event_views()
+    except Exception as e:
+        print(f"[READY] restore_event_views failed: {e}")
     status_text = (settings.get("status_text") or "").strip()
     status_emoji = (settings.get("status_emoji") or "").strip()
     status_until = settings.get("status_until")
@@ -11776,6 +11785,31 @@ async def продать(
     class TradeOfferView(View):
         def __init__(self):
             super().__init__(timeout=300)
+            self._seller_notified = False
+
+        async def notify_seller(self, accepted: bool, extra_text: str | None = None):
+            if self._seller_notified:
+                return
+            self._seller_notified = True
+            title = "✅ Ваше предложение принято" if accepted else "❌ Ваше предложение не принято"
+            description = (
+                f"Покупатель: {member.mention}\n"
+                f"Предмет: **{selected_key} × {количество}**\n"
+                f"Цена: **{fmt_money(price_value)}**"
+            )
+            if extra_text:
+                description += f"\n\n{extra_text}"
+            seller_notice = Embed(title=title, description=description, color=0x00FF00 if accepted else 0xFF0000)
+            try:
+                await ctx.author.send(content=ctx.author.mention, embed=seller_notice)
+            except Exception:
+                pass
+
+        async def on_timeout(self):
+            await self.notify_seller(
+                accepted=False,
+                extra_text="Покупатель не ответил на предложение вовремя.",
+            )
 
         async def interaction_check(self, interaction: Interaction) -> bool:
             if interaction.user.id != member.id:
@@ -11791,6 +11825,10 @@ async def продать(
             buyer_balance = ensure_user(buyer_id)
             seller_inv = inventory.get(seller_id, {})
             if seller_inv.get(selected_key, 0) < количество:
+                await self.notify_seller(
+                    accepted=False,
+                    extra_text="Сделка отменена: у вас больше нет нужного количества предметов.",
+                )
                 await interaction.response.edit_message(
                     embed=Embed(
                         title="❌ Сделка отменена",
@@ -11802,6 +11840,10 @@ async def продать(
                 self.stop()
                 return
             if buyer_balance.get("наличка", 0) < price_value:
+                await self.notify_seller(
+                    accepted=False,
+                    extra_text="Сделка отменена: у покупателя уже недостаточно налички.",
+                )
                 await interaction.response.edit_message(
                     embed=Embed(
                         title="❌ Сделка отменена",
@@ -11835,19 +11877,7 @@ async def продать(
             )
             done.add_field(name="Цена", value=fmt_money(price_value), inline=False)
             await interaction.response.edit_message(embed=done, view=None)
-            seller_notice = Embed(
-                title="✅ Ваш предмет продан",
-                description=(
-                    f"Покупатель: {member.mention}\n"
-                    f"Предмет: **{selected_key} × {количество}**\n"
-                    f"Сумма: **{fmt_money(price_value)}**"
-                ),
-                color=0x00FF00,
-            )
-            try:
-                await ctx.author.send(content=ctx.author.mention, embed=seller_notice)
-            except Exception:
-                pass
+            await self.notify_seller(accepted=True)
             await log_economy_change(
                 ctx.guild,
                 member.id,
@@ -11864,18 +11894,10 @@ async def продать(
 
         @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger)
         async def decline(self, interaction: Interaction, button: Button):
-            seller_notice = Embed(
-                title="❌ Продажа не состоялась",
-                description=(
-                    f"Покупатель {member.mention} отклонил предложение по предмету "
-                    f"**{selected_key} × {количество}**."
-                ),
-                color=0xFF0000,
+            await self.notify_seller(
+                accepted=False,
+                extra_text="Покупатель вручную отклонил предложение.",
             )
-            try:
-                await ctx.author.send(content=ctx.author.mention, embed=seller_notice)
-            except Exception:
-                pass
             await interaction.response.edit_message(
                 embed=Embed(
                     title="❌ Сделка отклонена",
@@ -12628,6 +12650,17 @@ async def создатьпредмет(ctx):
             vals.append(role.mention if role else f"<@&{rid}>")
         return ", ".join(vals) if vals else "—"
 
+    def validate_give_roles_hierarchy(role_ids: list[int]):
+        if not ctx.guild:
+            return
+        creator_top_role = ctx.author.top_role
+        for rid in role_ids:
+            role = ctx.guild.get_role(int(rid))
+            if role and role.position > creator_top_role.position:
+                raise ValueError(
+                    f"Нельзя выдавать роль {role.mention}: она выше вашей самой высокой роли ({creator_top_role.mention})."
+                )
+
     def build_embed():
         e = Embed(title="📝 Создание предмета", color=0x3498DB)
         ttl_text = (
@@ -12752,7 +12785,9 @@ async def создатьпредмет(ctx):
                 elif self.field_name == "require_roles":
                     draft["require_roles"] = parse_role_mentions(raw or "скип")
                 elif self.field_name == "give_roles":
-                    draft["give_roles"] = parse_role_mentions(raw or "скип")
+                    parsed = parse_role_mentions(raw or "скип")
+                    validate_give_roles_hierarchy(parsed)
+                    draft["give_roles"] = parsed
                 elif self.field_name == "remove_roles":
                     draft["remove_roles"] = parse_role_mentions(raw or "скип")
                 elif self.field_name == "use_text":
@@ -12802,6 +12837,11 @@ async def создатьпредмет(ctx):
                     await interaction.response.send_message(
                         "❌ Предмет с таким ключом уже существует.", ephemeral=True
                     )
+                    return
+                try:
+                    validate_give_roles_hierarchy(list(draft.get("give_roles", [])))
+                except Exception as e:
+                    await interaction.response.send_message(f"❌ {e}", ephemeral=True)
                     return
                 items_data.setdefault("items", {})[key] = {
                     "key": key,
