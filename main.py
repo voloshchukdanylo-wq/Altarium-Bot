@@ -12661,6 +12661,11 @@ async def создатьпредмет(ctx):
                     f"Нельзя выдавать роль {role.mention}: она выше вашей самой высокой роли ({creator_top_role.mention})."
                 )
 
+    def format_item_validation_error(err: Exception) -> str:
+        if isinstance(err, ValueError):
+            return str(err)
+        return "Проверьте введённые данные (числа, категорию и упоминания ролей)."
+
     def build_embed():
         e = Embed(title="📝 Создание предмета", color=0x3498DB)
         ttl_text = (
@@ -12794,7 +12799,7 @@ async def создатьпредмет(ctx):
                     draft["use_text"] = None if raw.lower() == "скип" else (raw or None)
             except Exception as e:
                 await interaction.response.send_message(
-                    f"❌ Ошибка: {e}", ephemeral=True
+                    f"❌ Ошибка: {format_item_validation_error(e)}", ephemeral=True
                 )
                 return
             await interaction.response.edit_message(embed=build_embed(), view=view)
@@ -13134,15 +13139,30 @@ async def купить(ctx, количество: int, *, item_key: str):
     )
     save_inventory()
 
-    for rid in item.get("give_roles", []):
-        role = ctx.guild.get_role(rid)
-        if role:
-            await ctx.author.add_roles(role)
+    try:
+        for rid in item.get("give_roles", []):
+            role = ctx.guild.get_role(rid)
+            if role:
+                await ctx.author.add_roles(role)
 
-    for rid in item.get("remove_roles", []):
-        role = ctx.guild.get_role(rid)
-        if role:
-            await ctx.author.remove_roles(role)
+        for rid in item.get("remove_roles", []):
+            role = ctx.guild.get_role(rid)
+            if role:
+                await ctx.author.remove_roles(role)
+    except discord.Forbidden:
+        user_items[selected_key] = user_items.get(selected_key, 0) + количество
+        save_inventory()
+        await ctx.send(
+            embed=Embed(
+                title="❌ Нельзя применить предмет",
+                description=(
+                    "Бот не может изменить роли: одна из ролей выше роли бота "
+                    "или у бота нет прав `Управлять ролями`."
+                ),
+                color=0xFF0000,
+            )
+        )
+        return
 
     use_text = item.get("use_text") or "✅"
     await ctx.send(
@@ -13365,6 +13385,22 @@ async def редактироватьпредмет(ctx, *, item_query: str):
         "use_text": item.get("use_text"),
     }
 
+    def validate_give_roles_hierarchy(role_ids: list[int]):
+        if not ctx.guild:
+            return
+        editor_top_role = ctx.author.top_role
+        for rid in role_ids:
+            role = ctx.guild.get_role(int(rid))
+            if role and role.position > editor_top_role.position:
+                raise ValueError(
+                    f"Нельзя выдавать роль {role.mention}: она выше вашей самой высокой роли ({editor_top_role.mention})."
+                )
+
+    def format_item_validation_error(err: Exception) -> str:
+        if isinstance(err, ValueError):
+            return str(err)
+        return "Проверьте введённые данные (числа, категорию и упоминания ролей)."
+
     def build_embed():
         e = Embed(title=f"🛠 Редактирование — {selected_key}", color=0x3498DB)
         ttl_text = (
@@ -13431,7 +13467,7 @@ async def редактироватьпредмет(ctx, *, item_query: str):
                 )
             except Exception as e:
                 await interaction.response.send_message(
-                    f"❌ Ошибка: {e}", ephemeral=True
+                    f"❌ Ошибка: {format_item_validation_error(e)}", ephemeral=True
                 )
                 return
             await interaction.response.edit_message(embed=build_embed(), view=view)
@@ -13465,9 +13501,17 @@ async def редактироватьпредмет(ctx, *, item_query: str):
             parts = [p.strip() for p in raw.split(";")]
             while len(parts) < 3:
                 parts.append("")
-            draft["require_roles"] = parse_role_mentions(parts[0] or "скип")
-            draft["give_roles"] = parse_role_mentions(parts[1] or "скип")
-            draft["remove_roles"] = parse_role_mentions(parts[2] or "скип")
+            try:
+                draft["require_roles"] = parse_role_mentions(parts[0] or "скип")
+                parsed_give_roles = parse_role_mentions(parts[1] or "скип")
+                validate_give_roles_hierarchy(parsed_give_roles)
+                draft["give_roles"] = parsed_give_roles
+                draft["remove_roles"] = parse_role_mentions(parts[2] or "скип")
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"❌ Ошибка: {format_item_validation_error(e)}", ephemeral=True
+                )
+                return
             txt = str(self.use_text.value or "").strip()
             draft["use_text"] = None if txt.lower() == "скип" else (txt or None)
             await interaction.response.edit_message(embed=build_embed(), view=view)
@@ -13496,6 +13540,13 @@ async def редактироватьпредмет(ctx, *, item_query: str):
         async def save(self, interaction: Interaction, button: Button):
             nonlocal selected_key
             old_price = int(item.get("price", 0))
+            try:
+                validate_give_roles_hierarchy(list(draft.get("give_roles", [])))
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"❌ Ошибка: {format_item_validation_error(e)}", ephemeral=True
+                )
+                return
             item.update(
                 {
                     "key": draft["key"],
