@@ -7478,6 +7478,30 @@ def build_company_request_embed(req: dict, color=0x3498DB):
     return em
 
 
+async def notify_company_request_author_dm(req: dict, title: str, description: str, color: int):
+    author_id = str(req.get("author_id") or "")
+    if not author_id.isdigit():
+        return
+
+    user = bot.get_user(int(author_id))
+    if user is None:
+        try:
+            user = await bot.fetch_user(int(author_id))
+        except Exception:
+            return
+
+    try:
+        await user.send(
+            embed=Embed(
+                title=title,
+                description=description,
+                color=color,
+            )
+        )
+    except Exception:
+        pass
+
+
 class CompanyCreateModal(Modal):
     def __init__(self):
         super().__init__(title="Создание компании", timeout=600)
@@ -7994,9 +8018,13 @@ class CompanyCountryRejectModal(Modal):
         if not req:
             await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
             return
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")), {})
+        company_name = company.get("name", "Без названия")
+        target_country = str(req.get("target_country") or "—")
+        reason = str(self.reason.value).strip()
         req["status"] = "rejected_by_country"
         req["processed_by"] = str(interaction.user.id)
-        req["status_text"] = f"❌ Страна отклонила вход\nПричина: {self.reason.value}"
+        req["status_text"] = f"❌ Страна отклонила вход\nПричина: {reason}"
         save_companies_data()
         result_channel = await get_channel_safe(companies_data.get("result_channel"))
         if result_channel:
@@ -8007,6 +8035,15 @@ class CompanyCountryRejectModal(Modal):
                 content=" ".join(sorted(set(mentions))),
                 embed=build_company_request_embed(req, color=0xE74C3C),
             )
+        await notify_company_request_author_dm(
+            req,
+            title="❌ Заявка на вход в страну отклонена",
+            description=(
+                f"Компания **{company_name}** не получила вход в страну **{target_country}**.\n"
+                f"**Причина:** {reason}"
+            ),
+            color=0xE74C3C,
+        )
         await interaction.response.edit_message(embed=build_company_request_embed(req, color=0xE74C3C), view=None)
 
 
@@ -8066,6 +8103,15 @@ class CompanyCountryDecisionView(View):
                 content=" ".join(sorted(set(mentions))),
                 embed=build_company_request_embed(req, color=0x2ECC71),
             )
+        await notify_company_request_author_dm(
+            req,
+            title="✅ Заявка на вход в страну принята",
+            description=(
+                f"Компания **{company.get('name', 'Без названия')}** получила разрешение на вход в страну "
+                f"**{target_country}**."
+            ),
+            color=0x2ECC71,
+        )
         await interaction.response.edit_message(embed=build_company_request_embed(req, color=0x2ECC71), view=None)
 
     @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:country_reject")
