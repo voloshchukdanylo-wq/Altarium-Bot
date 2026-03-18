@@ -222,6 +222,7 @@ companies_data = load_json(
         "requests_channel": None,
         "result_channel": None,
         "create_role_id": None,
+        "entry_requests_channel": None,
         "advert_attacks": {},
     },
 )
@@ -306,6 +307,7 @@ companies_data.setdefault("next_request_id", 1)
 companies_data.setdefault("requests_channel", None)
 companies_data.setdefault("result_channel", None)
 companies_data.setdefault("create_role_id", None)
+companies_data.setdefault("entry_requests_channel", None)
 companies_data.setdefault("advert_attacks", {})
 seasons_data.setdefault("seasons", {})
 seasons_data.setdefault("active_season", None)
@@ -715,6 +717,8 @@ def update_company_derived_fields(company: dict):
     company.setdefault("last_income_at", int(time.time()))
     company.setdefault("last_expense_at", int(time.time()))
     company.setdefault("autobuy", [])
+    company.setdefault("subject_item", "")
+    company.setdefault("country_presence", {})
     company.setdefault("active_ad_attack_until", 0)
     company.setdefault("active_ad_attack_target", None)
     company.setdefault("active_ad_attack_percent", 0)
@@ -792,6 +796,10 @@ def build_company_embed(company: dict, idx: int, total: int):
     em.add_field(name="Траты (за цикл)", value=f"{company.get('expense_amount', '0')} / {format_interval(expense_cd)}", inline=True)
     em.add_field(name="Доходы (за цикл)", value=f"{company.get('income_amount', '0')} / {format_interval(income_cd)}", inline=True)
     em.add_field(name="Оценка цены компании", value=f"{est_price:,}", inline=False)
+    em.add_field(name="Предмет компании", value=(company_subject_item_name(company) or "Не назначен"), inline=False)
+    presence = ensure_company_country_presence_struct(company)
+    active_countries = [k for k, v in presence.items() if isinstance(v, dict) and str(v.get("status")) == "active"]
+    em.add_field(name="Присутствие в странах", value=(", ".join(active_countries[:10]) if active_countries else "Только страна владельца"), inline=False)
     em.add_field(name="Владелец", value=f"<@{company.get('owner_id')}>", inline=False)
     competitors = get_company_competitors(company)
     if competitors:
@@ -1480,6 +1488,16 @@ async def restore_company_request_views():
                 try:
                     msg = await dm_ch.fetch_message(int(dm_mid))
                     await msg.edit(view=CompanyOwnerDecisionView(str(req_id)))
+                except Exception:
+                    pass
+
+        if status == "pending_country":
+            dm_ch = await get_channel_safe(req.get("decision_channel_id"))
+            dm_mid = req.get("decision_message_id")
+            if dm_ch and dm_mid:
+                try:
+                    msg = await dm_ch.fetch_message(int(dm_mid))
+                    await msg.edit(view=CompanyCountryDecisionView(str(req_id)))
                 except Exception:
                     pass
 
@@ -7386,6 +7404,53 @@ def find_companies_by_name(query: str, owner_id: str | None = None):
     return [c for c in all_companies if q in str(c.get("name", "")).strip().lower()]
 
 
+def company_subject_item_name(company: dict) -> str:
+    return str(company.get("subject_item") or company.get("company_item") or "").strip()
+
+
+def ensure_company_country_presence_struct(company: dict):
+    if not isinstance(company.get("country_presence"), dict):
+        company["country_presence"] = {}
+    return company["country_presence"]
+
+
+def get_country_name_by_user_id(user_id: str) -> str | None:
+    country_to_user, user_to_country = get_occupied_country_map()
+    return user_to_country.get(str(user_id))
+
+
+def get_owner_country_of_company(company: dict) -> str | None:
+    return get_country_name_by_user_id(str(company.get("owner_id") or ""))
+
+
+def get_user_company_item_qty(user_id: str, item_name: str) -> int:
+    if not item_name:
+        return 0
+    key_matches = resolve_item_key(item_name)
+    if not key_matches:
+        return 0
+    key = key_matches[0]
+    return int(inventory.setdefault(str(user_id), {}).get(key, 0))
+
+
+def effective_company_share(company: dict, user_id: str, country_name: str | None = None) -> float:
+    owner_id = str(company.get("owner_id") or "")
+    if str(user_id) == owner_id:
+        return 1.0
+    if not country_name:
+        country_name = get_country_name_by_user_id(str(user_id))
+    if not country_name:
+        return 0.0
+    presence = ensure_company_country_presence_struct(company).get(str(country_name))
+    if not isinstance(presence, dict) or str(presence.get("status")) != "active":
+        return 0.0
+    max_units = max(1, int(presence.get("max_units", 0) or 0))
+    qty = max(0, get_user_company_item_qty(str(user_id), company_subject_item_name(company)))
+    if qty <= 0:
+        return 0.0
+    return max(0.0, min(1.0, qty / max_units))
+
+
 def build_company_request_embed(req: dict, color=0x3498DB):
     em = Embed(
         title=f"🏢 Заявка компании #{req.get('id')} ({req.get('type')})",
@@ -7407,10 +7472,12 @@ class CompanyCreateModal(Modal):
         self.company_name = TextInput(label="Название компании", required=True, max_length=120)
         self.specialization = TextInput(label="Специализация (номер)", required=True, max_length=20)
         self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100)
+        self.subject_item = TextInput(label="Предмет компании (название из магазина)", required=True, max_length=120)
         self.add_item(self.post_url)
         self.add_item(self.company_name)
         self.add_item(self.specialization)
         self.add_item(self.first_invest)
+        self.add_item(self.subject_item)
 
     async def on_submit(self, interaction: Interaction):
         author_id = str(interaction.user.id)
@@ -7438,6 +7505,22 @@ class CompanyCreateModal(Modal):
                 ephemeral=True,
             )
             return
+
+        subject_matches = resolve_item_key(str(self.subject_item.value).strip())
+        if not subject_matches:
+            await interaction.response.send_message(
+                "❌ Предмет компании не найден в магазине. Укажите точное название предмета.",
+                ephemeral=True,
+            )
+            return
+        if len(subject_matches) > 1:
+            variants = "\n".join(f"• {name}" for name in subject_matches[:10])
+            await interaction.response.send_message(
+                "⚠️ Найдено несколько предметов. Уточните название:\n" + variants,
+                ephemeral=True,
+            )
+            return
+        subject_item = subject_matches[0]
 
         user = ensure_user(author_id)
         raw_first_invest = str(self.first_invest.value).strip()
@@ -7484,6 +7567,7 @@ class CompanyCreateModal(Modal):
                 "Название": str(self.company_name.value).strip(),
                 "Специализация": specialization_name,
                 "Первый вклад": raw_first_invest,
+                "Предмет компании": subject_item,
             },
             "first_invest_charged": int(first_invest),
             "first_invest_refunded": False,
@@ -7904,6 +7988,169 @@ class CompanyOwnerDecisionView(View):
         await interaction.response.send_modal(CompanyOwnerRejectModal(self.req_id))
 
 
+class CompanyCountryRejectModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Причина отказа страны", timeout=300)
+        self.reason = TextInput(label="Причина", required=True, style=discord.TextStyle.paragraph, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req["status"] = "rejected_by_country"
+        req["status_text"] = f"❌ Страна отклонила вход\nПричина: {self.reason.value}"
+        save_companies_data()
+        await interaction.response.edit_message(embed=build_company_request_embed(req, color=0xE74C3C), view=None)
+
+
+class CompanyCountryDecisionView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    @discord.ui.button(label="ℹ️ Посмотреть информацию о компании", style=ButtonStyle.secondary, custom_id="company:country_info")
+    async def info(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")))
+        if not company:
+            await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+            return
+        em = build_company_embed(company, 1, 1)
+        em.add_field(name="Стоимость входа", value=str(req.get("entry_fee", "0")), inline=False)
+        await interaction.response.send_message(embed=em, ephemeral=True)
+
+    @discord.ui.button(label="✅ Согласиться", style=ButtonStyle.success, custom_id="company:country_accept")
+    async def accept(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        if str(req.get("status")) != "pending_country":
+            await interaction.response.send_message("❌ Эта заявка уже обработана.", ephemeral=True)
+            return
+        target_owner_id = str(req.get("target_country_owner_id") or "")
+        if target_owner_id != str(interaction.user.id):
+            await interaction.response.send_message("❌ Только владелец целевой страны может принять.", ephemeral=True)
+            return
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")))
+        if not company:
+            await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+            return
+        target_country = str(req.get("target_country") or "").strip()
+        presence = ensure_company_country_presence_struct(company)
+        buyer_qty = get_user_company_item_qty(target_owner_id, company_subject_item_name(company))
+        presence[target_country] = {
+            "status": "active",
+            "buyer_user_id": target_owner_id,
+            "max_units": max(1, int(buyer_qty or 1)),
+            "created_at": int(time.time()),
+        }
+        req["status"] = "approved"
+        req["status_text"] = "✅ Вход компании в другую страну принят"
+        save_companies_data()
+        await interaction.response.edit_message(embed=build_company_request_embed(req, color=0x2ECC71), view=None)
+
+    @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger, custom_id="company:country_reject")
+    async def reject(self, interaction: Interaction, button: Button):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        target_owner_id = str(req.get("target_country_owner_id") or "")
+        if target_owner_id != str(interaction.user.id):
+            await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CompanyCountryRejectModal(self.req_id))
+
+
+class CompanyEntryFeeModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        super().__init__(title="Стоимость входа", timeout=300)
+        self.fee = TextInput(label="Стоимость входа", required=True, max_length=100)
+        self.add_item(self.fee)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        req["entry_fee"] = str(self.fee.value).strip()
+        req["status_text"] = f"📝 Добавлена стоимость входа: {self.fee.value}"
+        save_companies_data()
+        await interaction.response.send_message("✅ Стоимость входа сохранена.", ephemeral=True)
+
+
+class CompanyForeignEntryRequestModal(Modal):
+    def __init__(self):
+        super().__init__(title="Вход компании в другую страну", timeout=600)
+        self.post_url = TextInput(label="Ссылка на пост", required=True, max_length=400)
+        self.company_name = TextInput(label="Название компании", required=True, max_length=120)
+        self.target_owner = TextInput(label="Кому (пинг/ID владельца страны)", required=True, max_length=80)
+        self.add_item(self.post_url)
+        self.add_item(self.company_name)
+        self.add_item(self.target_owner)
+
+    async def on_submit(self, interaction: Interaction):
+        owner_id = str(interaction.user.id)
+        matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
+        if not matches:
+            await interaction.response.send_message("❌ У вас нет компании с таким названием.", ephemeral=True)
+            return
+        if len(matches) > 1:
+            await interaction.response.send_message("❌ Уточните название компании (найдено несколько совпадений).", ephemeral=True)
+            return
+        company = matches[0]
+        if not company_subject_item_name(company):
+            await interaction.response.send_message("❌ Для компании не назначен предмет компании. Создание входа недоступно.", ephemeral=True)
+            return
+
+        raw = str(self.target_owner.value).strip().replace('<@','').replace('>','').replace('!','')
+        if not raw.isdigit():
+            await interaction.response.send_message("❌ Укажите пинг или ID владельца страны.", ephemeral=True)
+            return
+        target_country = get_country_name_by_user_id(raw)
+        if not target_country:
+            await interaction.response.send_message("❌ Указанный пользователь не является владельцем страны.", ephemeral=True)
+            return
+
+        req_id = int(companies_data.get("next_request_id", 1))
+        companies_data["next_request_id"] = req_id + 1
+        req = {
+            "id": req_id,
+            "type": "foreign_entry",
+            "author_id": owner_id,
+            "company_id": str(company.get("id")),
+            "target_country": target_country,
+            "target_country_owner_id": str(raw),
+            "status": "pending_moderation",
+            "status_text": "⏳ На рассмотрении модерации",
+            "payload": {
+                "Ссылка на пост": str(self.post_url.value).strip(),
+                "Название компании": str(company.get("name", "")),
+                "Кому": f"<@{raw}>",
+            },
+            "created_at": int(time.time()),
+        }
+        companies_data.setdefault("requests", {})[str(req_id)] = req
+        save_companies_data()
+
+        ch_id = companies_data.get("entry_requests_channel") or companies_data.get("requests_channel")
+        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
+        if ch:
+            msg = await ch.send(content=company_ping_roles_line(interaction.guild) or None, embed=build_company_request_embed(req), view=CompanyReviewView(str(req_id)))
+            req["request_channel_id"] = msg.channel.id
+            req["request_message_id"] = msg.id
+            save_companies_data()
+        await interaction.response.send_message(f"✅ Заявка #{req_id} на вход отправлена модераторам.", ephemeral=True)
+
+
 COMPANY_CHANGE_LABELS = {
     "income_amount": "Доход",
     "income_cooldown": "КД дохода",
@@ -8028,9 +8275,11 @@ class CompanyCreatePayloadEditModal(Modal):
         self.company_name = TextInput(label="Название компании", required=True, max_length=120, default=str(payload.get("Название", ""))[:120])
         self.specialization = TextInput(label="Специализация (номер)", required=True, max_length=20)
         self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100, default=str(payload.get("Первый вклад", ""))[:100])
+        self.subject_item = TextInput(label="Предмет компании", required=True, max_length=120, default=str(payload.get("Предмет компании", ""))[:120])
         self.add_item(self.company_name)
         self.add_item(self.specialization)
         self.add_item(self.first_invest)
+        self.add_item(self.subject_item)
 
     async def on_submit(self, interaction: Interaction):
         req = companies_data.get("requests", {}).get(self.req_id)
@@ -8043,10 +8292,19 @@ class CompanyCreatePayloadEditModal(Modal):
             await interaction.response.send_message("❌ Неверная специализация: укажите её номер.", ephemeral=True)
             return
 
+        subject_matches = resolve_item_key(str(self.subject_item.value).strip())
+        if not subject_matches:
+            await interaction.response.send_message("❌ Предмет компании не найден в магазине.", ephemeral=True)
+            return
+        if len(subject_matches) > 1:
+            await interaction.response.send_message("❌ Уточните название предмета компании (найдено несколько совпадений).", ephemeral=True)
+            return
+
         payload = req.setdefault("payload", {})
         payload["Название"] = str(self.company_name.value).strip()
         payload["Специализация"] = specialization_name
         payload["Первый вклад"] = str(self.first_invest.value).strip()
+        payload["Предмет компании"] = subject_matches[0]
         req["status_text"] = f"📝 Данные создания отредактированы: {interaction.user.display_name}"
         req["processed_by"] = str(interaction.user.id)
         save_companies_data()
@@ -8154,6 +8412,15 @@ class CompanyReviewView(View):
                     ephemeral=True,
                 )
                 return
+            subject_item_raw = str(payload.get("Предмет компании", "")).strip()
+            subject_matches = resolve_item_key(subject_item_raw)
+            if not subject_matches:
+                await interaction.response.send_message(
+                    "❌ Нельзя создать компанию без корректного предмета компании из магазина.",
+                    ephemeral=True,
+                )
+                return
+            subject_item = subject_matches[0]
             charged_amount = int(req.get("first_invest_charged", 0) or 0)
             if charged_amount <= 0:
                 available_cash = int(creator.get("наличка", 0)) - int(creator.get("заморожено", 0))
@@ -8180,6 +8447,7 @@ class CompanyReviewView(View):
                 "specialization": payload.get("Специализация", "—"),
                 "founded_year": founded,
                 "first_invest": int(first_invest),
+                "subject_item": subject_item,
                 "advert_level": 1,
                 "income_amount": str(max(100000, int(first_invest * 0.05) if first_invest > 0 else 100000)),
                 "income_cooldown": 3600,
@@ -8206,6 +8474,33 @@ class CompanyReviewView(View):
             update_company_derived_fields(company)
             companies_data.setdefault("companies", {})[company_id] = company
             summary.append(f"Создана компания {company.get('name')}")
+
+        elif req_type == "foreign_entry":
+            company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
+            if not company:
+                await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+                return
+            target_owner_id = str(req.get("target_country_owner_id") or "")
+            target_country = str(req.get("target_country") or "")
+            if not target_owner_id or not target_country:
+                await interaction.response.send_message("❌ В заявке не указана целевая страна.", ephemeral=True)
+                return
+            req["status"] = "pending_country"
+            req["status_text"] = "⏳ Модерация приняла: ожидается решение целевой страны"
+            save_companies_data()
+            member = interaction.guild.get_member(int(target_owner_id)) if interaction.guild and target_owner_id.isdigit() else None
+            if member:
+                try:
+                    dm_msg = await member.send(
+                        content=f"📩 Запрос на вход компании **{company.get('name')}** в вашу страну **{target_country}**.",
+                        embed=build_company_request_embed(req),
+                        view=CompanyCountryDecisionView(str(req.get('id'))),
+                    )
+                    req["decision_channel_id"] = dm_msg.channel.id
+                    req["decision_message_id"] = dm_msg.id
+                except Exception:
+                    pass
+            summary.append(f"Заявка на вход компании {company.get('name')} отправлена владельцу страны {target_country}")
 
         elif req_type in ("buy", "sell"):
             company = companies_data.setdefault("companies", {}).get(str(req.get("company_id")))
@@ -8354,6 +8649,7 @@ class CompanyReviewActionSelect(Select):
             SelectOption(label="Сменить траты (и КД)", value="expense", emoji="📉"),
             SelectOption(label="Сменить уровень рекламы", value="advert", emoji="📣"),
             SelectOption(label="Сменить оценку цены", value="value", emoji="💎"),
+            SelectOption(label="Добавить стоимость входа", value="entry_fee", emoji="💰"),
             SelectOption(label="Принять заявку", value="approve", emoji="✅"),
             SelectOption(label="Отклонить по причине", value="reject", emoji="❌"),
         ]
@@ -8406,6 +8702,12 @@ class CompanyReviewActionSelect(Select):
         if choice == "value":
             await interaction.response.send_modal(CompanyValueChangeModal(view.req_id))
             return
+        if choice == "entry_fee":
+            if str(req.get("type")) != "foreign_entry":
+                await interaction.response.send_message("❌ Это действие доступно только для заявок входа в страну.", ephemeral=True)
+                return
+            await interaction.response.send_modal(CompanyEntryFeeModal(view.req_id))
+            return
         if choice == "approve":
             await view.approve_request(interaction)
             return
@@ -8438,6 +8740,7 @@ class CompanyActionsSelect(Select):
             SelectOption(label="Продать компанию", value="sell", emoji="💼"),
             SelectOption(label="Улучшить компанию", value="upgrade", emoji="🛠"),
             SelectOption(label="Рекламная атака", value="attack", emoji="📢"),
+            SelectOption(label="Подать заявку на вход в страну", value="foreign_entry", emoji="🌍"),
         ]
         super().__init__(placeholder="Действия с компаниями", min_values=1, max_values=1, options=options)
 
@@ -8458,6 +8761,10 @@ class CompanyActionsSelect(Select):
 
         if v == "buy":
             await interaction.response.send_modal(CompanyBuyModal())
+            return
+
+        if v == "foreign_entry":
+            await interaction.response.send_modal(CompanyForeignEntryRequestModal())
             return
 
         owned_companies = find_companies_by_name("*", owner_id=str(interaction.user.id))
@@ -8788,6 +9095,13 @@ async def итогикомпанийканал(ctx, channel: discord.TextChannel
     save_companies_data()
     await ctx.send(embed=Embed(title="✅ Канал итогов компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
 
+
+@bot.command(name="заявкивходакомпаний")
+@commands.has_permissions(administrator=True)
+async def заявкивходакомпаний(ctx, channel: discord.TextChannel):
+    companies_data["entry_requests_channel"] = channel.id
+    save_companies_data()
+    await ctx.send(embed=Embed(title="✅ Канал заявок входа компаний установлен", description=f"Канал: {channel.mention}", color=0x00FF00))
 
 
 
@@ -12240,6 +12554,26 @@ async def auto_role_income_loop():
                         user["наличка"] = int(user.get("наличка", 0)) + owner_gain
                         total_income += owner_gain
                         balances_changed_comp = True
+
+                        # Доход из присутствия компании в других странах:
+                        # начисляется владельцу и владельцу целевой страны одинаковой суммой,
+                        # но зависит от % предметов компании у владельца целевой страны.
+                        for country_name, pres in ensure_company_country_presence_struct(company).items():
+                            if not isinstance(pres, dict) or str(pres.get("status")) != "active":
+                                continue
+                            buyer_id = str(pres.get("buyer_user_id") or "")
+                            if not buyer_id:
+                                continue
+                            share = effective_company_share(company, buyer_id, country_name)
+                            if share <= 0:
+                                continue
+                            extra_income = int(owner_gain * share)
+                            if extra_income <= 0:
+                                continue
+                            user["наличка"] = int(user.get("наличка", 0)) + extra_income
+                            ensure_user(buyer_id)["наличка"] = int(ensure_user(buyer_id).get("наличка", 0)) + extra_income
+                            total_income += extra_income
+                            balances_changed_comp = True
                 company["last_income_at"] = last_income + cycles * income_cd
                 comp_changed = True
                 if total_income:
@@ -12265,6 +12599,23 @@ async def auto_role_income_loop():
                         user["наличка"] = int(user.get("наличка", 0)) - int(exp)
                         total_expense += int(exp)
                         balances_changed_comp = True
+
+                        for country_name, pres in ensure_company_country_presence_struct(company).items():
+                            if not isinstance(pres, dict) or str(pres.get("status")) != "active":
+                                continue
+                            buyer_id = str(pres.get("buyer_user_id") or "")
+                            if not buyer_id:
+                                continue
+                            share = effective_company_share(company, buyer_id, country_name)
+                            if share <= 0:
+                                continue
+                            extra_expense = int(int(exp) * share)
+                            if extra_expense <= 0:
+                                continue
+                            user["наличка"] = int(user.get("наличка", 0)) - extra_expense
+                            ensure_user(buyer_id)["наличка"] = int(ensure_user(buyer_id).get("наличка", 0)) - extra_expense
+                            total_expense += extra_expense
+                            balances_changed_comp = True
                 company["last_expense_at"] = last_expense + cycles * expense_cd
                 comp_changed = True
                 if total_expense:
