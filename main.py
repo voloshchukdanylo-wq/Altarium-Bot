@@ -1653,13 +1653,9 @@ async def on_ready():
         bot.add_view(PartnershipPanelView())
         bot.add_view(InvestmentPanelView())
         bot.add_view(EventCreateButtonView())
-        bot.add_view(RegistrationPanelView())
         for req_id, req in events_data.get("requests", {}).items():
             if isinstance(req, dict) and req.get("status") == "sent":
                 bot.add_view(EventPlayerView(str(req_id), page=0))
-        for req_id, req in reg_settings.get("requests", {}).items():
-            if isinstance(req, dict) and req.get("status") == "pending":
-                bot.add_view(RegistrationRequestView(str(req_id), req=req))
         persistent_views_registered = True
     try:
         await restore_company_request_views()
@@ -16509,36 +16505,6 @@ class RegistrationRequestView(LayoutViewBase):
             await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
             return
         await interaction.response.send_modal(RegistrationRejectReasonModal(self.request_id))
-
-
-@bot.command(name="регканал")
-@commands.has_permissions(administrator=True)
-async def регканал(ctx, channel: discord.TextChannel):
-    reg_settings["panel_channel_id"] = channel.id
-    message = await send_registration_panel_message(channel)
-    reg_settings["panel_message_id"] = message.id
-    save_reg_settings()
-    await ctx.send(
-        embed=Embed(
-            title="✅ Канал регистрации настроен",
-            description=f"Панель отправлена в {channel.mention}.",
-            color=0x2ECC71,
-        )
-    )
-
-
-@bot.command(name="регзаявкиканал")
-@commands.has_permissions(administrator=True)
-async def регзаявкиканал(ctx, channel: discord.TextChannel):
-    reg_settings["requests_channel_id"] = channel.id
-    save_reg_settings()
-    await ctx.send(
-        embed=Embed(
-            title="✅ Канал заявок настроен",
-            description=f"Теперь заявки на регистрацию будут отправляться в {channel.mention}.",
-            color=0x2ECC71,
-        )
-    )
 
 
 class DescriptionEditModal(Modal):
