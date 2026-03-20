@@ -21,6 +21,12 @@ REGISTRATION_COMPONENTS_V2 = all((
     V2Container is not None,
     V2TextDisplay is not None,
 ))
+REGISTRATION_COMPONENTS_V2_ENABLED = os.getenv("ENABLE_DISCORD_COMPONENTS_V2", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 from flask import Flask
 
 # ================== CONFIG ==================
@@ -15937,7 +15943,7 @@ def build_registration_request_text(req: dict) -> str:
 
 
 def registration_supports_components_v2() -> bool:
-    return REGISTRATION_COMPONENTS_V2
+    return REGISTRATION_COMPONENTS_V2 and REGISTRATION_COMPONENTS_V2_ENABLED
 
 
 def build_registration_panel_payload() -> dict:
