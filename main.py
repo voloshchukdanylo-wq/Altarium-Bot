@@ -12,6 +12,15 @@ import discord
 from discord import ButtonStyle, Embed, Interaction, SelectOption
 from discord.ext import commands, tasks
 from discord.ui import Button, Modal, Select, TextInput, UserSelect, View
+
+LayoutViewBase = getattr(discord.ui, "LayoutView", View)
+V2Container = getattr(discord.ui, "Container", None)
+V2TextDisplay = getattr(discord.ui, "TextDisplay", None)
+REGISTRATION_COMPONENTS_V2 = all((
+    LayoutViewBase is not View,
+    V2Container is not None,
+    V2TextDisplay is not None,
+))
 from flask import Flask
 
 # ================== CONFIG ==================
@@ -1629,7 +1638,7 @@ async def on_ready():
                 bot.add_view(EventPlayerView(str(req_id), page=0))
         for req_id, req in reg_settings.get("requests", {}).items():
             if isinstance(req, dict) and req.get("status") == "pending":
-                bot.add_view(RegistrationRequestView(str(req_id)))
+                bot.add_view(RegistrationRequestView(str(req_id), req=req))
         persistent_views_registered = True
     try:
         await restore_company_request_views()
@@ -15891,6 +15900,77 @@ def build_registration_fields_text(fields: dict) -> str:
     return "\n".join(lines) if lines else "—"
 
 
+def registration_panel_text() -> str:
+    return (
+        "### 📝 Панель регистрации\n"
+        "Выберите тип регистрации в меню ниже.\n\n"
+        "Доступные варианты: **страна, регион, ЧВК, повстанцы, организация**."
+    )
+
+
+def build_registration_request_text(req: dict) -> str:
+    status_map = {
+        "pending": "🟡 На рассмотрении",
+        "approved": "✅ Принято",
+        "rejected": "❌ Отклонено",
+        "cancelled": "⚪ Остановлено",
+    }
+    lines = [
+        "### 📨 Заявка на регистрацию",
+        f"**ID:** #{req.get('id')}",
+        f"**Игрок:** <@{req.get('applicant_id')}>" if req.get('applicant_id') else "**Игрок:** —",
+        f"**За кого регистрация:** {req.get('entity_name', '—')}",
+        f"**Тип:** {req.get('entity_type_label', '—')}",
+        f"**Сезон:** {req.get('season', '—')}",
+        f"**Статус:** {status_map.get(req.get('status'), req.get('status', '—'))}",
+        "",
+        "**Данные заявки:**",
+        build_registration_fields_text(req.get('fields', {})),
+    ]
+    moderator_id = req.get('moderator_id')
+    if moderator_id:
+        lines.extend(["", f"**Модератор:** <@{moderator_id}>"])
+    reason = str(req.get('decision_reason') or '').strip()
+    if reason:
+        lines.extend(["", f"**Причина:** {reason}"])
+    return "\n".join(lines)
+
+
+def registration_supports_components_v2() -> bool:
+    return REGISTRATION_COMPONENTS_V2
+
+
+def build_registration_panel_payload() -> dict:
+    if registration_supports_components_v2():
+        return {"content": None, "embed": None, "view": RegistrationPanelView()}
+    return {
+        "content": None,
+        "embed": Embed(
+            title="📝 Панель регистрации",
+            description=(
+                "Выберите тип регистрации в меню ниже.\n\n"
+                "Доступные варианты: **страна, регион, ЧВК, повстанцы, организация**."
+            ),
+            color=0x5865F2,
+        ),
+        "view": RegistrationPanelView(),
+    }
+
+
+def build_registration_request_message_kwargs(req: dict) -> dict:
+    if registration_supports_components_v2():
+        return {
+            "content": f"<@{req.get('applicant_id')}>" if req.get('applicant_id') else None,
+            "embed": None,
+            "view": RegistrationRequestView(str(req.get('id')), req=req),
+        }
+    return {
+        "content": f"<@{req.get('applicant_id')}>" if req.get('applicant_id') else None,
+        "embed": build_registration_request_embed(req),
+        "view": RegistrationRequestView(str(req.get('id'))) if req.get('status') == 'pending' else None,
+    }
+
+
 def build_registration_request_embed(req: dict) -> Embed:
     status_map = {
         "pending": ("🟡 На рассмотрении", 0xF1C40F),
@@ -15927,8 +16007,7 @@ async def edit_registration_request_message(req: dict):
         return
     try:
         message = await channel.fetch_message(int(message_id))
-        view = RegistrationRequestView(str(req.get("id"))) if req.get("status") == "pending" else None
-        await message.edit(embed=build_registration_request_embed(req), view=view)
+        await message.edit(**build_registration_request_message_kwargs(req))
     except Exception:
         pass
 
@@ -15939,9 +16018,7 @@ def validate_registration_entity(reg_type: str, entity_name: str, season_name: s
         return None, None
 
     resolved = resolve_country_name(entity_name)
-    if reg_type in {"country", "region"}:
-        if not resolved:
-            raise ValueError("Запись не найдена в `!создатьстат` для активного сезона.")
+    if reg_type in {"country", "region"} and resolved:
         expected_type = config.get("entity_type")
         actual_type = get_country_type(resolved)
         if actual_type != expected_type:
@@ -16145,16 +16222,18 @@ class RegistrationModal(Modal):
             return
 
         if self.reg_type == "region":
-            parent_name = resolve_country_name(raw_fields.get("country", ""))
-            if not parent_name or get_country_type(parent_name) != "Государство":
+            parent_input = str(raw_fields.get("country", "")).strip()
+            if not parent_input:
                 await interaction.response.send_message(
-                    "❌ Для региона нужно указать существующее государство-владельца из статов.",
+                    "❌ Для региона нужно указать государство-владельца.",
                     ephemeral=True,
                 )
                 return
-            if get_country_population_for_season(parent_name, active_season) is None:
+            resolved_parent = resolve_country_name(parent_input)
+            parent_name = resolved_parent or parent_input
+            if resolved_parent and get_country_type(parent_name) != "Государство":
                 await interaction.response.send_message(
-                    f"❌ Государство **{parent_name}** не существует в сезоне **{active_season}**.",
+                    "❌ Для региона в поле государства нужно указать государство, а не другой тип формирования.",
                     ephemeral=True,
                 )
                 return
@@ -16220,11 +16299,7 @@ class RegistrationModal(Modal):
             )
             return
 
-        message = await requests_channel.send(
-            content=f"<@{interaction.user.id}>",
-            embed=build_registration_request_embed(request_data),
-            view=RegistrationRequestView(request_id),
-        )
+        message = await requests_channel.send(**build_registration_request_message_kwargs(request_data))
         request_data["request_message_id"] = message.id
         save_reg_settings()
 
@@ -16256,9 +16331,15 @@ class RegistrationTypeSelect(Select):
         await interaction.response.send_modal(RegistrationModal(reg_type))
 
 
-class RegistrationPanelView(View):
+class RegistrationPanelView(LayoutViewBase):
     def __init__(self):
         super().__init__(timeout=None)
+        if registration_supports_components_v2():
+            container = V2Container()
+            container.add_item(V2TextDisplay(registration_panel_text()))
+            self.add_item(container)
+            self.add_item(RegistrationTypeSelect())
+            return
         self.add_item(RegistrationTypeSelect())
 
 
@@ -16288,10 +16369,34 @@ class RegistrationRejectReasonModal(Modal):
         )
 
 
-class RegistrationRequestView(View):
-    def __init__(self, request_id: str):
+class RegistrationRequestView(LayoutViewBase):
+    def __init__(self, request_id: str, req: dict | None = None):
         super().__init__(timeout=None)
         self.request_id = str(request_id)
+        self.req = req
+
+        if registration_supports_components_v2():
+            current_req = req or reg_settings.setdefault("requests", {}).get(self.request_id, {})
+            container = V2Container()
+            container.add_item(V2TextDisplay(build_registration_request_text(current_req or {})))
+            self.add_item(container)
+            if (current_req or {}).get("status") != "pending":
+                return
+            approve_btn = Button(
+                label="Принять",
+                style=ButtonStyle.success,
+                custom_id=f"reg:request:approve:{self.request_id}",
+            )
+            reject_btn = Button(
+                label="Отклонить",
+                style=ButtonStyle.danger,
+                custom_id=f"reg:request:reject:{self.request_id}",
+            )
+            approve_btn.callback = self.approve
+            reject_btn.callback = self.reject
+            self.add_item(approve_btn)
+            self.add_item(reject_btn)
+            return
 
         approve_btn = Button(
             label="Принять",
@@ -16324,10 +16429,7 @@ class RegistrationRequestView(View):
             return
         ok, message = await finalize_registration_request(req, interaction.user)
         if req.get("status") != "pending":
-            await interaction.response.edit_message(
-                embed=build_registration_request_embed(req),
-                view=None,
-            )
+            await interaction.response.edit_message(**build_registration_request_message_kwargs(req))
             await interaction.followup.send(message, ephemeral=True)
             return
         await interaction.response.send_message(message, ephemeral=True)
@@ -16344,15 +16446,7 @@ class RegistrationRequestView(View):
 @commands.has_permissions(administrator=True)
 async def регканал(ctx, channel: discord.TextChannel):
     reg_settings["panel_channel_id"] = channel.id
-    panel_embed = Embed(
-        title="📝 Панель регистрации",
-        description=(
-            "Выберите тип регистрации в меню ниже.\n\n"
-            "Доступные варианты: **страна, регион, ЧВК, повстанцы, организация**."
-        ),
-        color=0x5865F2,
-    )
-    message = await channel.send(embed=panel_embed, view=RegistrationPanelView())
+    message = await channel.send(**build_registration_panel_payload())
     reg_settings["panel_message_id"] = message.id
     save_reg_settings()
     await ctx.send(
