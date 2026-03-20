@@ -27,6 +27,7 @@ REGISTRATION_COMPONENTS_V2_ENABLED = os.getenv("ENABLE_DISCORD_COMPONENTS_V2", "
     "yes",
     "on",
 }
+REGISTRATION_COMPONENTS_V2_RUNTIME_ENABLED = REGISTRATION_COMPONENTS_V2 and REGISTRATION_COMPONENTS_V2_ENABLED
 from flask import Flask
 
 # ================== CONFIG ==================
@@ -15943,7 +15944,23 @@ def build_registration_request_text(req: dict) -> str:
 
 
 def registration_supports_components_v2() -> bool:
-    return REGISTRATION_COMPONENTS_V2 and REGISTRATION_COMPONENTS_V2_ENABLED
+    return REGISTRATION_COMPONENTS_V2_RUNTIME_ENABLED
+
+
+def disable_registration_components_v2():
+    global REGISTRATION_COMPONENTS_V2_RUNTIME_ENABLED
+    REGISTRATION_COMPONENTS_V2_RUNTIME_ENABLED = False
+
+
+def registration_components_v2_unsupported(exc: Exception) -> bool:
+    if not isinstance(exc, discord.HTTPException):
+        return False
+    message = str(exc).lower()
+    return (
+        'invalid form body' in message
+        and 'components.0' in message
+        and 'value of field "type" must be one of' in message
+    )
 
 
 def build_registration_panel_payload() -> dict:
@@ -15975,6 +15992,26 @@ def build_registration_request_message_kwargs(req: dict) -> dict:
         "embed": build_registration_request_embed(req),
         "view": RegistrationRequestView(str(req.get('id'))) if req.get('status') == 'pending' else None,
     }
+
+
+async def send_registration_panel_message(channel: discord.abc.Messageable):
+    try:
+        return await channel.send(**build_registration_panel_payload())
+    except discord.HTTPException as exc:
+        if not registration_supports_components_v2() or not registration_components_v2_unsupported(exc):
+            raise
+        disable_registration_components_v2()
+        return await channel.send(**build_registration_panel_payload())
+
+
+async def send_registration_request_message(channel: discord.abc.Messageable, req: dict):
+    try:
+        return await channel.send(**build_registration_request_message_kwargs(req))
+    except discord.HTTPException as exc:
+        if not registration_supports_components_v2() or not registration_components_v2_unsupported(exc):
+            raise
+        disable_registration_components_v2()
+        return await channel.send(**build_registration_request_message_kwargs(req))
 
 
 def build_registration_request_embed(req: dict) -> Embed:
@@ -16013,7 +16050,13 @@ async def edit_registration_request_message(req: dict):
         return
     try:
         message = await channel.fetch_message(int(message_id))
-        await message.edit(**build_registration_request_message_kwargs(req))
+        try:
+            await message.edit(**build_registration_request_message_kwargs(req))
+        except discord.HTTPException as exc:
+            if not registration_supports_components_v2() or not registration_components_v2_unsupported(exc):
+                raise
+            disable_registration_components_v2()
+            await message.edit(**build_registration_request_message_kwargs(req))
     except Exception:
         pass
 
@@ -16305,7 +16348,7 @@ class RegistrationModal(Modal):
             )
             return
 
-        message = await requests_channel.send(**build_registration_request_message_kwargs(request_data))
+        message = await send_registration_request_message(requests_channel, request_data)
         request_data["request_message_id"] = message.id
         save_reg_settings()
 
@@ -16452,7 +16495,7 @@ class RegistrationRequestView(LayoutViewBase):
 @commands.has_permissions(administrator=True)
 async def регканал(ctx, channel: discord.TextChannel):
     reg_settings["panel_channel_id"] = channel.id
-    message = await channel.send(**build_registration_panel_payload())
+    message = await send_registration_panel_message(channel)
     reg_settings["panel_message_id"] = message.id
     save_reg_settings()
     await ctx.send(
