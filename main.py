@@ -135,7 +135,14 @@ inventory = load_json(INVENTORY_FILE, {})
 server_inventory = load_json(SERVER_INVENTORY_FILE, {"users": {}})
 country_stats = load_json(COUNTRY_STATS_FILE, {})
 country_owners = load_json(
-    COUNTRY_OWNERS_FILE, {"country_to_user": {}, "user_to_country": {}}
+    COUNTRY_OWNERS_FILE,
+    {
+        "country_to_user": {},
+        "user_to_country": {},
+        "season_country_to_user": {},
+        "season_user_to_country": {},
+        "user_profiles": {},
+    },
 )
 passive_flows = load_json(PASSIVE_FLOW_FILE, {"users": {}})
 command_access = load_json(COMMAND_ACCESS_FILE, {"commands": {}})
@@ -164,6 +171,11 @@ reg_settings = load_json(
         "roles_remove": [],
         "wipe_roles": [],
         "wipe_role_exclusions": [],
+        "panel_channel_id": None,
+        "requests_channel_id": None,
+        "panel_message_id": None,
+        "requests": {},
+        "next_request_id": 1,
     },
 )
 player_state = load_json(PLAYER_STATE_FILE, {"users": {}})
@@ -281,11 +293,19 @@ persistent_views_registered = False
 automod_link_tracker = {}
 country_owners.setdefault("country_to_user", {})
 country_owners.setdefault("user_to_country", {})
+country_owners.setdefault("season_country_to_user", {})
+country_owners.setdefault("season_user_to_country", {})
+country_owners.setdefault("user_profiles", {})
 sphere_requests.setdefault("result_channel_id", None)
 reg_settings.setdefault("roles_add", reg_settings.get("roles", []))
 reg_settings.setdefault("roles_remove", [])
 reg_settings.setdefault("wipe_roles", [])
 reg_settings.setdefault("wipe_role_exclusions", [])
+reg_settings.setdefault("panel_channel_id", None)
+reg_settings.setdefault("requests_channel_id", None)
+reg_settings.setdefault("panel_message_id", None)
+reg_settings.setdefault("requests", {})
+reg_settings.setdefault("next_request_id", 1)
 server_inventory.setdefault("users", {})
 investments.setdefault("requests", {})
 investments.setdefault("next_id", 1)
@@ -650,7 +670,7 @@ def save_companies_data():
 
 
 def is_registered_player(user_id: str) -> bool:
-    return str(user_id) in country_owners.setdefault("user_to_country", {})
+    return user_has_any_registration(str(user_id))
 
 
 def calculate_company_level(income_amount: str, income_cooldown: int) -> tuple[str, int]:
@@ -1079,9 +1099,7 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
             str(r.get("decision_user_id", "")),
         }
     }
-    old_country = country_owners.setdefault("user_to_country", {}).pop(user_id, None)
-    if old_country:
-        country_owners.setdefault("country_to_user", {}).pop(old_country, None)
+    remove_user_registration(user_id)
     save_json(BALANCES_FILE, balances)
     save_inventory()
     save_json(POPULATION_FILE, pop)
@@ -1605,9 +1623,13 @@ async def on_ready():
         bot.add_view(PartnershipPanelView())
         bot.add_view(InvestmentPanelView())
         bot.add_view(EventCreateButtonView())
+        bot.add_view(RegistrationPanelView())
         for req_id, req in events_data.get("requests", {}).items():
             if isinstance(req, dict) and req.get("status") == "sent":
                 bot.add_view(EventPlayerView(str(req_id), page=0))
+        for req_id, req in reg_settings.get("requests", {}).items():
+            if isinstance(req, dict) and req.get("status") == "pending":
+                bot.add_view(RegistrationRequestView(str(req_id)))
         persistent_views_registered = True
     try:
         await restore_company_request_views()
@@ -3825,7 +3847,9 @@ async def установитьсезон(ctx, year: str):
 
     seasons_data["active_season"] = selected
     get_season_progress_map(selected)
+    sync_legacy_occupied_maps_for_active_season()
     save_seasons_data()
+    save_country_owners()
     await ctx.send(
         embed=Embed(
             title="✅ Активный сезон",
@@ -7415,8 +7439,14 @@ def ensure_company_country_presence_struct(company: dict):
 
 
 def get_country_name_by_user_id(user_id: str) -> str | None:
-    country_to_user, user_to_country = get_occupied_country_map()
-    return user_to_country.get(str(user_id))
+    _, user_to_country = get_occupied_country_map()
+    current = user_to_country.get(str(user_id))
+    if current:
+        return current
+    profile = country_owners.setdefault("user_profiles", {}).get(str(user_id), {})
+    if isinstance(profile, dict):
+        return profile.get("active_country")
+    return None
 
 
 def get_owner_country_of_company(company: dict) -> str | None:
@@ -10457,6 +10487,33 @@ def save_country_owners():
     save_json(COUNTRY_OWNERS_FILE, country_owners)
 
 
+def get_active_registration_season() -> str:
+    return str(seasons_data.get("active_season") or "").strip()
+
+
+def get_registration_profile(user_id: str):
+    return country_owners.setdefault("user_profiles", {}).setdefault(
+        str(user_id),
+        {
+            "active_country": None,
+            "active_season": None,
+            "registrations": {},
+        },
+    )
+
+
+def ensure_registration_maps():
+    country_owners.setdefault("country_to_user", {})
+    country_owners.setdefault("user_to_country", {})
+    country_owners.setdefault("season_country_to_user", {})
+    country_owners.setdefault("season_user_to_country", {})
+    country_owners.setdefault("user_profiles", {})
+    season_country_to_user = country_owners.setdefault("season_country_to_user", {})
+    season_user_to_country = country_owners.setdefault("season_user_to_country", {})
+    country_owners.setdefault("user_profiles", {})
+    return season_country_to_user, season_user_to_country
+
+
 def resolve_country_name(raw_country: str):
     if raw_country in country_stats:
         return raw_country
@@ -10517,9 +10574,29 @@ def set_country_population_for_season(
         record["type"] = country_type
 
 
-def get_occupied_country_map():
-    country_to_user = country_owners.setdefault("country_to_user", {})
-    user_to_country = country_owners.setdefault("user_to_country", {})
+def user_has_any_registration(user_id: str) -> bool:
+    uid = str(user_id)
+    _, season_user_to_country = ensure_registration_maps()
+    if uid in country_owners.setdefault("user_to_country", {}):
+        return True
+    for mapping in season_user_to_country.values():
+        if uid in mapping:
+            return True
+    profile = country_owners.setdefault("user_profiles", {}).get(uid, {})
+    registrations = profile.get("registrations") if isinstance(profile, dict) else {}
+    return bool(registrations)
+
+
+def get_occupied_country_map(season_name: str = None):
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    active_season = str(season_name or get_active_registration_season() or "").strip()
+
+    if active_season:
+        country_to_user = season_country_to_user.setdefault(active_season, {})
+        user_to_country = season_user_to_country.setdefault(active_season, {})
+    else:
+        country_to_user = country_owners.setdefault("country_to_user", {})
+        user_to_country = country_owners.setdefault("user_to_country", {})
 
     # Ленивая синхронизация из player_stats для старых данных
     players = load_json(PLAYER_STATS_FILE, {})
@@ -10527,21 +10604,144 @@ def get_occupied_country_map():
     for uid, pdata in players.items():
         if not isinstance(pdata, dict) or not pdata:
             continue
-        current = user_to_country.get(str(uid))
-        if current:
+        target_country = None
+        target_season = active_season
+        if active_season:
+            for country_name, season_map in pdata.items():
+                if not isinstance(season_map, dict):
+                    continue
+                if active_season in season_map:
+                    target_country = country_name
+                    break
+        else:
+            target_country = next(iter(pdata.keys()), None)
+            if target_country:
+                season_map = pdata.get(target_country, {})
+                if isinstance(season_map, dict) and season_map:
+                    target_season = next(iter(season_map.keys()), None)
+        if not target_country:
             continue
-        first_country = next(iter(pdata.keys()), None)
-        if not first_country:
+
+        uid = str(uid)
+        if uid in user_to_country:
             continue
-        if first_country not in country_to_user:
-            user_to_country[str(uid)] = first_country
-            country_to_user[first_country] = str(uid)
-            changed = True
+        if target_country in country_to_user:
+            continue
+
+        user_to_country[uid] = target_country
+        country_to_user[target_country] = uid
+        if target_season:
+            season_country_to_user.setdefault(str(target_season), {}).setdefault(target_country, uid)
+            season_user_to_country.setdefault(str(target_season), {}).setdefault(uid, target_country)
+            profile = get_registration_profile(uid)
+            profile.setdefault("registrations", {}).setdefault(
+                str(target_season), {"country": target_country, "status": "legacy"}
+            )
+            if not profile.get("active_country"):
+                profile["active_country"] = target_country
+            if not profile.get("active_season"):
+                profile["active_season"] = str(target_season)
+        changed = True
+
+    if active_season:
+        country_owners["country_to_user"] = dict(country_to_user)
+        country_owners["user_to_country"] = dict(user_to_country)
 
     if changed:
         save_country_owners()
 
     return country_to_user, user_to_country
+
+
+def set_user_registration(user_id: str, country_name: str, season_name: str, payload: dict | None = None):
+    uid = str(user_id)
+    season_key = str(season_name or "").strip()
+    if not season_key:
+        raise ValueError("season_name is required")
+
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    season_country_to_user.setdefault(season_key, {})[country_name] = uid
+    season_user_to_country.setdefault(season_key, {})[uid] = country_name
+
+    profile = get_registration_profile(uid)
+    registrations = profile.setdefault("registrations", {})
+    record = dict(payload or {})
+    record["country"] = country_name
+    record["season"] = season_key
+    registrations[season_key] = record
+    profile["active_country"] = country_name
+    profile["active_season"] = season_key
+
+    active_season = get_active_registration_season()
+    if not active_season or active_season == season_key:
+        country_owners["country_to_user"] = dict(season_country_to_user.get(season_key, {}))
+        country_owners["user_to_country"] = dict(season_user_to_country.get(season_key, {}))
+
+
+def remove_user_registration(user_id: str, season_name: str = None):
+    uid = str(user_id)
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    target_seasons = [str(season_name)] if season_name else list(season_user_to_country.keys())
+
+    profile = country_owners.setdefault("user_profiles", {}).get(uid)
+    active_changed = False
+    for season_key in list(target_seasons):
+        season_key = str(season_key or "").strip()
+        if not season_key:
+            continue
+        country_name = season_user_to_country.setdefault(season_key, {}).pop(uid, None)
+        if country_name:
+            season_country_to_user.setdefault(season_key, {}).pop(country_name, None)
+            active_changed = True
+        if isinstance(profile, dict):
+            profile.setdefault("registrations", {}).pop(season_key, None)
+
+    if isinstance(profile, dict):
+        registrations = profile.get("registrations", {})
+        if registrations:
+            last_season = next(reversed(registrations))
+            profile["active_season"] = last_season
+            profile["active_country"] = registrations[last_season].get("country")
+        else:
+            profile["active_season"] = None
+            profile["active_country"] = None
+    else:
+        country_owners.setdefault("user_profiles", {}).pop(uid, None)
+
+    active_season = get_active_registration_season()
+    if active_changed:
+        if active_season:
+            country_owners["country_to_user"] = dict(season_country_to_user.get(active_season, {}))
+            country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
+        else:
+            country_owners["country_to_user"] = {}
+            country_owners["user_to_country"] = {}
+
+
+def remove_country_registration(country_name: str):
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    for season_key, mapping in season_country_to_user.items():
+        uid = mapping.pop(country_name, None)
+        if uid:
+            season_user_to_country.setdefault(season_key, {}).pop(str(uid), None)
+            profile = country_owners.setdefault("user_profiles", {}).get(str(uid))
+            if isinstance(profile, dict):
+                profile.setdefault("registrations", {}).pop(season_key, None)
+    active_season = get_active_registration_season()
+    if active_season:
+        country_owners["country_to_user"] = dict(season_country_to_user.get(active_season, {}))
+        country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
+
+
+def sync_legacy_occupied_maps_for_active_season():
+    active_season = get_active_registration_season()
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    if active_season:
+        country_owners["country_to_user"] = dict(season_country_to_user.get(active_season, {}))
+        country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
+    else:
+        country_owners["country_to_user"] = {}
+        country_owners["user_to_country"] = {}
 
 
 def save_moderation_data():
@@ -14672,6 +14872,13 @@ async def wipe_all(ctx):
                 for uid, data in player_state.get("users", {}).items()
                 if isinstance(data, dict)
             }
+            registered_user_ids = {
+                str(uid)
+                for season_map in country_owners.get("season_user_to_country", {}).values()
+                if isinstance(season_map, dict)
+                for uid in season_map.keys()
+            }
+            registered_user_ids.update(str(uid) for uid in country_owners.get("user_to_country", {}).keys())
             player_state["users"] = {}
             investments["users"] = {}
             companies_data["companies"] = {}
@@ -14680,6 +14887,9 @@ async def wipe_all(ctx):
             companies_data["next_request_id"] = 1
             country_owners["country_to_user"] = {}
             country_owners["user_to_country"] = {}
+            country_owners["season_country_to_user"] = {}
+            country_owners["season_user_to_country"] = {}
+            country_owners["user_profiles"] = {}
             save_player_state()
             save_investments()
             save_companies_data()
@@ -14689,11 +14899,12 @@ async def wipe_all(ctx):
                 if m.bot:
                     continue
                 try:
-                    await restore_member_roles_after_wipe(
-                        m,
-                        pre_reg_roles_map.get(str(m.id), []),
-                        reason="Глобальный вайп",
-                    )
+                    if str(m.id) in registered_user_ids:
+                        await restore_member_roles_after_wipe(
+                            m,
+                            pre_reg_roles_map.get(str(m.id), []),
+                            reason="Глобальный вайп",
+                        )
                     await m.edit(nick=None, reason="Глобальный вайп")
                 except Exception:
                     pass
@@ -14814,6 +15025,9 @@ async def undo_wipe(ctx):
     )
     country_owners.setdefault("country_to_user", {})
     country_owners.setdefault("user_to_country", {})
+    country_owners.setdefault("season_country_to_user", {})
+    country_owners.setdefault("season_user_to_country", {})
+    country_owners.setdefault("user_profiles", {})
     save_country_owners()
 
     await ctx.send(
@@ -14844,7 +15058,7 @@ async def wipe_player(ctx, member: discord.Member):
         str(c.get("owner_id")) == user_id
         for c in companies_data.setdefault("companies", {}).values()
     )
-    user_has_country = user_id in country_owners.setdefault("user_to_country", {})
+    user_has_country = user_has_any_registration(user_id)
 
     if not any(
         [
@@ -14960,11 +15174,7 @@ async def wipe_player(ctx, member: discord.Member):
                     str(r.get("decision_user_id", "")),
                 }
             }
-            old_country = country_owners.setdefault("user_to_country", {}).pop(
-                user_id, None
-            )
-            if old_country:
-                country_owners.setdefault("country_to_user", {}).pop(old_country, None)
+            remove_user_registration(user_id)
 
             save_json(BALANCES_FILE, balances)
             save_inventory()
@@ -14978,9 +15188,10 @@ async def wipe_player(ctx, member: discord.Member):
             save_country_owners()
 
             try:
-                await restore_member_roles_after_wipe(
-                    member, pre_reg_roles, reason="Вайп игрока"
-                )
+                if user_has_country or pre_reg_roles:
+                    await restore_member_roles_after_wipe(
+                        member, pre_reg_roles, reason="Вайп игрока"
+                    )
                 await member.edit(nick=None, reason="Вайп игрока")
             except Exception:
                 pass
@@ -15203,10 +15414,7 @@ async def удалитьстат(ctx, *, country: str):
         )
         return
 
-    country_to_user, user_to_country = get_occupied_country_map()
-    owner_id = country_to_user.pop(resolved_country, None)
-    if owner_id is not None:
-        user_to_country.pop(str(owner_id), None)
+    remove_country_registration(resolved_country)
 
     country_stats.pop(resolved_country, None)
     save_json(COUNTRY_STATS_FILE, country_stats)
@@ -15354,7 +15562,18 @@ async def рег(ctx, member: discord.Member, country: str, year: str):
         )
         return
 
-    country_to_user, user_to_country = get_occupied_country_map()
+    active_season = get_active_registration_season()
+    if active_season and year_str != active_season:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка регистрации",
+                description=f"Сейчас активен сезон **{active_season}**, поэтому регистрация в сезон **{year_str}** недоступна.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    country_to_user, user_to_country = get_occupied_country_map(year_str)
     current_country = user_to_country.get(user_id)
     occupied_by = country_to_user.get(resolved_country)
 
@@ -15390,8 +15609,16 @@ async def рег(ctx, member: discord.Member, country: str, year: str):
             year_str
         ] = population_value
         save_json(PLAYER_STATS_FILE, players)
-        user_to_country[user_id] = resolved_country
-        country_to_user[resolved_country] = user_id
+        set_user_registration(
+            user_id,
+            resolved_country,
+            year_str,
+            {
+                "type": get_country_type(resolved_country),
+                "status": "approved",
+                "source": "manual_command",
+            },
+        )
         save_country_owners()
 
         def check(m):
@@ -15413,9 +15640,10 @@ async def рег(ctx, member: discord.Member, country: str, year: str):
             pass
 
         state = ensure_player_state(user_id)
-        state["pre_reg_role_ids"] = [
-            r.id for r in member.roles if r != ctx.guild.default_role and not r.managed
-        ]
+        if not state.get("pre_reg_role_ids"):
+            state["pre_reg_role_ids"] = [
+                r.id for r in member.roles if r != ctx.guild.default_role and not r.managed
+            ]
         now_ts = int(time.time())
         state["shield_until"] = now_ts + 2 * 24 * 3600
         state["happiness"] = 50
@@ -15514,12 +15742,23 @@ async def рег(ctx, member: discord.Member, country: str, year: str):
 
 @bot.command(name="занятстраны")
 async def занятстраны(ctx):
-    country_to_user, _ = get_occupied_country_map()
+    active_season = get_active_registration_season()
+    if not active_season:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Сначала установите активный сезон командой `!установитьсезон`.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    country_to_user, _ = get_occupied_country_map(active_season)
     if not country_to_user:
         await ctx.send(
             embed=Embed(
-                title="🌍 Занятые страны",
-                description="Пока нет занятых стран.",
+                title=f"🌍 Занятые страны сезона {active_season}",
+                description="Пока нет занятых стран в активном сезоне.",
                 color=0x3498DB,
             )
         )
@@ -15536,21 +15775,38 @@ async def занятстраны(ctx):
 
     await ctx.send(
         embed=Embed(
-            title="🌍 Занятые страны", description="\n".join(lines), color=0x3498DB
+            title=f"🌍 Занятые страны сезона {active_season}",
+            description="\n".join(lines),
+            color=0x3498DB,
         )
     )
 
 
 @bot.command(name="свободстраны")
 async def свободстраны(ctx):
-    country_to_user, _ = get_occupied_country_map()
-    free = [c for c in country_stats.keys() if c not in country_to_user]
+    active_season = get_active_registration_season()
+    if not active_season:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description="Сначала установите активный сезон командой `!установитьсезон`.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    country_to_user, _ = get_occupied_country_map(active_season)
+    free = [
+        c
+        for c in country_stats.keys()
+        if get_country_population_for_season(c, active_season) is not None and c not in country_to_user
+    ]
 
     if not free:
         await ctx.send(
             embed=Embed(
                 title="🟢 Свободные страны",
-                description="Свободных стран нет.",
+                description=f"Свободных стран в сезоне **{active_season}** нет.",
                 color=0x00AA55,
             )
         )
@@ -15561,7 +15817,564 @@ async def свободстраны(ctx):
         for c in sorted(free, key=lambda x: str(x).casefold())
     )
     await ctx.send(
-        embed=Embed(title="🟢 Свободные страны", description=desc, color=0x00AA55)
+        embed=Embed(
+            title=f"🟢 Свободные страны сезона {active_season}",
+            description=desc,
+            color=0x00AA55,
+        )
+    )
+
+
+REGISTRATION_TYPE_CONFIG = {
+    "country": {
+        "label": "страна",
+        "title": "Регистрация: страна",
+        "entity_type": "Государство",
+        "fields": [
+            ("entity_name", "Название страны", "Например: Германия", True, discord.TextStyle.short, 120),
+            ("government", "Форма правления", "Например: Республика", True, discord.TextStyle.short, 120),
+            ("ideology", "Идеология", "Например: Демократия", True, discord.TextStyle.short, 120),
+            ("religion", "Религия", "Например: Светское государство", True, discord.TextStyle.short, 120),
+        ],
+    },
+    "region": {
+        "label": "регион",
+        "title": "Регистрация: регион",
+        "entity_type": "Регион",
+        "fields": [
+            ("entity_name", "Название региона", "Например: Бавария", True, discord.TextStyle.short, 120),
+            ("country", "В какой стране регион", "Например: Германия", True, discord.TextStyle.short, 120),
+            ("flag", "Флаг региона по эмодзи", "Например: 🏴", False, discord.TextStyle.short, 20),
+        ],
+    },
+    "pmc": {
+        "label": "чвк",
+        "title": "Регистрация: ЧВК",
+        "entity_type": "ЧВК",
+        "fields": [
+            ("entity_name", "Название ЧВК", "Например: Black Guard", True, discord.TextStyle.short, 120),
+            ("country", "Страна базирования", "Например: Германия", True, discord.TextStyle.short, 120),
+            ("specialization", "Специализация", "Война, охрана, диверсии, партизаны", True, discord.TextStyle.short, 200),
+        ],
+    },
+    "rebels": {
+        "label": "повстанец",
+        "title": "Регистрация: повстанцы",
+        "entity_type": "Повстанцы",
+        "fields": [
+            ("entity_name", "Название", "Например: Свободный фронт", True, discord.TextStyle.short, 120),
+            ("goal", "Цель восстания", "Что хотят добиться", True, discord.TextStyle.short, 200),
+            ("ideology", "Идеология", "Например: Национализм", True, discord.TextStyle.short, 120),
+            ("reason", "Причина восстания", "Почему началось восстание", True, discord.TextStyle.paragraph, 400),
+            ("location", "Регион/страна", "Где действует движение", True, discord.TextStyle.short, 120),
+        ],
+    },
+    "organization": {
+        "label": "организация",
+        "title": "Регистрация: организация",
+        "entity_type": "Организация",
+        "fields": [
+            ("entity_name", "Название", "Например: Красный Крест", True, discord.TextStyle.short, 120),
+            ("org_type", "Тип организации", "Терроризм, гуманитарная помощь и т.д.", True, discord.TextStyle.short, 200),
+            ("goal", "Цель существования", "Зачем существует организация", True, discord.TextStyle.paragraph, 400),
+            ("country", "Страна базирования", "Например: Германия", True, discord.TextStyle.short, 120),
+        ],
+    },
+}
+
+
+def build_registration_fields_text(fields: dict) -> str:
+    lines = []
+    for key, value in fields.items():
+        pretty = str(key).replace("_", " ").strip().capitalize()
+        lines.append(f"**{pretty}:** {value or '—'}")
+    return "\n".join(lines) if lines else "—"
+
+
+def build_registration_request_embed(req: dict) -> Embed:
+    status_map = {
+        "pending": ("🟡 На рассмотрении", 0xF1C40F),
+        "approved": ("✅ Принято", 0x2ECC71),
+        "rejected": ("❌ Отклонено", 0xE74C3C),
+        "cancelled": ("⚪ Остановлено", 0x95A5A6),
+    }
+    status_label, color = status_map.get(req.get("status"), (req.get("status", "—"), 0x3498DB))
+    embed = Embed(title=f"📨 Заявка на регистрацию #{req.get('id')}", color=color)
+    embed.description = (
+        f"**Игрок:** <@{req.get('applicant_id')}>\n"
+        f"**За кого регистрация:** {req.get('entity_name', '—')}\n"
+        f"**Тип:** {req.get('entity_type_label', '—')}\n"
+        f"**Сезон:** {req.get('season', '—')}\n"
+        f"**Статус:** {status_label}"
+    )
+    embed.add_field(name="Данные заявки", value=build_registration_fields_text(req.get("fields", {})), inline=False)
+    moderator_id = req.get("moderator_id")
+    if moderator_id:
+        embed.add_field(name="Модератор", value=f"<@{moderator_id}>", inline=True)
+    reason = str(req.get("decision_reason") or "").strip()
+    if reason:
+        embed.add_field(name="Причина", value=reason[:1024], inline=False)
+    return embed
+
+
+async def edit_registration_request_message(req: dict):
+    channel_id = req.get("request_channel_id")
+    message_id = req.get("request_message_id")
+    if not channel_id or not message_id:
+        return
+    channel = await get_channel_safe(channel_id)
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(int(message_id))
+        view = RegistrationRequestView(str(req.get("id"))) if req.get("status") == "pending" else None
+        await message.edit(embed=build_registration_request_embed(req), view=view)
+    except Exception:
+        pass
+
+
+def validate_registration_entity(reg_type: str, entity_name: str, season_name: str):
+    config = REGISTRATION_TYPE_CONFIG.get(reg_type)
+    if not config:
+        return None, None
+
+    resolved = resolve_country_name(entity_name)
+    if reg_type in {"country", "region"}:
+        if not resolved:
+            raise ValueError("Запись не найдена в `!создатьстат` для активного сезона.")
+        expected_type = config.get("entity_type")
+        actual_type = get_country_type(resolved)
+        if actual_type != expected_type:
+            raise ValueError(f"Нужен тип `{expected_type}`, а найден `{actual_type}`.")
+        if get_country_population_for_season(resolved, season_name) is None:
+            raise ValueError(f"{expected_type} **{resolved}** не существует в сезоне **{season_name}**.")
+        return resolved, get_country_population_for_season(resolved, season_name)
+
+    if resolved and get_country_population_for_season(resolved, season_name) is None:
+        raise ValueError(f"Формирование **{resolved}** существует в другом сезоне. Сейчас активен сезон **{season_name}**.")
+    return resolved or entity_name, get_country_population_for_season(resolved, season_name) if resolved else None
+
+
+async def finalize_registration_request(req: dict, moderator: discord.abc.User):
+    guild = bot.get_guild(int(req.get("guild_id", 0)))
+    if guild is None:
+        try:
+            guild = await bot.fetch_guild(int(req.get("guild_id", 0)))
+        except Exception:
+            guild = None
+
+    member = guild.get_member(int(req.get("applicant_id", 0))) if guild else None
+    if member is None and guild:
+        try:
+            member = await guild.fetch_member(int(req.get("applicant_id", 0)))
+        except Exception:
+            member = None
+
+    if member is None:
+        req["status"] = "cancelled"
+        req["moderator_id"] = moderator.id
+        req["decision_reason"] = "игрок покинул сервер"
+        save_reg_settings()
+        await edit_registration_request_message(req)
+        return False, "Игрок покинул сервер. Заявка остановлена автоматически."
+
+    country_to_user, user_to_country = get_occupied_country_map(req.get("season"))
+    current_country = user_to_country.get(str(member.id))
+    entity_name = req.get("entity_name")
+    occupied_by = country_to_user.get(entity_name)
+
+    if current_country and current_country != entity_name:
+        return False, f"Игрок уже зарегистрирован в сезоне **{req.get('season')}** за **{current_country}**."
+    if occupied_by and str(occupied_by) != str(member.id):
+        return False, f"**{entity_name}** уже занято другим игроком в сезоне **{req.get('season')}**."
+
+    ensure_user(str(member.id))
+    population_data = load_json(POPULATION_FILE, {})
+    players = load_json(PLAYER_STATS_FILE, {})
+    population_value = req.get("population")
+    if isinstance(population_value, int) and population_value > 0 and (str(member.id) not in population_data or population_data[str(member.id)] == 0):
+        population_data[str(member.id)] = population_value
+        save_json(POPULATION_FILE, population_data)
+
+    if isinstance(population_value, int) and population_value > 0:
+        players.setdefault(str(member.id), {}).setdefault(entity_name, {})[str(req.get("season"))] = population_value
+        save_json(PLAYER_STATS_FILE, players)
+
+    state = ensure_player_state(str(member.id))
+    if not state.get("pre_reg_role_ids"):
+        state["pre_reg_role_ids"] = [
+            r.id for r in member.roles if r != guild.default_role and not r.managed
+        ]
+    now_ts = int(time.time())
+    state["shield_until"] = now_ts + 2 * 24 * 3600
+    state["happiness"] = 50
+    state["happiness_pause_until"] = max(int(state.get("happiness_pause_until", 0)), state["shield_until"])
+    state["last_happiness_tick"] = now_ts
+    save_player_state()
+
+    set_user_registration(
+        str(member.id),
+        entity_name,
+        str(req.get("season")),
+        {
+            "type": req.get("entity_type_label"),
+            "status": "approved",
+            "source": "registration_panel",
+            "request_id": req.get("id"),
+            "fields": req.get("fields", {}),
+        },
+    )
+    save_country_owners()
+
+    for rid in reg_settings.get("roles_add", reg_settings.get("roles", [])):
+        role = guild.get_role(int(rid)) if str(rid).isdigit() else None
+        if role:
+            try:
+                await member.add_roles(role, reason=f"Принята заявка на регистрацию #{req.get('id')}")
+            except Exception:
+                pass
+
+    for rid in reg_settings.get("roles_remove", []):
+        role = guild.get_role(int(rid)) if str(rid).isdigit() else None
+        if role:
+            try:
+                await member.remove_roles(role, reason=f"Принята заявка на регистрацию #{req.get('id')}")
+            except Exception:
+                pass
+
+    req["status"] = "approved"
+    req["moderator_id"] = moderator.id
+    req["decision_reason"] = "Заявка принята."
+    save_reg_settings()
+    await edit_registration_request_message(req)
+
+    try:
+        await member.send(
+            embed=Embed(
+                title="✅ Регистрация принята",
+                description=(
+                    f"Ваша заявка за **{entity_name}** ({req.get('entity_type_label')}) "
+                    f"в сезоне **{req.get('season')}** была одобрена."
+                ),
+                color=0x2ECC71,
+            )
+        )
+    except Exception:
+        pass
+
+    return True, f"Заявка **#{req.get('id')}** принята."
+
+
+async def reject_registration_request(req: dict, moderator: discord.abc.User, reason: str):
+    req["status"] = "rejected"
+    req["moderator_id"] = moderator.id
+    req["decision_reason"] = reason
+    save_reg_settings()
+    await edit_registration_request_message(req)
+
+    guild = bot.get_guild(int(req.get("guild_id", 0)))
+    member = guild.get_member(int(req.get("applicant_id", 0))) if guild else None
+    if member is None and guild:
+        try:
+            member = await guild.fetch_member(int(req.get("applicant_id", 0)))
+        except Exception:
+            member = None
+
+    if member is not None:
+        try:
+            await member.send(
+                embed=Embed(
+                    title="❌ Регистрация отклонена",
+                    description=(
+                        f"Ваша заявка за **{req.get('entity_name')}** была отклонена.\n"
+                        f"**Причина:** {reason}"
+                    ),
+                    color=0xE74C3C,
+                )
+            )
+        except Exception:
+            pass
+
+
+class RegistrationModal(Modal):
+    def __init__(self, reg_type: str):
+        config = REGISTRATION_TYPE_CONFIG[reg_type]
+        super().__init__(title=config["title"], timeout=600)
+        self.reg_type = reg_type
+        self.config = config
+        self.inputs = {}
+        for key, label, placeholder, required, style, max_length in config["fields"]:
+            input_item = TextInput(
+                label=label,
+                placeholder=placeholder,
+                required=required,
+                style=style,
+                max_length=max_length,
+            )
+            self.inputs[key] = input_item
+            self.add_item(input_item)
+
+    async def on_submit(self, interaction: Interaction):
+        active_season = get_active_registration_season()
+        if not active_season:
+            await interaction.response.send_message(
+                "❌ Сначала администратор должен установить активный сезон (`!установитьсезон`).",
+                ephemeral=True,
+            )
+            return
+        requests_channel_id = reg_settings.get("requests_channel_id")
+        if not requests_channel_id:
+            await interaction.response.send_message(
+                "❌ Канал заявок не настроен. Используйте `!регзаявкиканал`.",
+                ephemeral=True,
+            )
+            return
+
+        raw_fields = {key: str(item.value).strip() for key, item in self.inputs.items()}
+        entity_name_input = raw_fields.get("entity_name", "")
+        if not entity_name_input:
+            await interaction.response.send_message("❌ Укажите название регистрации.", ephemeral=True)
+            return
+
+        try:
+            resolved_name, population_value = validate_registration_entity(
+                self.reg_type, entity_name_input, active_season
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        if self.reg_type == "region":
+            parent_name = resolve_country_name(raw_fields.get("country", ""))
+            if not parent_name or get_country_type(parent_name) != "Государство":
+                await interaction.response.send_message(
+                    "❌ Для региона нужно указать существующее государство-владельца из статов.",
+                    ephemeral=True,
+                )
+                return
+            if get_country_population_for_season(parent_name, active_season) is None:
+                await interaction.response.send_message(
+                    f"❌ Государство **{parent_name}** не существует в сезоне **{active_season}**.",
+                    ephemeral=True,
+                )
+                return
+            actual_owner = get_region_owner_country(resolved_name)
+            if actual_owner and str(actual_owner).casefold() != str(parent_name).casefold():
+                await interaction.response.send_message(
+                    f"❌ Регион **{resolved_name}** закреплён за государством **{actual_owner}** в статах.",
+                    ephemeral=True,
+                )
+                return
+            raw_fields["country"] = parent_name
+
+        display_fields = {
+            label: raw_fields.get(key, "")
+            for key, label, *_rest in self.config["fields"]
+        }
+
+        country_to_user, user_to_country = get_occupied_country_map(active_season)
+        current_country = user_to_country.get(str(interaction.user.id))
+        if current_country and current_country != resolved_name:
+            await interaction.response.send_message(
+                f"❌ Вы уже зарегистрированы в сезоне **{active_season}** за **{current_country}**.",
+                ephemeral=True,
+            )
+            return
+        occupied_by = country_to_user.get(resolved_name)
+        if occupied_by and str(occupied_by) != str(interaction.user.id):
+            await interaction.response.send_message(
+                f"❌ **{resolved_name}** уже занято другим игроком в сезоне **{active_season}**.",
+                ephemeral=True,
+            )
+            return
+
+        request_id = str(reg_settings.get("next_request_id", 1))
+        reg_settings["next_request_id"] = int(reg_settings.get("next_request_id", 1)) + 1
+        request_data = {
+            "id": request_id,
+            "guild_id": interaction.guild_id,
+            "applicant_id": interaction.user.id,
+            "status": "pending",
+            "season": active_season,
+            "reg_type": self.reg_type,
+            "entity_type_label": self.config["entity_type"],
+            "entity_name": resolved_name,
+            "population": population_value if isinstance(population_value, int) else None,
+            "fields": display_fields,
+            "moderator_id": None,
+            "decision_reason": "",
+            "request_channel_id": int(requests_channel_id),
+            "request_message_id": None,
+            "created_at": int(time.time()),
+        }
+        reg_settings.setdefault("requests", {})[request_id] = request_data
+        save_reg_settings()
+
+        requests_channel = await get_channel_safe(requests_channel_id)
+        if not requests_channel:
+            reg_settings.setdefault("requests", {}).pop(request_id, None)
+            save_reg_settings()
+            await interaction.response.send_message(
+                "❌ Канал заявок недоступен. Проверьте настройки `!регзаявкиканал`.",
+                ephemeral=True,
+            )
+            return
+
+        message = await requests_channel.send(
+            content=f"<@{interaction.user.id}>",
+            embed=build_registration_request_embed(request_data),
+            view=RegistrationRequestView(request_id),
+        )
+        request_data["request_message_id"] = message.id
+        save_reg_settings()
+
+        await interaction.response.send_message(
+            f"✅ Заявка **#{request_id}** отправлена в канал заявок.",
+            ephemeral=True,
+        )
+
+
+class RegistrationTypeSelect(Select):
+    def __init__(self):
+        options = [
+            SelectOption(label="Страна", value="country", description="Регистрация за государство"),
+            SelectOption(label="Регион", value="region", description="Регистрация за регион"),
+            SelectOption(label="ЧВК", value="pmc", description="Регистрация частной военной компании"),
+            SelectOption(label="Повстанцы", value="rebels", description="Регистрация повстанческого движения"),
+            SelectOption(label="Организация", value="organization", description="Регистрация организации"),
+        ]
+        super().__init__(
+            placeholder="Выберите тип регистрации",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="reg:panel:type_select",
+        )
+
+    async def callback(self, interaction: Interaction):
+        reg_type = self.values[0]
+        await interaction.response.send_modal(RegistrationModal(reg_type))
+
+
+class RegistrationPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(RegistrationTypeSelect())
+
+
+class RegistrationRejectReasonModal(Modal):
+    def __init__(self, request_id: str):
+        super().__init__(title=f"Отклонение заявки #{request_id}", timeout=300)
+        self.request_id = str(request_id)
+        self.reason_input = TextInput(
+            label="Причина отклонения",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=True,
+            placeholder="Укажите, почему заявка отклонена",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: Interaction):
+        req = reg_settings.setdefault("requests", {}).get(self.request_id)
+        if not req or req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+        reason = str(self.reason_input.value).strip()
+        await reject_registration_request(req, interaction.user, reason)
+        await interaction.response.send_message(
+            f"✅ Заявка **#{self.request_id}** отклонена.",
+            ephemeral=True,
+        )
+
+
+class RegistrationRequestView(View):
+    def __init__(self, request_id: str):
+        super().__init__(timeout=None)
+        self.request_id = str(request_id)
+
+        approve_btn = Button(
+            label="Принять",
+            style=ButtonStyle.success,
+            custom_id=f"reg:request:approve:{self.request_id}",
+        )
+        reject_btn = Button(
+            label="Отклонить",
+            style=ButtonStyle.danger,
+            custom_id=f"reg:request:reject:{self.request_id}",
+        )
+        approve_btn.callback = self.approve
+        reject_btn.callback = self.reject
+        self.add_item(approve_btn)
+        self.add_item(reject_btn)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message(
+            "❌ Только администратор может обрабатывать заявки на регистрацию.",
+            ephemeral=True,
+        )
+        return False
+
+    async def approve(self, interaction: Interaction):
+        req = reg_settings.setdefault("requests", {}).get(self.request_id)
+        if not req or req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+        ok, message = await finalize_registration_request(req, interaction.user)
+        if req.get("status") != "pending":
+            await interaction.response.edit_message(
+                embed=build_registration_request_embed(req),
+                view=None,
+            )
+            await interaction.followup.send(message, ephemeral=True)
+            return
+        await interaction.response.send_message(message, ephemeral=True)
+
+    async def reject(self, interaction: Interaction):
+        req = reg_settings.setdefault("requests", {}).get(self.request_id)
+        if not req or req.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RegistrationRejectReasonModal(self.request_id))
+
+
+@bot.command(name="регканал")
+@commands.has_permissions(administrator=True)
+async def регканал(ctx, channel: discord.TextChannel):
+    reg_settings["panel_channel_id"] = channel.id
+    panel_embed = Embed(
+        title="📝 Панель регистрации",
+        description=(
+            "Выберите тип регистрации в меню ниже.\n\n"
+            "Доступные варианты: **страна, регион, ЧВК, повстанцы, организация**."
+        ),
+        color=0x5865F2,
+    )
+    message = await channel.send(embed=panel_embed, view=RegistrationPanelView())
+    reg_settings["panel_message_id"] = message.id
+    save_reg_settings()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал регистрации настроен",
+            description=f"Панель отправлена в {channel.mention}.",
+            color=0x2ECC71,
+        )
+    )
+
+
+@bot.command(name="регзаявкиканал")
+@commands.has_permissions(administrator=True)
+async def регзаявкиканал(ctx, channel: discord.TextChannel):
+    reg_settings["requests_channel_id"] = channel.id
+    save_reg_settings()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Канал заявок настроен",
+            description=f"Теперь заявки на регистрацию будут отправляться в {channel.mention}.",
+            color=0x2ECC71,
+        )
     )
 
 
