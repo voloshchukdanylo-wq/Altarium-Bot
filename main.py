@@ -16,10 +16,12 @@ from discord.ui import Button, Modal, Select, TextInput, UserSelect, View
 LayoutViewBase = getattr(discord.ui, "LayoutView", View)
 V2Container = getattr(discord.ui, "Container", None)
 V2TextDisplay = getattr(discord.ui, "TextDisplay", None)
+V2ActionRow = getattr(discord.ui, "ActionRow", None)
 REGISTRATION_COMPONENTS_V2 = all((
     LayoutViewBase is not View,
     V2Container is not None,
     V2TextDisplay is not None,
+    V2ActionRow is not None,
 ))
 REGISTRATION_COMPONENTS_V2_ENABLED = os.getenv("ENABLE_DISCORD_COMPONENTS_V2", "").strip().lower() in {
     "1",
@@ -16399,7 +16401,10 @@ class RegistrationPanelView(LayoutViewBase):
             container = V2Container()
             container.add_item(V2TextDisplay(registration_panel_text()))
             self.add_item(container)
-            self.add_item(RegistrationTypeSelect())
+
+            action_row = V2ActionRow()
+            action_row.add_item(RegistrationTypeSelect())
+            self.add_item(action_row)
             return
         self.add_item(RegistrationTypeSelect())
 
@@ -16455,8 +16460,11 @@ class RegistrationRequestView(LayoutViewBase):
             )
             approve_btn.callback = self.approve
             reject_btn.callback = self.reject
-            self.add_item(approve_btn)
-            self.add_item(reject_btn)
+
+            action_row = V2ActionRow()
+            action_row.add_item(approve_btn)
+            action_row.add_item(reject_btn)
+            self.add_item(action_row)
             return
 
         approve_btn = Button(
