@@ -695,6 +695,37 @@ async def restore_member_roles_after_wipe(
         await member.add_roles(*roles_to_add, reason=reason)
 
 
+def get_registration_role_ids_for_wipe() -> set[int]:
+    role_ids = set()
+    for source_key in ("roles_add", "roles", "wipe_roles"):
+        for rid in reg_settings.get(source_key, []):
+            if str(rid).isdigit():
+                role_ids.add(int(rid))
+
+    excluded_role_ids = {
+        int(rid)
+        for rid in reg_settings.get("wipe_role_exclusions", [])
+        if str(rid).isdigit()
+    }
+    return {rid for rid in role_ids if rid not in excluded_role_ids}
+
+
+async def remove_registration_roles_for_member(
+    member: discord.Member, reason: str
+):
+    role_ids = get_registration_role_ids_for_wipe()
+    if not role_ids:
+        return
+
+    roles_to_remove = [
+        role
+        for role in member.roles
+        if role.id in role_ids and role != member.guild.default_role and not role.managed
+    ]
+    if roles_to_remove:
+        await member.remove_roles(*roles_to_remove, reason=reason)
+
+
 def save_companies_data():
     save_json(COMPANIES_FILE, companies_data)
 
@@ -1144,24 +1175,10 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     if guild is not None:
         member = guild.get_member(int(user_id))
         if member:
-            role_ids = {
-                int(rid)
-                for rid in reg_settings.get("wipe_roles", [])
-                if str(rid).isdigit()
-            }
-            excluded_ids = {
-                int(rid)
-                for rid in reg_settings.get("wipe_role_exclusions", [])
-                if str(rid).isdigit()
-            }
-            roles_to_remove = [
-                r for r in member.roles if r.id in role_ids and r.id not in excluded_ids
-            ]
             try:
-                if roles_to_remove:
-                    asyncio.create_task(
-                        member.remove_roles(*roles_to_remove, reason="Вайп игрока")
-                    )
+                asyncio.create_task(
+                    remove_registration_roles_for_member(member, reason="Вайп игрока")
+                )
             except Exception:
                 pass
             try:
@@ -7465,13 +7482,23 @@ def ensure_company_country_presence_struct(company: dict):
 
 
 def get_country_name_by_user_id(user_id: str) -> str | None:
-    _, user_to_country = get_occupied_country_map()
-    current = user_to_country.get(str(user_id))
+    uid = str(user_id)
+    active_season = get_active_registration_season()
+    _, user_to_country = get_occupied_country_map(active_season or None)
+    current = user_to_country.get(uid)
     if current:
         return current
-    profile = country_owners.setdefault("user_profiles", {}).get(str(user_id), {})
+    profile = country_owners.setdefault("user_profiles", {}).get(uid, {})
     if isinstance(profile, dict):
-        return profile.get("active_country")
+        registrations = profile.get("registrations", {})
+        if active_season and isinstance(registrations, dict):
+            active_record = registrations.get(str(active_season), {})
+            if isinstance(active_record, dict):
+                country_name = str(active_record.get("country") or "").strip()
+                if country_name:
+                    return country_name
+        if not active_season:
+            return profile.get("active_country")
     return None
 
 
@@ -14893,18 +14920,21 @@ async def wipe_all(ctx):
             save_passive_flows()
             seasons_data["season_user_progress"] = {}
             save_seasons_data()
+            active_season = get_active_registration_season()
             pre_reg_roles_map = {
                 str(uid): list((data or {}).get("pre_reg_role_ids", []))
                 for uid, data in player_state.get("users", {}).items()
                 if isinstance(data, dict)
             }
+            active_registrations = (
+                country_owners.get("season_user_to_country", {}).get(active_season, {})
+                if active_season
+                else country_owners.get("user_to_country", {})
+            )
             registered_user_ids = {
                 str(uid)
-                for season_map in country_owners.get("season_user_to_country", {}).values()
-                if isinstance(season_map, dict)
-                for uid in season_map.keys()
+                for uid in (active_registrations or {}).keys()
             }
-            registered_user_ids.update(str(uid) for uid in country_owners.get("user_to_country", {}).keys())
             player_state["users"] = {}
             investments["users"] = {}
             companies_data["companies"] = {}
@@ -14930,6 +14960,10 @@ async def wipe_all(ctx):
                             m,
                             pre_reg_roles_map.get(str(m.id), []),
                             reason="Глобальный вайп",
+                        )
+                    else:
+                        await remove_registration_roles_for_member(
+                            m, reason="Глобальный вайп"
                         )
                     await m.edit(nick=None, reason="Глобальный вайп")
                 except Exception:
@@ -15135,7 +15169,11 @@ async def wipe_player(ctx, member: discord.Member):
                 "inventory": inventory.get(user_id, {}),
                 "population": population.get(user_id, 0),
                 "passive_entries": get_passive_entries(user_id).copy(),
-                "season_progress": get_user_progress_for_season(user_id, seasons_data.get("active_season")).copy(),
+                "season_progress": {
+                    str(season_name): dict(progress_map.get(user_id, {}))
+                    for season_name, progress_map in seasons_data.setdefault("season_user_progress", {}).items()
+                    if isinstance(progress_map, dict) and user_id in progress_map
+                },
                 "player_state": player_state.setdefault("users", {})
                 .get(user_id, {})
                 .copy(),
@@ -15217,6 +15255,10 @@ async def wipe_player(ctx, member: discord.Member):
                 if user_has_country or pre_reg_roles:
                     await restore_member_roles_after_wipe(
                         member, pre_reg_roles, reason="Вайп игрока"
+                    )
+                else:
+                    await remove_registration_roles_for_member(
+                        member, reason="Вайп игрока"
                     )
                 await member.edit(nick=None, reason="Вайп игрока")
             except Exception:
@@ -15579,10 +15621,27 @@ async def рег(ctx, member: discord.Member, country: str, year: str):
 
     population_value = get_country_population_for_season(resolved_country, year_str)
     if population_value is None:
+        available_seasons = []
+        country_data = country_stats.get(resolved_country, {})
+        if isinstance(country_data, dict):
+            seasons_map = country_data.get("seasons", {})
+            if isinstance(seasons_map, dict):
+                available_seasons = [
+                    str(season_name)
+                    for season_name, season_population in seasons_map.items()
+                    if season_population is not None and str(season_name) != year_str
+                ]
         await ctx.send(
             embed=Embed(
                 title="❌ Ошибка",
-                description=f"Нет данных по населению для **{resolved_country}** в сезоне **{year_str}**.",
+                description=(
+                    f"Нет данных по населению для **{resolved_country}** в сезоне **{year_str}**."
+                    + (
+                        f"\nФормирование есть в других сезонах: **{', '.join(sorted(available_seasons))}**."
+                        if available_seasons
+                        else ""
+                    )
+                ),
                 color=0xFF0000,
             )
         )
@@ -16605,6 +16664,13 @@ async def профиль(ctx, member: discord.Member = None):
     science = int(state.get("science", 0))
     news_count = int(state.get("news_published", 0))
     coins_value = int(user.get("коины", 0))
+    active_season = get_active_registration_season()
+    active_country = get_country_name_by_user_id(user_id)
+    active_registration_text = (
+        f"{active_country} ({active_season})"
+        if active_country and active_season
+        else "—"
+    )
 
     embed = Embed(
         title=f"📊 Профиль {member.display_name}",
@@ -16615,6 +16681,7 @@ async def профиль(ctx, member: discord.Member = None):
         f"**💰 Общий баланс:** {fmt_money(user['наличка'] + user['банк'])}",
         f"**🪙 Серверная валюта:** {fmt_num(coins_value)} {settings.get('coin_currency', 'Alta-коин')}",
         f"**📝 Описание:** {admin_description or '—'}",
+        f"**🌍 Активная регистрация:** {active_registration_text}",
         f"**🏘 Население:** {fmt_num(population_value)}",
         f"**📰 Опубликовано новостей:** {news_count}",
         f"**🛡️ Щит:** {format_seconds_left(shield_left) if shield_left > 0 else 'нет'}",
