@@ -10640,6 +10640,27 @@ def user_has_any_registration(user_id: str) -> bool:
     return bool(registrations)
 
 
+def get_all_registered_user_ids() -> set[str]:
+    registered_user_ids = {
+        str(uid)
+        for uid in country_owners.setdefault("user_to_country", {}).keys()
+    }
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    for mapping in season_user_to_country.values():
+        if isinstance(mapping, dict):
+            registered_user_ids.update(str(uid) for uid in mapping.keys())
+    for mapping in season_country_to_user.values():
+        if isinstance(mapping, dict):
+            registered_user_ids.update(str(uid) for uid in mapping.values())
+    for uid, profile in country_owners.setdefault("user_profiles", {}).items():
+        if not isinstance(profile, dict):
+            continue
+        registrations = profile.get("registrations")
+        if isinstance(registrations, dict) and registrations:
+            registered_user_ids.add(str(uid))
+    return registered_user_ids
+
+
 def get_occupied_country_map(season_name: str = None):
     season_country_to_user, season_user_to_country = ensure_registration_maps()
     active_season = str(season_name or get_active_registration_season() or "").strip()
@@ -14873,6 +14894,7 @@ async def wipe_all(ctx):
         "balances": balances.copy(),
         "inventory": inventory.copy(),
         "population": load_json(POPULATION_FILE, {}),
+        "player_stats": load_json(PLAYER_STATS_FILE, {}),
         "passive_flows": passive_flows.copy(),
         "season_user_progress": seasons_data.get("season_user_progress", {}).copy(),
         "player_state": player_state.copy(),
@@ -14916,25 +14938,17 @@ async def wipe_all(ctx):
             save_json(BALANCES_FILE, balances)
             save_inventory()
             save_json(POPULATION_FILE, {})
+            save_json(PLAYER_STATS_FILE, {})
             passive_flows["users"] = {}
             save_passive_flows()
             seasons_data["season_user_progress"] = {}
             save_seasons_data()
-            active_season = get_active_registration_season()
             pre_reg_roles_map = {
                 str(uid): list((data or {}).get("pre_reg_role_ids", []))
                 for uid, data in player_state.get("users", {}).items()
                 if isinstance(data, dict)
             }
-            active_registrations = (
-                country_owners.get("season_user_to_country", {}).get(active_season, {})
-                if active_season
-                else country_owners.get("user_to_country", {})
-            )
-            registered_user_ids = {
-                str(uid)
-                for uid in (active_registrations or {}).keys()
-            }
+            registered_user_ids = get_all_registered_user_ids()
             player_state["users"] = {}
             investments["users"] = {}
             companies_data["companies"] = {}
@@ -15044,6 +15058,7 @@ async def undo_wipe(ctx):
     save_json(BALANCES_FILE, balances)
     save_inventory()
     save_json(POPULATION_FILE, backup.get("population", {}))
+    save_json(PLAYER_STATS_FILE, backup.get("player_stats", {}))
     passive_flows.clear()
     passive_flows.update(backup.get("passive_flows", {"users": {}}))
     passive_flows.setdefault("users", {})
