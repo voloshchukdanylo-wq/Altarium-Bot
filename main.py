@@ -663,8 +663,9 @@ async def restore_member_roles_after_wipe(
         for rid in reg_settings.get("wipe_role_exclusions", [])
         if str(rid).isdigit()
     }
+    has_snapshot = isinstance(role_ids_snapshot, list) and bool(role_ids_snapshot)
 
-    if isinstance(role_ids_snapshot, list) and role_ids_snapshot:
+    if has_snapshot:
         for rid in role_ids_snapshot:
             if not str(rid).isdigit():
                 continue
@@ -686,7 +687,15 @@ async def restore_member_roles_after_wipe(
     removable_roles = [
         r for r in member.roles if r != member.guild.default_role and not r.managed
     ]
-    roles_to_remove = [r for r in removable_roles if r.id not in target_ids]
+    registration_role_ids = get_registration_role_ids_for_wipe()
+    if has_snapshot:
+        roles_to_remove = [r for r in removable_roles if r.id not in target_ids]
+    else:
+        roles_to_remove = [
+            r
+            for r in removable_roles
+            if r.id in registration_role_ids and r.id not in target_ids
+        ]
     roles_to_add = [r for r in target_roles if r not in member.roles]
 
     if roles_to_remove:
@@ -1123,6 +1132,9 @@ def chunk_lines_for_embed(lines: list[str], limit: int = 1024) -> list[str]:
 
 
 def wipe_user_data(user_id: str, guild: discord.Guild = None):
+    user_had_registration = user_has_any_registration(user_id)
+    state = ensure_player_state(user_id)
+    pre_reg_roles = list(state.get("pre_reg_role_ids", []))
     prev_user = (
         balances.get(user_id, {}) if isinstance(balances.get(user_id), dict) else {}
     )
@@ -1140,7 +1152,6 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     passive_flows.setdefault("users", {}).pop(user_id, None)
     for _season_map in seasons_data.setdefault("season_user_progress", {}).values():
         _season_map.pop(user_id, None)
-    state = ensure_player_state(user_id)
     state["posts_count"] = 0
     player_state.setdefault("users", {}).pop(user_id, None)
     investments.setdefault("users", {}).pop(user_id, None)
@@ -1175,12 +1186,15 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     if guild is not None:
         member = guild.get_member(int(user_id))
         if member:
-            try:
-                asyncio.create_task(
-                    remove_registration_roles_for_member(member, reason="Вайп игрока")
-                )
-            except Exception:
-                pass
+            if user_had_registration:
+                try:
+                    asyncio.create_task(
+                        restore_member_roles_after_wipe(
+                            member, pre_reg_roles, reason="Вайп игрока"
+                        )
+                    )
+                except Exception:
+                    pass
             try:
                 asyncio.create_task(member.edit(nick=None, reason="Вайп игрока"))
             except Exception:
@@ -14966,19 +14980,14 @@ async def wipe_all(ctx):
             save_country_owners()
 
             for m in ctx.guild.members:
-                if m.bot:
+                if m.bot or str(m.id) not in registered_user_ids:
                     continue
                 try:
-                    if str(m.id) in registered_user_ids:
-                        await restore_member_roles_after_wipe(
-                            m,
-                            pre_reg_roles_map.get(str(m.id), []),
-                            reason="Глобальный вайп",
-                        )
-                    else:
-                        await remove_registration_roles_for_member(
-                            m, reason="Глобальный вайп"
-                        )
+                    await restore_member_roles_after_wipe(
+                        m,
+                        pre_reg_roles_map.get(str(m.id), []),
+                        reason="Глобальный вайп",
+                    )
                     await m.edit(nick=None, reason="Глобальный вайп")
                 except Exception:
                     pass
@@ -15267,13 +15276,9 @@ async def wipe_player(ctx, member: discord.Member):
             save_country_owners()
 
             try:
-                if user_has_country or pre_reg_roles:
+                if user_has_country:
                     await restore_member_roles_after_wipe(
                         member, pre_reg_roles, reason="Вайп игрока"
-                    )
-                else:
-                    await remove_registration_roles_for_member(
-                        member, reason="Вайп игрока"
                     )
                 await member.edit(nick=None, reason="Вайп игрока")
             except Exception:
