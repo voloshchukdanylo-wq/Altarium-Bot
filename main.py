@@ -172,6 +172,7 @@ country_owners = load_json(
         "season_country_to_user": {},
         "season_user_to_country": {},
         "user_profiles": {},
+        "legacy_registration_migration_done": False,
     },
 )
 passive_flows = load_json(PASSIVE_FLOW_FILE, {"users": {}})
@@ -10575,10 +10576,78 @@ def ensure_registration_maps():
     country_owners.setdefault("season_country_to_user", {})
     country_owners.setdefault("season_user_to_country", {})
     country_owners.setdefault("user_profiles", {})
+    country_owners.setdefault("legacy_registration_migration_done", False)
     season_country_to_user = country_owners.setdefault("season_country_to_user", {})
     season_user_to_country = country_owners.setdefault("season_user_to_country", {})
     country_owners.setdefault("user_profiles", {})
     return season_country_to_user, season_user_to_country
+
+
+def migrate_legacy_registrations_from_player_stats():
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    if country_owners.get("legacy_registration_migration_done"):
+        return False
+
+    has_registration_data = any(
+        isinstance(mapping, dict) and mapping
+        for mapping in (
+            country_owners.get("country_to_user"),
+            country_owners.get("user_to_country"),
+            country_owners.get("user_profiles"),
+        )
+    ) or any(
+        isinstance(mapping, dict) and mapping
+        for mapping in season_country_to_user.values()
+    ) or any(
+        isinstance(mapping, dict) and mapping
+        for mapping in season_user_to_country.values()
+    )
+    if has_registration_data:
+        country_owners["legacy_registration_migration_done"] = True
+        return False
+
+    players = load_json(PLAYER_STATS_FILE, {})
+    changed = False
+    for uid, pdata in players.items():
+        if not isinstance(pdata, dict) or not pdata:
+            continue
+
+        for country_name, season_map in pdata.items():
+            if not isinstance(season_map, dict) or not season_map:
+                continue
+
+            for season_name in season_map.keys():
+                season_key = str(season_name or "").strip()
+                if not season_key:
+                    continue
+                uid_str = str(uid)
+                season_users = season_user_to_country.setdefault(season_key, {})
+                season_countries = season_country_to_user.setdefault(season_key, {})
+                if uid_str in season_users or country_name in season_countries:
+                    continue
+
+                season_users[uid_str] = country_name
+                season_countries[country_name] = uid_str
+                profile = get_registration_profile(uid_str)
+                profile.setdefault("registrations", {}).setdefault(
+                    season_key, {"country": country_name, "status": "legacy"}
+                )
+                if not profile.get("active_country"):
+                    profile["active_country"] = country_name
+                if not profile.get("active_season"):
+                    profile["active_season"] = season_key
+                changed = True
+                break
+
+    active_season = get_active_registration_season()
+    if active_season:
+        country_owners["country_to_user"] = dict(season_country_to_user.get(active_season, {}))
+        country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
+
+    country_owners["legacy_registration_migration_done"] = True
+    if changed:
+        save_country_owners()
+    return changed
 
 
 def resolve_country_name(raw_country: str):
@@ -10676,67 +10745,18 @@ def get_all_registered_user_ids() -> set[str]:
 
 
 def get_occupied_country_map(season_name: str = None):
+    migrate_legacy_registrations_from_player_stats()
     season_country_to_user, season_user_to_country = ensure_registration_maps()
     active_season = str(season_name or get_active_registration_season() or "").strip()
 
     if active_season:
         country_to_user = season_country_to_user.setdefault(active_season, {})
         user_to_country = season_user_to_country.setdefault(active_season, {})
+        country_owners["country_to_user"] = dict(country_to_user)
+        country_owners["user_to_country"] = dict(user_to_country)
     else:
         country_to_user = country_owners.setdefault("country_to_user", {})
         user_to_country = country_owners.setdefault("user_to_country", {})
-
-    # Ленивая синхронизация из player_stats для старых данных
-    players = load_json(PLAYER_STATS_FILE, {})
-    changed = False
-    for uid, pdata in players.items():
-        if not isinstance(pdata, dict) or not pdata:
-            continue
-        target_country = None
-        target_season = active_season
-        if active_season:
-            for country_name, season_map in pdata.items():
-                if not isinstance(season_map, dict):
-                    continue
-                if active_season in season_map:
-                    target_country = country_name
-                    break
-        else:
-            target_country = next(iter(pdata.keys()), None)
-            if target_country:
-                season_map = pdata.get(target_country, {})
-                if isinstance(season_map, dict) and season_map:
-                    target_season = next(iter(season_map.keys()), None)
-        if not target_country:
-            continue
-
-        uid = str(uid)
-        if uid in user_to_country:
-            continue
-        if target_country in country_to_user:
-            continue
-
-        user_to_country[uid] = target_country
-        country_to_user[target_country] = uid
-        if target_season:
-            season_country_to_user.setdefault(str(target_season), {}).setdefault(target_country, uid)
-            season_user_to_country.setdefault(str(target_season), {}).setdefault(uid, target_country)
-            profile = get_registration_profile(uid)
-            profile.setdefault("registrations", {}).setdefault(
-                str(target_season), {"country": target_country, "status": "legacy"}
-            )
-            if not profile.get("active_country"):
-                profile["active_country"] = target_country
-            if not profile.get("active_season"):
-                profile["active_season"] = str(target_season)
-        changed = True
-
-    if active_season:
-        country_owners["country_to_user"] = dict(country_to_user)
-        country_owners["user_to_country"] = dict(user_to_country)
-
-    if changed:
-        save_country_owners()
 
     return country_to_user, user_to_country
 
@@ -14974,6 +14994,7 @@ async def wipe_all(ctx):
             country_owners["season_country_to_user"] = {}
             country_owners["season_user_to_country"] = {}
             country_owners["user_profiles"] = {}
+            country_owners["legacy_registration_migration_done"] = True
             save_player_state()
             save_investments()
             save_companies_data()
@@ -15112,6 +15133,7 @@ async def undo_wipe(ctx):
     country_owners.setdefault("season_country_to_user", {})
     country_owners.setdefault("season_user_to_country", {})
     country_owners.setdefault("user_profiles", {})
+    country_owners.setdefault("legacy_registration_migration_done", False)
     save_country_owners()
 
     await ctx.send(
