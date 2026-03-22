@@ -926,6 +926,32 @@ def save_investments():
     save_json(INVESTMENTS_FILE, investments)
 
 
+def remove_active_investments_for_user(user_id: str) -> int:
+    uid = str(user_id)
+    active_map = investments.setdefault("active_investments", {})
+    removed = 0
+    for inv_id, inv in list(active_map.items()):
+        if str((inv or {}).get("user_id") or "") != uid:
+            continue
+        active_map.pop(str(inv_id), None)
+        removed += 1
+    return removed
+
+
+def reset_investment_runtime(reset_rp_year: bool = False):
+    investments["requests"] = {}
+    investments["next_id"] = 1
+    investments["users"] = {}
+    investments["active_investments"] = {}
+    rp = investments.setdefault("rp_year", {})
+    if reset_rp_year:
+        rp["year"] = None
+        rp["next_tick_at"] = None
+    else:
+        rp.setdefault("year", None)
+        rp["next_tick_at"] = None
+
+
 def format_rp_year_embed(year: int, quarter_index: int):
     seasons = [
         ("🌱 Весна", 0x55AA55, "Рост, обновление и новые возможности."),
@@ -1156,6 +1182,12 @@ def wipe_user_data(user_id: str, guild: discord.Guild = None):
     state["posts_count"] = 0
     player_state.setdefault("users", {}).pop(user_id, None)
     investments.setdefault("users", {}).pop(user_id, None)
+    remove_active_investments_for_user(user_id)
+    investments["requests"] = {
+        rid: req
+        for rid, req in investments.setdefault("requests", {}).items()
+        if user_id != str((req or {}).get("author_id", ""))
+    }
     companies_data["companies"] = {
         cid: c
         for cid, c in companies_data.setdefault("companies", {}).items()
@@ -10841,6 +10873,36 @@ def remove_country_registration(country_name: str):
         country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
 
 
+def clear_all_registrations() -> tuple[int, int]:
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    players = load_json(PLAYER_STATS_FILE, {})
+    cleared_countries = sum(
+        len(mapping) for mapping in season_country_to_user.values() if isinstance(mapping, dict)
+    )
+    cleared_users = len(get_all_registered_user_ids())
+    if isinstance(players, dict):
+        legacy_users = 0
+        legacy_countries = 0
+        for pdata in players.values():
+            if not isinstance(pdata, dict) or not pdata:
+                continue
+            legacy_users += 1
+            legacy_countries += len(pdata)
+        cleared_users = max(cleared_users, legacy_users)
+        cleared_countries = max(cleared_countries, legacy_countries)
+
+    country_owners["country_to_user"] = {}
+    country_owners["user_to_country"] = {}
+    country_owners["season_country_to_user"] = {}
+    country_owners["season_user_to_country"] = {}
+    country_owners["user_profiles"] = {}
+    country_owners["legacy_registration_migration_done"] = True
+
+    save_json(PLAYER_STATS_FILE, {})
+    save_country_owners()
+    return cleared_countries, cleared_users
+
+
 def sync_legacy_occupied_maps_for_active_season():
     active_season = get_active_registration_season()
     season_country_to_user, season_user_to_country = ensure_registration_maps()
@@ -11783,10 +11845,15 @@ async def постыочистить(ctx):
         st["posts_count"] = 0
 
     save_player_state()
+    cleared_countries, cleared_users = clear_all_registrations()
     await ctx.send(
         embed=Embed(
             title="✅ Счётчик постов очищен",
-            description=f"Обнулён счётчик постов у **{changed}** участников. Сообщения не удалялись.",
+            description=(
+                f"Обнулён счётчик постов у **{changed}** участников.\n"
+                f"Также очищены регистрации **{cleared_countries}** занятых стран у **{cleared_users}** игроков"
+                " (включая тех, кто уже вышел с сервера). Роли не трогались, сообщения не удалялись."
+            ),
             color=0x00FF00,
         )
     )
@@ -14984,7 +15051,7 @@ async def wipe_all(ctx):
             }
             registered_user_ids = get_all_registered_user_ids()
             player_state["users"] = {}
-            investments["users"] = {}
+            reset_investment_runtime(reset_rp_year=True)
             companies_data["companies"] = {}
             companies_data["requests"] = {}
             companies_data["next_company_id"] = 1
@@ -15159,7 +15226,9 @@ async def wipe_player(ctx, member: discord.Member):
         player_state["users"].get(user_id)
     )
     user_has_season = any(user_id in m for m in seasons_data.setdefault("season_user_progress", {}).values())
-    user_has_investments = bool(investments.setdefault("users", {}).get(user_id))
+    user_has_investments = bool(investments.setdefault("users", {}).get(user_id)) or bool(
+        get_active_investments_for_user(user_id)
+    )
     user_has_companies = any(
         str(c.get("owner_id")) == user_id
         for c in companies_data.setdefault("companies", {}).values()
@@ -15224,6 +15293,10 @@ async def wipe_player(ctx, member: discord.Member):
                 .get(user_id, {})
                 .copy(),
                 "investments": ensure_investments(user_id).copy(),
+                "active_investments": {
+                    str(inv_id): dict(inv)
+                    for inv_id, inv in get_active_investments_for_user(user_id)
+                },
                 "companies": {
                     cid: c
                     for cid, c in companies_data.setdefault("companies", {}).items()
@@ -15268,6 +15341,12 @@ async def wipe_player(ctx, member: discord.Member):
             state["posts_count"] = 0
             player_state.setdefault("users", {}).pop(user_id, None)
             investments.setdefault("users", {}).pop(user_id, None)
+            remove_active_investments_for_user(user_id)
+            investments["requests"] = {
+                rid: req
+                for rid, req in investments.setdefault("requests", {}).items()
+                if user_id != str((req or {}).get("author_id", ""))
+            }
             companies_data["companies"] = {
                 cid: c
                 for cid, c in companies_data.setdefault("companies", {}).items()
