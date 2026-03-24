@@ -225,6 +225,9 @@ investments = load_json(
             "year": None,
             "cooldown": 86400,
             "next_tick_at": None,
+            "science_limit_start": 0,
+            "science_limit_increment": 0,
+            "science_limit_current": 0,
         },
     },
 )
@@ -350,6 +353,9 @@ investments["rp_year"].setdefault("message_id", None)
 investments["rp_year"].setdefault("year", None)
 investments["rp_year"].setdefault("cooldown", 86400)
 investments["rp_year"].setdefault("next_tick_at", None)
+investments["rp_year"].setdefault("science_limit_start", 0)
+investments["rp_year"].setdefault("science_limit_increment", 0)
+investments["rp_year"].setdefault("science_limit_current", 0)
 investments.setdefault("users", {})
 companies_data.setdefault("companies", {})
 companies_data.setdefault("requests", {})
@@ -947,12 +953,35 @@ def reset_investment_runtime(reset_rp_year: bool = False):
     if reset_rp_year:
         rp["year"] = None
         rp["next_tick_at"] = None
+        rp["science_limit_current"] = int(rp.get("science_limit_start", 0))
     else:
         rp.setdefault("year", None)
         rp["next_tick_at"] = None
 
 
-def format_rp_year_embed(year: int, quarter_index: int):
+def calculate_world_stats(guild: discord.Guild | None):
+    active_member_ids = set()
+    if guild is not None:
+        active_member_ids = {str(m.id) for m in guild.members if not m.bot}
+
+    registered_ids = get_all_registered_user_ids()
+    if active_member_ids:
+        registered_ids = {uid for uid in registered_ids if uid in active_member_ids}
+
+    population_data = load_json(POPULATION_FILE, {})
+    total_population = sum(int(population_data.get(uid, 0) or 0) for uid in registered_ids)
+    total_science = sum(int(ensure_player_state(uid).get("science", 0) or 0) for uid in registered_ids)
+    return total_population, total_science, len(registered_ids)
+
+
+def format_rp_year_embed(
+    year: int,
+    quarter_index: int,
+    science_limit: int,
+    total_population: int,
+    total_science: int,
+    registered_count: int,
+):
     seasons = [
         ("🌱 Весна", 0x55AA55, "Рост, обновление и новые возможности."),
         ("☀️ Лето", 0xF1C40F, "Пик активности, энергии и побед."),
@@ -969,6 +998,10 @@ def format_rp_year_embed(year: int, quarter_index: int):
         ),
         color=color,
     )
+    em.add_field(name="🔬 Лимит науки", value=fmt_num(max(0, int(science_limit))), inline=False)
+    em.add_field(name="🏘 Общее население", value=fmt_num(max(0, int(total_population))), inline=True)
+    em.add_field(name="🧪 Общая наука", value=fmt_num(max(0, int(total_science))), inline=True)
+    em.add_field(name="👥 Зарегистрировано", value=fmt_num(max(0, int(registered_count))), inline=True)
     return em
 
 
@@ -2230,8 +2263,8 @@ async def on_command_error(ctx, error):
             "списоксезонов": "!списоксезонов",
             "тайнканал": "!тайнканал #канал",
             "рассылка": "!рассылка Текст объявления",
-            "кдгод": "!рпгодканал #канал 1939 24ч",
-            "рпгодканал": "!рпгодканал #канал 1939 24ч",
+            "кдгод": "!рпгодканал #канал 24ч",
+            "рпгодканал": "!рпгодканал #канал 24ч",
             "заявкиинвестиций": "!заявкиинвестиций #канал",
             "итогинвестицийканал": "!итогинвестицийканал #канал",
             "податьинвестициюканал": "!податьинвестициюканал #канал",
@@ -2496,7 +2529,7 @@ async def хелп(ctx):
         "податьинвестициюканал": "Отправляет панель подачи инвестиционной заявки в выбранный канал.",
         "заявкиинвестиций": "Устанавливает канал, куда отправляются заявки инвестиций.",
         "итогинвестицийканал": "Устанавливает канал итогов по инвестиционным заявкам.",
-        "рпгодканал": "Настраивает канал RP-года, стартовый год и авто-обновление по КД.",
+        "рпгодканал": "Настраивает канал RP-года и КД, затем открывает форму: стартовый год, лимит науки и надбавка/год.",
         "податьпартнеркуканал": "Отправляет панель с кнопкой подачи партнерки в выбранный канал.",
         "заявкипартнерокканал": "Устанавливает канал, куда отправляются заявки партнерок.",
         "партнеркиканал": "Устанавливает канал публикации принятых партнерок.",
@@ -12433,9 +12466,136 @@ async def заморозкавывести(ctx, member: discord.Member, amount: 
     )
 
 
+class RPYearSetupModal(Modal):
+    def __init__(self, channel: discord.TextChannel, cooldown_secs: int, initiator_id: int):
+        super().__init__(title="Настройка RP-года", timeout=300)
+        self.channel = channel
+        self.cooldown_secs = int(cooldown_secs)
+        self.initiator_id = int(initiator_id)
+        rp = investments.setdefault("rp_year", {})
+        self.start_year_input = TextInput(
+            label="1. Стартовый год",
+            required=True,
+            default=str(rp.get("year") or ""),
+            max_length=16,
+        )
+        self.start_science_input = TextInput(
+            label="2. Лимит науки",
+            required=True,
+            default=str(int(rp.get("science_limit_start", 0) or 0)),
+            max_length=16,
+        )
+        self.increment_input = TextInput(
+            label="3. Надбавка науки за год",
+            required=True,
+            default=str(int(rp.get("science_limit_increment", 0) or 0)),
+            max_length=16,
+        )
+        self.add_item(self.start_year_input)
+        self.add_item(self.start_science_input)
+        self.add_item(self.increment_input)
+
+    async def on_submit(self, interaction: Interaction):
+        if interaction.user.id != self.initiator_id:
+            await interaction.response.send_message("❌ Эту форму может отправить только инициатор команды.", ephemeral=True)
+            return
+
+        try:
+            start_year = int(self.start_year_input.value.strip())
+            science_start = max(0, int(self.start_science_input.value.strip()))
+            science_increment = max(0, int(self.increment_input.value.strip()))
+        except Exception:
+            await interaction.response.send_message(
+                "❌ Все поля формы должны быть целыми числами.",
+                ephemeral=True,
+            )
+            return
+
+        now_ts = int(time.time())
+        rp = investments.setdefault("rp_year", {})
+        rp["channel_id"] = self.channel.id
+        rp["year"] = int(start_year)
+        rp["cooldown"] = int(self.cooldown_secs)
+        rp["next_tick_at"] = now_ts + int(self.cooldown_secs)
+        rp["science_limit_start"] = int(science_start)
+        rp["science_limit_increment"] = int(science_increment)
+        rp["science_limit_current"] = int(science_start)
+
+        msg = None
+        old_msg_id = rp.get("message_id")
+        should_send_new = old_msg_id is None
+        if old_msg_id:
+            try:
+                msg = await self.channel.fetch_message(int(old_msg_id))
+            except discord.NotFound:
+                should_send_new = True
+            except (discord.DiscordServerError, discord.HTTPException):
+                await interaction.response.send_message(
+                    embed=Embed(
+                        title="⚠️ Временная ошибка Discord",
+                        description=(
+                            "Не удалось обновить сообщение RP-года из-за временной ошибки Discord API. "
+                            "Попробуйте ещё раз через несколько секунд."
+                        ),
+                        color=0xF1C40F,
+                    ),
+                    ephemeral=True,
+                )
+                return
+            except Exception:
+                should_send_new = True
+
+        quarter = int(((int(self.cooldown_secs) - max(0, rp["next_tick_at"] - now_ts)) * 4) / int(self.cooldown_secs)) % 4
+        total_population, total_science, registered_count = calculate_world_stats(interaction.guild)
+        em = format_rp_year_embed(
+            int(start_year),
+            quarter,
+            int(rp.get("science_limit_current", science_start)),
+            total_population,
+            total_science,
+            registered_count,
+        )
+        if msg:
+            await msg.edit(embed=em)
+        elif should_send_new:
+            sent = await self.channel.send(embed=em)
+            rp["message_id"] = sent.id
+
+        save_investments()
+        await interaction.response.send_message(
+            embed=Embed(
+                title="✅ RP-год настроен",
+                description=(
+                    f"Канал: {self.channel.mention}\n"
+                    f"Стартовый год: **{start_year}**\n"
+                    f"КД года: **{format_interval(self.cooldown_secs)}**\n"
+                    f"Лимит науки: **{fmt_num(science_start)}**\n"
+                    f"Надбавка/год: **+{fmt_num(science_increment)}**"
+                ),
+                color=0x00FF00,
+            ),
+            ephemeral=True,
+        )
+
+
+class RPYearSetupView(View):
+    def __init__(self, channel: discord.TextChannel, cooldown_secs: int, initiator_id: int):
+        super().__init__(timeout=180)
+        self.channel = channel
+        self.cooldown_secs = int(cooldown_secs)
+        self.initiator_id = int(initiator_id)
+
+    @discord.ui.button(label="Открыть форму RP-года", style=ButtonStyle.primary)
+    async def open_form(self, interaction: Interaction, button: Button):
+        if interaction.user.id != self.initiator_id:
+            await interaction.response.send_message("❌ Форму может открыть только инициатор команды.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RPYearSetupModal(self.channel, self.cooldown_secs, self.initiator_id))
+
+
 @bot.command(name="рпгодканал", aliases=["кдгод"])
 @commands.has_permissions(administrator=True)
-async def рпгодканал(ctx, channel: discord.TextChannel, year: int, cooldown: str):
+async def рпгодканал(ctx, channel: discord.TextChannel, cooldown: str):
     try:
         secs = parse_interval(cooldown)
     except Exception as e:
@@ -12446,53 +12606,18 @@ async def рпгодканал(ctx, channel: discord.TextChannel, year: int, coo
         await ctx.send(embed=Embed(title="❌ Ошибка", description="Минимальный интервал — 60 секунд.", color=0xFF0000))
         return
 
-    now_ts = int(time.time())
-    rp = investments.setdefault("rp_year", {})
-    rp["channel_id"] = channel.id
-    rp["year"] = int(year)
-    rp["cooldown"] = int(secs)
-    rp["next_tick_at"] = now_ts + int(secs)
-
-    msg = None
-    old_msg_id = rp.get("message_id")
-    should_send_new = old_msg_id is None
-    if old_msg_id:
-        try:
-            msg = await channel.fetch_message(int(old_msg_id))
-        except discord.NotFound:
-            should_send_new = True
-        except (discord.DiscordServerError, discord.HTTPException):
-            # Временная ошибка API Discord — не отправляем новый эмбед,
-            # чтобы не плодить дубликаты при кратковременных сбоях.
-            await ctx.send(
-                embed=Embed(
-                    title="⚠️ Временная ошибка Discord",
-                    description=(
-                        "Не удалось обновить сообщение RP-года из-за временной ошибки Discord API. "
-                        "Попробуйте команду ещё раз через несколько секунд."
-                    ),
-                    color=0xF1C40F,
-                )
-            )
-            return
-        except Exception:
-            should_send_new = True
-
-    quarter = int(((int(secs) - max(0, rp["next_tick_at"] - now_ts)) * 4) / int(secs)) % 4
-    em = format_rp_year_embed(int(year), quarter)
-    if msg:
-        await msg.edit(embed=em)
-    elif should_send_new:
-        sent = await channel.send(embed=em)
-        rp["message_id"] = sent.id
-
-    save_investments()
+    view = RPYearSetupView(channel, int(secs), ctx.author.id)
     await ctx.send(
         embed=Embed(
-            title="✅ RP-год настроен",
-            description=f"Канал: {channel.mention}\nГод: **{year}**\nКД года: **{format_interval(secs)}**",
-            color=0x00FF00,
-        )
+            title="📝 Настройка RP-года",
+            description=(
+                f"Команда принята: канал {channel.mention}, КД **{format_interval(secs)}**.\n"
+                "Нажмите кнопку ниже и заполните форму:\n"
+                "1) Стартовый год\n2) Лимит науки\n3) Надбавка науки за год"
+            ),
+            color=0x3498DB,
+        ),
+        view=view,
     )
 
 
@@ -13452,6 +13577,8 @@ async def auto_role_income_loop():
         rp_channel_id = rp.get("channel_id")
         rp_year = rp.get("year")
         rp_cooldown = max(60, int(rp.get("cooldown", 86400)))
+        science_increment = max(0, int(rp.get("science_limit_increment", 0) or 0))
+        science_limit_current = max(0, int(rp.get("science_limit_current", rp.get("science_limit_start", 0)) or 0))
         next_tick_at = rp.get("next_tick_at")
         if rp_channel_id and rp_year is not None:
             rp_channel = guild.get_channel(int(rp_channel_id))
@@ -13465,6 +13592,8 @@ async def auto_role_income_loop():
                 while now_rp >= int(next_tick_at):
                     rp_year = int(rp.get("year", rp_year)) + 1
                     rp["year"] = rp_year
+                    science_limit_current += science_increment
+                    rp["science_limit_current"] = science_limit_current
                     next_tick_at = int(next_tick_at) + rp_cooldown
                     rp["next_tick_at"] = next_tick_at
                     progressed_year = True
@@ -13482,7 +13611,15 @@ async def auto_role_income_loop():
 
                 elapsed = max(0, rp_cooldown - max(0, int(next_tick_at) - now_rp))
                 quarter = int((elapsed * 4) / rp_cooldown) % 4
-                em = format_rp_year_embed(int(rp.get("year", rp_year)), quarter)
+                total_population, total_science, registered_count = calculate_world_stats(guild)
+                em = format_rp_year_embed(
+                    int(rp.get("year", rp_year)),
+                    quarter,
+                    int(rp.get("science_limit_current", science_limit_current)),
+                    total_population,
+                    total_science,
+                    registered_count,
+                )
                 msg = None
                 msg_id = rp.get("message_id")
                 should_send_new = msg_id is None
@@ -17933,27 +18070,33 @@ async def ивенты(ctx):
 @bot.command(name="статистика")
 @commands.has_permissions(administrator=True)
 async def statistics(ctx):
-    population = load_json(POPULATION_FILE, {})
-    users = [
-        (uid, data)
-        for uid, data in balances.items()
-        if uid != "валюта" and isinstance(data, dict)
-    ]
+    active_members = [m for m in ctx.guild.members if not m.bot]
+    active_member_ids = {str(m.id) for m in active_members}
 
-    total_players = len(users)
+    registered_ids = get_all_registered_user_ids()
+    registered_active_ids = {uid for uid in registered_ids if uid in active_member_ids}
+
+    total_players = len(active_members)
+    total_registered = len(registered_active_ids)
     total_balance = sum(
-        user.get("наличка", 0) + user.get("банк", 0) for _, user in users
+        int((balances.get(uid) or {}).get("наличка", 0))
+        + int((balances.get(uid) or {}).get("банк", 0))
+        for uid in registered_active_ids
     )
-    total_population = sum(population.get(uid, 0) for uid, _ in users)
+    total_population, total_science, _ = calculate_world_stats(ctx.guild)
 
     embed = Embed(title="📊 Общая статистика сервера", color=0x3498DB)
     embed.add_field(
-        name="👥 Количество игроков", value=str(total_players), inline=False
+        name="👥 Участников на сервере", value=str(total_players), inline=False
+    )
+    embed.add_field(
+        name="🪪 Зарегистрированных игроков", value=str(total_registered), inline=False
     )
     embed.add_field(
         name="💰 Общий баланс", value=f"{total_balance} {currency}", inline=False
     )
     embed.add_field(name="🏘 Общее население", value=str(total_population), inline=False)
+    embed.add_field(name="🔬 Общая наука", value=str(total_science), inline=False)
     await ctx.send(embed=embed)
 
 # ================== START ==================
