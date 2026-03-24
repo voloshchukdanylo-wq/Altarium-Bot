@@ -1095,6 +1095,63 @@ def format_seconds_left(seconds: int) -> str:
     return format_interval(max(0, int(seconds)))
 
 
+def resolve_role_from_text(guild: discord.Guild, text: str):
+    query = str(text or "").strip()
+    if not query:
+        return None
+
+    if query.startswith("<@&") and query.endswith(">"):
+        query = query[3:-1]
+    if query.isdigit():
+        role = guild.get_role(int(query))
+        if role:
+            return role
+
+    lowered = query.casefold()
+    exact = discord.utils.find(lambda r: r.name.casefold() == lowered, guild.roles)
+    if exact:
+        return exact
+    return discord.utils.find(lambda r: lowered in r.name.casefold(), guild.roles)
+
+
+def parse_accum_limit(value: str) -> dict:
+    raw = str(value or "").strip().lower()
+    if raw in ("", "0", "нет", "no", "none", "off"):
+        return {"type": "none", "value": 0}
+    if any(ch.isalpha() for ch in raw):
+        secs = parse_interval(raw)
+        if secs <= 0:
+            raise ValueError("Лимит времени должен быть больше 0.")
+        return {"type": "time", "value": int(secs)}
+    cycles = int(raw)
+    if cycles <= 0:
+        raise ValueError("Лимит пропусков должен быть больше 0.")
+    return {"type": "cycles", "value": cycles}
+
+
+def compute_accumulative_income(cfg: dict, user_cash: int, elapsed_cycles: int) -> int:
+    if elapsed_cycles <= 0:
+        return 0
+    try:
+        base_amount = parse_money_value(str(cfg.get("amount", 0)), user_cash)
+    except Exception:
+        base_amount = 0
+    if base_amount <= 0:
+        return 0
+
+    cut = max(0, int(cfg.get("accum_cut", 0)))
+    total = 0
+    for cycle_idx in range(1, elapsed_cycles + 1):
+        if cut <= 0 or cycle_idx <= 2:
+            cycle_amount = base_amount
+        else:
+            missed = cycle_idx - 2
+            cut_total = cut * (missed * (missed + 1) // 2)
+            cycle_amount = base_amount - cut_total
+        total += max(0, cycle_amount)
+    return int(max(0, total))
+
+
 def add_embed_lines_chunked(
     embed: Embed,
     field_name: str,
@@ -11523,10 +11580,22 @@ async def коллект(ctx):
             cooldown_wait.append((role.mention, cooldown - elapsed))
             continue
 
-        try:
-            amount = parse_money_value(str(data.get("amount", 0)), user["наличка"])
-        except Exception:
-            amount = 0
+        mode = str(data.get("mode", "manual")).lower()
+        if mode == "accumulative":
+            cycles = elapsed // max(1, cooldown)
+            limit_cfg = data.get("accum_limit", {}) or {}
+            limit_type = str(limit_cfg.get("type", "none")).lower()
+            limit_value = int(limit_cfg.get("value", 0) or 0)
+            if limit_type == "cycles" and limit_value > 0:
+                cycles = min(cycles, limit_value)
+            elif limit_type == "time" and limit_value > 0 and cooldown > 0:
+                cycles = min(cycles, max(1, limit_value // cooldown))
+            amount = compute_accumulative_income(data, user["наличка"], int(cycles))
+        else:
+            try:
+                amount = parse_money_value(str(data.get("amount", 0)), user["наличка"])
+            except Exception:
+                amount = 0
 
         total_earned += amount
         collected_roles.append((role.mention, amount))
@@ -11628,8 +11697,28 @@ async def доходсписок(ctx):
                 cooldown_view = fmt_num(int(data.get("cooldown", 0)))
             except Exception:
                 cooldown_view = str(data.get("cooldown", 0)).strip() or "0"
+            mode = str(data.get("mode", "auto" if data.get("auto", True) else "manual")).lower()
+            mode_label = "обычный"
+            if mode == "auto":
+                mode_label = "автоколлект"
+            elif mode == "accumulative":
+                mode_label = "накопительный"
+
+            extra = ""
+            if mode == "accumulative":
+                limit_cfg = data.get("accum_limit", {}) or {}
+                lt = str(limit_cfg.get("type", "none")).lower()
+                lv = int(limit_cfg.get("value", 0) or 0)
+                if lt == "time" and lv > 0:
+                    limit_text = format_interval(lv)
+                elif lt == "cycles" and lv > 0:
+                    limit_text = f"{lv} проп."
+                else:
+                    limit_text = "без лимита"
+                cut_text = fmt_num(int(data.get("accum_cut", 0) or 0))
+                extra = f", лимит: {limit_text}, срез: {cut_text}"
             lines.append(
-                f"{role.mention} — {amount_view} ({currency} / %), кулдаун {cooldown_view}с, авто: {data.get('auto', True)}"
+                f"{role.mention} — {amount_view} ({currency} / %), кулдаун {cooldown_view}с, режим: {mode_label}{extra}"
             )
 
     freeze_cfg = role_income.setdefault("freeze_roles", {})
@@ -11834,6 +11923,159 @@ async def топ(ctx):
     await ctx.send(embed=view.build_embed(), view=view)
 
 
+class IncomeBaseModal(Modal):
+    def __init__(self, role: discord.Role, auto_mode: bool):
+        title = "Добавить автоколлект" if auto_mode else "Добавить обычный сбор"
+        super().__init__(title=title, timeout=600)
+        self.role = role
+        self.auto_mode = auto_mode
+        self.amount = TextInput(label="Сумма сбора (число или %)", required=True, max_length=100)
+        self.cooldown = TextInput(label="Кулдаун (например 1ч, 30м)", required=True, max_length=100)
+        self.add_item(self.amount)
+        self.add_item(self.cooldown)
+
+    async def on_submit(self, interaction: Interaction):
+        try:
+            cooldown = parse_interval(str(self.cooldown.value).strip())
+            if cooldown <= 0:
+                raise ValueError("Кулдаун должен быть больше 0.")
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный кулдаун: {e}", ephemeral=True)
+            return
+
+        role_income.setdefault("roles", {})[str(self.role.id)] = {
+            "amount": str(self.amount.value).strip(),
+            "cooldown": int(cooldown),
+            "auto": self.auto_mode,
+            "mode": "auto" if self.auto_mode else "manual",
+            "accum_limit": {"type": "none", "value": 0},
+            "accum_cut": 0,
+        }
+        save_json(ROLE_INCOME_FILE, role_income)
+        await interaction.response.send_message(
+            embed=Embed(
+                title="✅ Доход для роли добавлен",
+                description=(
+                    f"**Роль:** {self.role.mention}\n\n"
+                    f"**Режим:** {'Автоколлект' if self.auto_mode else 'Обычный сбор'}\n\n"
+                    f"**Сумма:** {str(self.amount.value).strip()} {currency}\n\n"
+                    f"**Кулдаун:** {format_interval(cooldown)}"
+                ),
+                color=0x00FF00,
+            )
+        )
+
+
+class IncomeAccumModal(Modal):
+    def __init__(self, role: discord.Role):
+        super().__init__(title="Добавить накопительный сбор", timeout=600)
+        self.role = role
+        self.amount = TextInput(label="Сумма сбора (число или %)", required=True, max_length=100)
+        self.cooldown = TextInput(label="Кулдаун (например 1ч, 30м)", required=True, max_length=100)
+        self.limit = TextInput(
+            label="Лимит накопления (время или пропуски)",
+            placeholder="Например: 12ч или 8. 0/нет — без лимита",
+            required=True,
+            max_length=100,
+            default="0",
+        )
+        self.cut_enabled = TextInput(
+            label="Включить срез накопления? (да/нет)",
+            required=True,
+            max_length=10,
+            default="нет",
+        )
+        self.cut_value = TextInput(
+            label="Срез за пропуск (число)",
+            placeholder="Например: 50",
+            required=True,
+            max_length=100,
+            default="0",
+        )
+        for item in (self.amount, self.cooldown, self.limit, self.cut_enabled, self.cut_value):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Interaction):
+        amount_raw = str(self.amount.value).strip()
+        try:
+            cooldown = parse_interval(str(self.cooldown.value).strip())
+            if cooldown <= 0:
+                raise ValueError("Кулдаун должен быть больше 0.")
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный кулдаун: {e}", ephemeral=True)
+            return
+
+        try:
+            limit_cfg = parse_accum_limit(str(self.limit.value).strip())
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Неверный лимит накопления: {e}", ephemeral=True)
+            return
+
+        cut_on = str(self.cut_enabled.value).strip().lower() in ("да", "yes", "true", "1", "on")
+        try:
+            cut_value = int(str(self.cut_value.value).strip().replace(" ", ""))
+        except Exception:
+            await interaction.response.send_message("❌ Срез должен быть числом.", ephemeral=True)
+            return
+        cut_value = max(0, cut_value if cut_on else 0)
+
+        role_income.setdefault("roles", {})[str(self.role.id)] = {
+            "amount": amount_raw,
+            "cooldown": int(cooldown),
+            "auto": False,
+            "mode": "accumulative",
+            "accum_limit": limit_cfg,
+            "accum_cut": cut_value,
+        }
+        save_json(ROLE_INCOME_FILE, role_income)
+
+        limit_desc = "без лимита"
+        if limit_cfg.get("type") == "time":
+            limit_desc = f"до {format_interval(int(limit_cfg.get('value', 0)))}"
+        elif limit_cfg.get("type") == "cycles":
+            limit_desc = f"до {int(limit_cfg.get('value', 0))} пропусков"
+
+        await interaction.response.send_message(
+            embed=Embed(
+                title="✅ Накопительный доход добавлен",
+                description=(
+                    f"**Роль:** {self.role.mention}\n\n"
+                    f"**Сумма:** {amount_raw} {currency}\n"
+                    f"**Кулдаун:** {format_interval(cooldown)}\n"
+                    f"**Лимит накопления:** {limit_desc}\n"
+                    f"**Срез накопления:** {'вкл' if cut_value > 0 else 'выкл'}"
+                    + (f" (−{fmt_money(cut_value)} за пропуск)" if cut_value > 0 else "")
+                ),
+                color=0x00FF00,
+            )
+        )
+
+
+class IncomeModeSelectView(View):
+    def __init__(self, author_id: int, role: discord.Role):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.role = role
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Эти кнопки доступны только автору команды.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Обычный сбор", style=ButtonStyle.secondary, emoji="💵")
+    async def normal(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(IncomeBaseModal(self.role, auto_mode=False))
+
+    @discord.ui.button(label="Автоколлект", style=ButtonStyle.primary, emoji="🤖")
+    async def auto(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(IncomeBaseModal(self.role, auto_mode=True))
+
+    @discord.ui.button(label="Накопительный сбор", style=ButtonStyle.success, emoji="📈")
+    async def accum(self, interaction: Interaction, button: Button):
+        await interaction.response.send_modal(IncomeAccumModal(self.role))
+
+
 @bot.command(name="постыочистить")
 @commands.has_permissions(administrator=True)
 async def постыочистить(ctx):
@@ -11946,27 +12188,36 @@ async def забрать(ctx, member: discord.Member, amount: str):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def доходдобавить(
-    ctx, role: discord.Role, amount: str, cooldown: int, auto: str = "да"
-):
-    role_income.setdefault("roles", {})[str(role.id)] = {
-        "amount": amount,
-        "cooldown": cooldown,
-        "auto": auto.lower() in ["да", "yes", "true", "1"],
-    }
-    save_json(ROLE_INCOME_FILE, role_income)
+async def доходдобавить(ctx, *, role_query: str = ""):
+    role = None
+    try:
+        role = await commands.RoleConverter().convert(ctx, role_query)
+    except Exception:
+        role = resolve_role_from_text(ctx.guild, role_query)
+
+    if not role:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description='Укажите роль: `!доходдобавить "название роли"` или mention роли.',
+                color=0xFF0000,
+            )
+        )
+        return
 
     await ctx.send(
         embed=Embed(
-            title="✅ Доход для роли добавлен",
+            title="💰 Добавление дохода роли",
             description=(
                 f"**Роль:** {role.mention}\n\n"
-                f"**Сумма:** {amount} {currency}\n\n"
-                f"**Кулдаун:** {cooldown}с\n\n"
-                f"**Автосбор:** {role_income['roles'][str(role.id)]['auto']}"
+                "Выберите формат:\n"
+                "• Обычный сбор\n"
+                "• Автоколлект\n"
+                "• Накопительный сбор"
             ),
-            color=0x00FF00,
-        )
+            color=0x3498DB,
+        ),
+        view=IncomeModeSelectView(ctx.author.id, role),
     )
 
 
