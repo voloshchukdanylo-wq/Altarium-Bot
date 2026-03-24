@@ -10930,6 +10930,58 @@ def remove_country_registration(country_name: str):
         country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
 
 
+def remap_country_references(old_name: str, new_name: str, new_type: str):
+    old_key = str(old_name or "")
+    new_key = str(new_name or "")
+    if not old_key or not new_key:
+        return
+
+    season_country_to_user, season_user_to_country = ensure_registration_maps()
+    for season_key, mapping in season_country_to_user.items():
+        if not isinstance(mapping, dict) or old_key not in mapping:
+            continue
+        uid = mapping.pop(old_key)
+        mapping[new_key] = uid
+        if uid:
+            season_user_to_country.setdefault(season_key, {})[str(uid)] = new_key
+
+    for profile in country_owners.setdefault("user_profiles", {}).values():
+        if not isinstance(profile, dict):
+            continue
+        registrations = profile.get("registrations")
+        if not isinstance(registrations, dict):
+            continue
+        for reg_data in registrations.values():
+            if isinstance(reg_data, dict) and str(reg_data.get("country")) == old_key:
+                reg_data["country"] = new_key
+                reg_data["type"] = new_type
+        if str(profile.get("active_country")) == old_key:
+            profile["active_country"] = new_key
+
+    players = load_json(PLAYER_STATS_FILE, {})
+    players_changed = False
+    for uid, country_map in list(players.items()):
+        if not isinstance(country_map, dict) or old_key not in country_map:
+            continue
+        current_payload = country_map.pop(old_key)
+        if new_key in country_map and isinstance(country_map[new_key], dict) and isinstance(current_payload, dict):
+            merged = dict(country_map[new_key])
+            merged.update(current_payload)
+            country_map[new_key] = merged
+        else:
+            country_map[new_key] = current_payload
+        players_changed = True
+
+    if players_changed:
+        save_json(PLAYER_STATS_FILE, players)
+
+    active_season = get_active_registration_season()
+    if active_season:
+        country_owners["country_to_user"] = dict(season_country_to_user.get(active_season, {}))
+        country_owners["user_to_country"] = dict(season_user_to_country.get(active_season, {}))
+    save_country_owners()
+
+
 def clear_all_registrations() -> tuple[int, int]:
     season_country_to_user, season_user_to_country = ensure_registration_maps()
     players = load_json(PLAYER_STATS_FILE, {})
@@ -15833,6 +15885,228 @@ async def создатьстат(ctx):
         async def cancel(self, interaction: Interaction, button: Button):
             await interaction.response.edit_message(
                 embed=Embed(title="❎ Создание отменено", color=0xAAAAAA), view=None
+            )
+            self.stop()
+
+    view = StatView()
+    await ctx.send(embed=build_embed(), view=view)
+
+
+@bot.command(name="редактстат")
+@commands.has_permissions(administrator=True)
+async def редактстат(ctx, *, country: str):
+    resolved_country = resolve_country_name(country)
+    if not resolved_country:
+        await ctx.send(
+            embed=Embed(
+                title="❌ Ошибка",
+                description=f"Страна **{country}** не найдена в статистике.",
+                color=0xFF0000,
+            )
+        )
+        return
+
+    country_record = country_stats.get(resolved_country, {}) if isinstance(country_stats.get(resolved_country), dict) else {}
+    seasons_map = country_record.get("seasons", {}) if isinstance(country_record.get("seasons"), dict) else {}
+    default_season = ""
+    default_population = 0
+    active_season = str(seasons_data.get("active_season") or "").strip()
+    if active_season and active_season in seasons_map:
+        default_season = active_season
+        default_population = int(seasons_map.get(active_season) or 0)
+    elif seasons_map:
+        default_season = str(next(iter(seasons_map.keys())))
+        default_population = int(seasons_map.get(default_season) or 0)
+
+    draft = {
+        "original_country": resolved_country,
+        "country": resolved_country,
+        "type": get_country_type(resolved_country),
+        "season": default_season,
+        "population": default_population,
+        "owner_country": get_region_owner_country(resolved_country) or "",
+    }
+    types = ["Государство", "Регион", "ЧВК", "Организация", "Повстанцы", "Террористы"]
+
+    def build_embed():
+        embed = Embed(title="🧾 Редактирование стата", color=0x3498DB)
+        owner_line = ""
+        if draft["type"] == "Регион":
+            owner_line = f"\n**Государство-владелец:** {draft['owner_country'] or '—'}"
+        embed.description = (
+            f"**Было:** {draft['original_country']}\n"
+            f"**Название:** {draft['country'] or '—'}\n"
+            f"**Тип:** {draft['type']}\n"
+            f"**Сезон:** {draft['season'] or '—'}\n"
+            f"**Население:** {fmt_num(draft['population']) if draft['population'] else '—'}"
+            f"{owner_line}"
+        )
+        return embed
+
+    class StatModal(Modal):
+        def __init__(self):
+            super().__init__(title="Параметры стата", timeout=600)
+            self.country_in = TextInput(
+                label="Название",
+                required=True,
+                max_length=120,
+                default=draft["country"],
+            )
+            self.type_in = TextInput(
+                label="Тип",
+                required=True,
+                default=draft["type"],
+                placeholder=", ".join(types),
+            )
+            self.season_in = TextInput(
+                label="Сезон", required=True, max_length=120, default=draft["season"]
+            )
+            self.pop_in = TextInput(
+                label="Население",
+                required=True,
+                default=(str(draft["population"]) if draft["population"] else ""),
+            )
+            self.owner_country_in = TextInput(
+                label="Государство-владелец (для региона)",
+                required=False,
+                max_length=120,
+                default=draft.get("owner_country", ""),
+                placeholder="Обязательно для типа Регион",
+            )
+            self.add_item(self.country_in)
+            self.add_item(self.type_in)
+            self.add_item(self.season_in)
+            self.add_item(self.pop_in)
+            self.add_item(self.owner_country_in)
+
+        async def on_submit(self, interaction: Interaction):
+            country_type = next(
+                (
+                    t
+                    for t in types
+                    if t.casefold() == str(self.type_in.value).strip().casefold()
+                ),
+                None,
+            )
+            if not country_type:
+                await interaction.response.send_message(
+                    "❌ Неверный тип записи.", ephemeral=True
+                )
+                return
+            try:
+                pop_val = int(str(self.pop_in.value).strip())
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Население должно быть числом.", ephemeral=True
+                )
+                return
+            draft["country"] = str(self.country_in.value).strip()
+            draft["type"] = country_type
+            draft["season"] = str(self.season_in.value).strip()
+            draft["population"] = max(0, pop_val)
+            draft["owner_country"] = str(self.owner_country_in.value).strip()
+
+            if draft["type"] == "Регион":
+                parent_name = resolve_country_name(draft["owner_country"])
+                if not parent_name:
+                    await interaction.response.send_message(
+                        "❌ Сохранение региона невозможно: государство-владелец не найдено в статах.",
+                        ephemeral=True,
+                    )
+                    return
+                if get_country_type(parent_name) != "Государство":
+                    await interaction.response.send_message(
+                        "❌ Владелец региона должен быть типа `Государство`.",
+                        ephemeral=True,
+                    )
+                    return
+                draft["owner_country"] = parent_name
+            else:
+                draft["owner_country"] = ""
+            await interaction.response.edit_message(embed=build_embed(), view=view)
+
+    class StatView(View):
+        def __init__(self):
+            super().__init__(timeout=900)
+
+        async def interaction_check(self, interaction: Interaction) -> bool:
+            if interaction.user.id != ctx.author.id:
+                await interaction.response.send_message(
+                    "❌ Только автор команды может настраивать.", ephemeral=True
+                )
+                return False
+            return True
+
+        @discord.ui.button(label="Открыть форму", style=ButtonStyle.primary)
+        async def open_form(self, interaction: Interaction, button: Button):
+            await interaction.response.send_modal(StatModal())
+
+        @discord.ui.button(label="✅ Сохранить", style=ButtonStyle.success)
+        async def save(self, interaction: Interaction, button: Button):
+            if not draft["country"] or not draft["season"] or draft["population"] <= 0:
+                await interaction.response.send_message(
+                    "❌ Заполните все поля и укажите население > 0.", ephemeral=True
+                )
+                return
+            if draft["season"] not in seasons_data.get("seasons", {}):
+                await interaction.response.send_message(
+                    "❌ Такой сезон не создан. Сначала !создатьсезон.", ephemeral=True
+                )
+                return
+            if draft["type"] == "Регион":
+                parent_name = resolve_country_name(draft.get("owner_country", ""))
+                if not parent_name or get_country_type(parent_name) != "Государство":
+                    await interaction.response.send_message(
+                        "❌ Для региона нужно указать существующее государство-владельца.",
+                        ephemeral=True,
+                    )
+                    return
+                draft["owner_country"] = parent_name
+
+            existing_name = resolve_country_name(draft["country"])
+            if existing_name and existing_name != draft["original_country"]:
+                await interaction.response.send_message(
+                    f"❌ Формирование **{existing_name}** уже существует.",
+                    ephemeral=True,
+                )
+                return
+
+            old_name = draft["original_country"]
+            new_name = draft["country"]
+            if old_name != new_name:
+                record = country_stats.pop(old_name, {})
+                country_stats[new_name] = record if isinstance(record, dict) else {}
+
+            set_country_population_for_season(
+                new_name,
+                draft["season"],
+                int(draft["population"]),
+                draft["type"],
+            )
+            record = country_stats.setdefault(new_name, {})
+            if draft["type"] == "Регион":
+                record["owner_country"] = draft["owner_country"]
+            else:
+                record.pop("owner_country", None)
+
+            if old_name != new_name:
+                remap_country_references(old_name, new_name, draft["type"])
+
+            save_json(COUNTRY_STATS_FILE, country_stats)
+            await interaction.response.edit_message(
+                embed=Embed(
+                    title="✅ Статистика обновлена",
+                    description=build_embed().description,
+                    color=0x00FF00,
+                ),
+                view=None,
+            )
+            self.stop()
+
+        @discord.ui.button(label="❌ Отмена", style=ButtonStyle.secondary)
+        async def cancel(self, interaction: Interaction, button: Button):
+            await interaction.response.edit_message(
+                embed=Embed(title="❎ Редактирование отменено", color=0xAAAAAA), view=None
             )
             self.stop()
 
