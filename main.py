@@ -814,8 +814,8 @@ def update_company_derived_fields(company: dict):
     company.setdefault("last_income_at", int(time.time()))
     company.setdefault("last_expense_at", int(time.time()))
     company.setdefault("autobuy", [])
-    company.setdefault("subject_item", "")
     company.setdefault("country_presence", {})
+    company.setdefault("science_auto_bonus", 0)
     company.setdefault("active_ad_attack_until", 0)
     company.setdefault("active_ad_attack_target", None)
     company.setdefault("active_ad_attack_percent", 0)
@@ -893,7 +893,7 @@ def build_company_embed(company: dict, idx: int, total: int):
     em.add_field(name="Траты (за цикл)", value=f"{company.get('expense_amount', '0')} / {format_interval(expense_cd)}", inline=True)
     em.add_field(name="Доходы (за цикл)", value=f"{company.get('income_amount', '0')} / {format_interval(income_cd)}", inline=True)
     em.add_field(name="Оценка цены компании", value=f"{est_price:,}", inline=False)
-    em.add_field(name="Предмет компании", value=(company_subject_item_name(company) or "Не назначен"), inline=False)
+    em.add_field(name="Автонадбавка науки", value=f"{int(company.get('science_auto_bonus', 0) or 0)} за цикл дохода", inline=False)
     presence = ensure_company_country_presence_struct(company)
     active_countries = [k for k, v in presence.items() if isinstance(v, dict) and str(v.get("status")) == "active"]
     em.add_field(name="Присутствие в странах", value=(", ".join(active_countries[:10]) if active_countries else "Только страна владельца"), inline=False)
@@ -7608,10 +7608,6 @@ def find_companies_by_name(query: str, owner_id: str | None = None):
     return [c for c in all_companies if q in str(c.get("name", "")).strip().lower()]
 
 
-def company_subject_item_name(company: dict) -> str:
-    return str(company.get("subject_item") or company.get("company_item") or "").strip()
-
-
 def ensure_company_country_presence_struct(company: dict):
     if not isinstance(company.get("country_presence"), dict):
         company["country_presence"] = {}
@@ -7643,16 +7639,6 @@ def get_owner_country_of_company(company: dict) -> str | None:
     return get_country_name_by_user_id(str(company.get("owner_id") or ""))
 
 
-def get_user_company_item_qty(user_id: str, item_name: str) -> int:
-    if not item_name:
-        return 0
-    key_matches = resolve_item_key(item_name)
-    if not key_matches:
-        return 0
-    key = key_matches[0]
-    return int(inventory.setdefault(str(user_id), {}).get(key, 0))
-
-
 def effective_company_share(company: dict, user_id: str, country_name: str | None = None) -> float:
     owner_id = str(company.get("owner_id") or "")
     if str(user_id) == owner_id:
@@ -7664,11 +7650,8 @@ def effective_company_share(company: dict, user_id: str, country_name: str | Non
     presence = ensure_company_country_presence_struct(company).get(str(country_name))
     if not isinstance(presence, dict) or str(presence.get("status")) != "active":
         return 0.0
-    max_units = max(1, int(presence.get("max_units", 0) or 0))
-    qty = max(0, get_user_company_item_qty(str(user_id), company_subject_item_name(company)))
-    if qty <= 0:
-        return 0.0
-    return max(0.0, min(1.0, qty / max_units))
+    share_percent = int(presence.get("share_percent", 10) or 10)
+    return max(0.0, min(1.0, share_percent / 100.0))
 
 
 COMPANY_REQUEST_TYPE_LABELS = {
@@ -7729,10 +7712,12 @@ class CompanyCreateModal(Modal):
         self.company_name = TextInput(label="Название компании", required=True, max_length=120)
         self.specialization = TextInput(label="Специализация (номер)", required=True, max_length=20)
         self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100)
+        self.science_auto_bonus = TextInput(label="Автонадбавка науки (за цикл дохода)", required=False, max_length=20, default="0")
         self.add_item(self.post_url)
         self.add_item(self.company_name)
         self.add_item(self.specialization)
         self.add_item(self.first_invest)
+        self.add_item(self.science_auto_bonus)
 
     async def on_submit(self, interaction: Interaction):
         author_id = str(interaction.user.id)
@@ -7775,6 +7760,15 @@ class CompanyCreateModal(Modal):
         if int(first_invest) <= 0:
             await interaction.response.send_message("❌ Первый вклад должен быть больше нуля.", ephemeral=True)
             return
+        raw_science_bonus = str(self.science_auto_bonus.value).strip() or "0"
+        try:
+            science_auto_bonus = int(raw_science_bonus)
+        except Exception:
+            await interaction.response.send_message("❌ Автонадбавка науки должна быть целым числом.", ephemeral=True)
+            return
+        if science_auto_bonus < 0:
+            await interaction.response.send_message("❌ Автонадбавка науки не может быть отрицательной.", ephemeral=True)
+            return
 
         available_cash = int(user.get("наличка", 0)) - int(user.get("заморожено", 0))
         if int(first_invest) > available_cash:
@@ -7806,6 +7800,7 @@ class CompanyCreateModal(Modal):
                 "Название": str(self.company_name.value).strip(),
                 "Специализация": specialization_name,
                 "Первый вклад": raw_first_invest,
+                "Автонадбавка науки": str(science_auto_bonus),
             },
             "first_invest_charged": int(first_invest),
             "first_invest_refunded": False,
@@ -8305,11 +8300,10 @@ class CompanyCountryDecisionView(View):
             return
         target_country = str(req.get("target_country") or "").strip()
         presence = ensure_company_country_presence_struct(company)
-        buyer_qty = get_user_company_item_qty(target_owner_id, company_subject_item_name(company))
         presence[target_country] = {
             "status": "active",
             "buyer_user_id": target_owner_id,
-            "max_units": max(1, int(buyer_qty or 1)),
+            "share_percent": 10,
             "created_at": int(time.time()),
         }
         req["status"] = "approved"
@@ -8385,9 +8379,6 @@ class CompanyForeignEntryRequestModal(Modal):
             await interaction.response.send_message("❌ Уточните название компании (найдено несколько совпадений).", ephemeral=True)
             return
         company = matches[0]
-        if not company_subject_item_name(company):
-            await interaction.response.send_message("❌ Для компании не назначен предмет компании. Создание входа недоступно.", ephemeral=True)
-            return
 
         target_member = resolve_member_query(
             interaction.guild,
@@ -8443,6 +8434,7 @@ COMPANY_CHANGE_LABELS = {
     "expense_cooldown": "КД трат",
     "advert_level": "Уровень рекламы",
     "min_value": "Оценка цены",
+    "science_auto_bonus": "Автонадбавка науки",
 }
 
 
@@ -8551,6 +8543,38 @@ class CompanyValueChangeModal(Modal):
         await interaction.response.send_message("✅ Оценка компании сохранена.", ephemeral=True)
 
 
+class CompanyScienceBonusChangeModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = companies_data.get("requests", {}).get(self.req_id, {})
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")), {}) if req else {}
+        super().__init__(title="Сменить автонадбавку науки", timeout=600)
+        default_value = "0"
+        if req and str(req.get("type")) == "create":
+            default_value = str(req.get("payload", {}).get("Автонадбавка науки", "0"))
+        elif company:
+            default_value = str(company.get("science_auto_bonus", 0))
+        self.value = TextInput(label="Науки за 1 цикл дохода", required=True, max_length=20, default=default_value[:20])
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        try:
+            bonus = int(str(self.value.value).strip())
+        except Exception:
+            await interaction.response.send_message("❌ Введите целое число.", ephemeral=True)
+            return
+        if bonus < 0:
+            await interaction.response.send_message("❌ Значение не может быть отрицательным.", ephemeral=True)
+            return
+        _append_company_review_change(req, "science_auto_bonus", str(bonus), "Автонадбавка науки", interaction.user)
+        save_companies_data()
+        await interaction.response.send_message("✅ Автонадбавка науки сохранена.", ephemeral=True)
+
+
 class CompanyCreatePayloadEditModal(Modal):
     def __init__(self, req_id: str):
         self.req_id = str(req_id)
@@ -8560,11 +8584,16 @@ class CompanyCreatePayloadEditModal(Modal):
         self.company_name = TextInput(label="Название компании", required=True, max_length=120, default=str(payload.get("Название", ""))[:120])
         self.specialization = TextInput(label="Специализация (номер)", required=True, max_length=20)
         self.first_invest = TextInput(label="Первый вклад", required=True, max_length=100, default=str(payload.get("Первый вклад", ""))[:100])
-        self.subject_item = TextInput(label="Предмет компании (из магазина)", required=True, max_length=120, default=str(payload.get("Предмет компании", ""))[:120])
+        self.science_auto_bonus = TextInput(
+            label="Автонадбавка науки (за цикл дохода)",
+            required=False,
+            max_length=20,
+            default=str(payload.get("Автонадбавка науки", "0"))[:20],
+        )
         self.add_item(self.company_name)
         self.add_item(self.specialization)
         self.add_item(self.first_invest)
-        self.add_item(self.subject_item)
+        self.add_item(self.science_auto_bonus)
 
     async def on_submit(self, interaction: Interaction):
         req = companies_data.get("requests", {}).get(self.req_id)
@@ -8577,19 +8606,21 @@ class CompanyCreatePayloadEditModal(Modal):
             await interaction.response.send_message("❌ Неверная специализация: укажите её номер.", ephemeral=True)
             return
 
-        subject_matches = resolve_item_key(str(self.subject_item.value).strip())
-        if not subject_matches:
-            await interaction.response.send_message("❌ Предмет компании не найден в магазине.", ephemeral=True)
+        raw_science_bonus = str(self.science_auto_bonus.value).strip() or "0"
+        try:
+            science_auto_bonus = int(raw_science_bonus)
+        except Exception:
+            await interaction.response.send_message("❌ Автонадбавка науки должна быть целым числом.", ephemeral=True)
             return
-        if len(subject_matches) > 1:
-            await interaction.response.send_message("❌ Уточните название предмета компании (найдено несколько совпадений).", ephemeral=True)
+        if science_auto_bonus < 0:
+            await interaction.response.send_message("❌ Автонадбавка науки не может быть отрицательной.", ephemeral=True)
             return
 
         payload = req.setdefault("payload", {})
         payload["Название"] = str(self.company_name.value).strip()
         payload["Специализация"] = specialization_name
         payload["Первый вклад"] = str(self.first_invest.value).strip()
-        payload["Предмет компании"] = subject_matches[0]
+        payload["Автонадбавка науки"] = str(science_auto_bonus)
         req["status_text"] = f"📝 Данные создания отредактированы: {interaction.user.display_name}"
         req["processed_by"] = str(interaction.user.id)
         save_companies_data()
@@ -8697,15 +8728,15 @@ class CompanyReviewView(View):
                     ephemeral=True,
                 )
                 return
-            subject_item_raw = str(payload.get("Предмет компании", "")).strip()
-            subject_matches = resolve_item_key(subject_item_raw)
-            if not subject_matches:
+            try:
+                payload_science_bonus = int(str(payload.get("Автонадбавка науки", "0")).strip() or 0)
+            except Exception:
                 await interaction.response.send_message(
-                    "❌ Нельзя создать компанию без корректного предмета компании из магазина. Укажите его через меню редактирования заявки.",
+                    "❌ Неверный формат `автонадбавки науки` в заявке создания.",
                     ephemeral=True,
                 )
                 return
-            subject_item = subject_matches[0]
+            payload_science_bonus = max(0, payload_science_bonus)
             charged_amount = int(req.get("first_invest_charged", 0) or 0)
             if charged_amount <= 0:
                 available_cash = int(creator.get("наличка", 0)) - int(creator.get("заморожено", 0))
@@ -8732,8 +8763,8 @@ class CompanyReviewView(View):
                 "specialization": payload.get("Специализация", "—"),
                 "founded_year": founded,
                 "first_invest": int(first_invest),
-                "subject_item": subject_item,
                 "advert_level": 1,
+                "science_auto_bonus": payload_science_bonus,
                 "income_amount": str(max(100000, int(first_invest * 0.05) if first_invest > 0 else 100000)),
                 "income_cooldown": 3600,
                 "expense_amount": str(max(10000, int(first_invest * 0.01) if first_invest > 0 else 10000)),
@@ -8756,6 +8787,8 @@ class CompanyReviewView(View):
                 company["min_value"] = parse_money_value(str(changes["min_value"]), max(1, int(first_invest)))
             if "advert_level" in changes:
                 company["advert_level"] = max(1, int(str(changes["advert_level"]).strip()))
+            if "science_auto_bonus" in changes:
+                company["science_auto_bonus"] = max(0, int(str(changes["science_auto_bonus"]).strip()))
             update_company_derived_fields(company)
             companies_data.setdefault("companies", {})[company_id] = company
             summary.append(f"Создана компания {company.get('name')}")
@@ -8890,6 +8923,15 @@ class CompanyReviewView(View):
                         ephemeral=True,
                     )
                     return
+            if "science_auto_bonus" in changes:
+                try:
+                    company["science_auto_bonus"] = max(0, int(str(changes["science_auto_bonus"]).strip()))
+                except Exception:
+                    await interaction.response.send_message(
+                        "❌ Неверный формат `автонадбавки науки` в изменениях компании.",
+                        ephemeral=True,
+                    )
+                    return
             update_company_derived_fields(company)
             if changes:
                 lines = []
@@ -8900,6 +8942,7 @@ class CompanyReviewView(View):
                     "expense_cooldown",
                     "advert_level",
                     "min_value",
+                    "science_auto_bonus",
                 ]:
                     if change_key not in changes:
                         continue
@@ -8950,6 +8993,7 @@ class CompanyReviewActionSelect(Select):
             SelectOption(label="Сменить траты (и КД)", value="expense", emoji="📉"),
             SelectOption(label="Сменить уровень рекламы", value="advert", emoji="📣"),
             SelectOption(label="Сменить оценку цены", value="value", emoji="💎"),
+            SelectOption(label="Сменить автонадбавку науки", value="science_bonus", emoji="🔬"),
             SelectOption(label="Добавить стоимость входа", value="entry_fee", emoji="💰"),
             SelectOption(label="Принять заявку", value="approve", emoji="✅"),
             SelectOption(label="Отклонить по причине", value="reject", emoji="❌"),
@@ -8977,7 +9021,7 @@ class CompanyReviewActionSelect(Select):
             return
 
         choice = self.values[0]
-        if choice in {"income", "expense", "advert", "value"} and str(req.get("type")) not in {"upgrade", "create"}:
+        if choice in {"income", "expense", "advert", "value", "science_bonus"} and str(req.get("type")) not in {"upgrade", "create"}:
             await interaction.response.send_message(
                 "❌ Ручные изменения параметров доступны только для заявок на создание или улучшение компании.",
                 ephemeral=True,
@@ -9002,6 +9046,9 @@ class CompanyReviewActionSelect(Select):
             return
         if choice == "value":
             await interaction.response.send_modal(CompanyValueChangeModal(view.req_id))
+            return
+        if choice == "science_bonus":
+            await interaction.response.send_modal(CompanyScienceBonusChangeModal(view.req_id))
             return
         if choice == "entry_fee":
             if str(req.get("type")) != "foreign_entry":
@@ -9053,8 +9100,7 @@ class CompanyActionsSelect(Select):
                 embed=Embed(
                     title="📚 Специализации компаний",
                     description=(
-                        f"Перед созданием выберите номер специализации:\n\n{available}\n\n"
-                        "Предмет компании теперь назначается модератором в меню редактирования заявки."
+                        f"Перед созданием выберите номер специализации:\n\n{available}"
                     ),
                     color=0x3498DB,
                 ),
@@ -9231,6 +9277,79 @@ class CompanyDirectValueModal(Modal):
         await interaction.response.send_message("✅ Оценка компании обновлена.", ephemeral=True)
 
 
+class CompanyDirectScienceBonusModal(Modal):
+    def __init__(self, company_id: str):
+        self.company_id = str(company_id)
+        company = companies_data.get("companies", {}).get(self.company_id, {})
+        super().__init__(title="Сменить автонадбавку науки", timeout=600)
+        self.value = TextInput(
+            label="Науки за 1 цикл дохода",
+            required=True,
+            max_length=20,
+            default=str(int(company.get("science_auto_bonus", 0) or 0)),
+        )
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: Interaction):
+        company = companies_data.get("companies", {}).get(self.company_id)
+        if not company:
+            await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+            return
+        try:
+            bonus = int(str(self.value.value).strip())
+        except Exception:
+            await interaction.response.send_message("❌ Введите целое число.", ephemeral=True)
+            return
+        if bonus < 0:
+            await interaction.response.send_message("❌ Значение не может быть отрицательным.", ephemeral=True)
+            return
+        company["science_auto_bonus"] = bonus
+        save_companies_data()
+        await interaction.response.send_message("✅ Автонадбавка науки обновлена.", ephemeral=True)
+
+
+class CompanyRawEditModal(Modal):
+    def __init__(self, company_id: str):
+        self.company_id = str(company_id)
+        company = companies_data.get("companies", {}).get(self.company_id, {})
+        raw = json.dumps(company, ensure_ascii=False, indent=2)
+        if len(raw) > 3900:
+            raw = json.dumps(company, ensure_ascii=False)
+        super().__init__(title="Полное редактирование компании", timeout=900)
+        self.raw_json = TextInput(
+            label="JSON компании",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000,
+            default=raw[:4000],
+        )
+        self.add_item(self.raw_json)
+
+    async def on_submit(self, interaction: Interaction):
+        current = companies_data.get("companies", {}).get(self.company_id)
+        if not current:
+            await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
+            return
+        raw = str(self.raw_json.value).strip()
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            await interaction.response.send_message("❌ Некорректный JSON.", ephemeral=True)
+            return
+        if not isinstance(payload, dict):
+            await interaction.response.send_message("❌ JSON должен быть объектом.", ephemeral=True)
+            return
+        payload["id"] = str(self.company_id)
+        payload["owner_id"] = str(payload.get("owner_id", current.get("owner_id", "")))
+        update_company_derived_fields(payload)
+        companies_data.setdefault("companies", {})[self.company_id] = payload
+        save_companies_data()
+        await interaction.response.send_message(
+            "✅ Компания полностью обновлена из JSON (включая страны пребывания и другие поля).",
+            ephemeral=True,
+        )
+
+
 class CompanyAutoBuyModal(Modal):
     def __init__(self, company_id: str):
         self.company_id = str(company_id)
@@ -9272,7 +9391,9 @@ class CompanyDirectEditSelect(Select):
             SelectOption(label="Сменить траты (и КД)", value="expense", emoji="📉"),
             SelectOption(label="Сменить уровень рекламы", value="advert", emoji="📣"),
             SelectOption(label="Сменить оценку цены", value="value", emoji="💎"),
+            SelectOption(label="Сменить автонадбавку науки", value="science_bonus", emoji="🔬"),
             SelectOption(label="Настроить автопокупку", value="autobuy", emoji="🛍️"),
+            SelectOption(label="Полное редактирование (JSON)", value="raw_edit", emoji="🧩"),
         ]
         super().__init__(placeholder="Выберите параметр компании", min_values=1, max_values=1, options=options)
 
@@ -9290,8 +9411,14 @@ class CompanyDirectEditSelect(Select):
         if choice == "value":
             await interaction.response.send_modal(CompanyDirectValueModal(self.company_id))
             return
+        if choice == "science_bonus":
+            await interaction.response.send_modal(CompanyDirectScienceBonusModal(self.company_id))
+            return
         if choice == "autobuy":
             await interaction.response.send_modal(CompanyAutoBuyModal(self.company_id))
+            return
+        if choice == "raw_edit":
+            await interaction.response.send_modal(CompanyRawEditModal(self.company_id))
             return
 
 
@@ -13376,6 +13503,7 @@ async def auto_role_income_loop():
         # Автоначисление компаний
         comp_changed = False
         balances_changed_comp = False
+        player_state_changed_comp = False
         now_comp = int(time.time())
         for company in companies_data.setdefault("companies", {}).values():
             owner_id = str(company.get("owner_id") or "")
@@ -13398,6 +13526,7 @@ async def auto_role_income_loop():
                         inc = 0
                     if inc:
                         owner_gain = int(inc)
+                        science_gain = max(0, int(company.get("science_auto_bonus", 0) or 0))
                         victim_company_id = str(company.get("id") or "")
                         active_attackers = []
                         for attacker in companies_data.setdefault("companies", {}).values():
@@ -13439,6 +13568,10 @@ async def auto_role_income_loop():
                                 except Exception:
                                     pass
                         user["наличка"] = int(user.get("наличка", 0)) + owner_gain
+                        if science_gain > 0:
+                            state = ensure_player_state(owner_id)
+                            state["science"] = int(state.get("science", 0) or 0) + science_gain
+                            player_state_changed_comp = True
                         total_income += owner_gain
                         balances_changed_comp = True
 
@@ -13559,6 +13692,8 @@ async def auto_role_income_loop():
             save_json(BALANCES_FILE, balances)
             save_inventory()
             save_items()
+        if player_state_changed_comp:
+            save_player_state()
 
 
         status_until = settings.get("status_until")
