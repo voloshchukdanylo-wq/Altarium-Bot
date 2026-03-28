@@ -13798,7 +13798,6 @@ async def auto_role_income_loop():
         # Автоначисление компаний
         comp_changed = False
         balances_changed_comp = False
-        player_state_changed_comp = False
         now_comp = int(time.time())
         for company in companies_data.setdefault("companies", {}).values():
             owner_id = str(company.get("owner_id") or "")
@@ -13821,7 +13820,6 @@ async def auto_role_income_loop():
                         inc = 0
                     if inc:
                         owner_gain = int(inc)
-                        science_gain = max(0, int(company.get("science_auto_bonus", 0) or 0))
                         victim_company_id = str(company.get("id") or "")
                         active_attackers = []
                         for attacker in companies_data.setdefault("companies", {}).values():
@@ -13863,10 +13861,6 @@ async def auto_role_income_loop():
                                 except Exception:
                                     pass
                         user["наличка"] = int(user.get("наличка", 0)) + owner_gain
-                        if science_gain > 0:
-                            state = ensure_player_state(owner_id)
-                            state["science"] = int(state.get("science", 0) or 0) + science_gain
-                            player_state_changed_comp = True
                         total_income += owner_gain
                         balances_changed_comp = True
 
@@ -13987,10 +13981,6 @@ async def auto_role_income_loop():
             save_json(BALANCES_FILE, balances)
             save_inventory()
             save_items()
-        if player_state_changed_comp:
-            save_player_state()
-
-
         status_until = settings.get("status_until")
         if status_until is not None and int(time.time()) >= int(status_until):
             settings["status_emoji"] = None
@@ -14019,6 +14009,7 @@ async def auto_role_income_loop():
                     next_tick_at = rp["next_tick_at"]
 
                 progressed_year = False
+                progressed_year_count = 0
                 while now_rp >= int(next_tick_at):
                     rp_year = int(rp.get("year", rp_year)) + 1
                     rp["year"] = rp_year
@@ -14027,6 +14018,7 @@ async def auto_role_income_loop():
                     next_tick_at = int(next_tick_at) + rp_cooldown
                     rp["next_tick_at"] = next_tick_at
                     progressed_year = True
+                    progressed_year_count += 1
 
                     for inv_id, inv in investments.setdefault("active_investments", {}).items():
                         if str(inv.get("status")) != "pending_year":
@@ -14080,6 +14072,20 @@ async def auto_role_income_loop():
                         pass
 
                 if progressed_year:
+                    rp_science_changed = False
+                    for company in companies_data.setdefault("companies", {}).values():
+                        owner_id = str(company.get("owner_id") or "")
+                        if not owner_id:
+                            continue
+                        science_gain_per_year = max(0, int(company.get("science_auto_bonus", 0) or 0))
+                        if science_gain_per_year <= 0:
+                            continue
+                        state = ensure_player_state(owner_id)
+                        state["science"] = int(state.get("science", 0) or 0) + (science_gain_per_year * progressed_year_count)
+                        rp_science_changed = True
+
+                    if rp_science_changed:
+                        save_player_state()
                     save_investments()
 
         # Счастье / население / содержание войск (каждые 12ч)
