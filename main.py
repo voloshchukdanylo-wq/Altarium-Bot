@@ -5538,76 +5538,147 @@ async def сферы(ctx):
 @bot.command(name="понизитьсферу")
 @commands.has_permissions(administrator=True)
 async def понизитьсферу(ctx, member: discord.Member):
-    user_id = str(member.id)
+    await уровеньсферы(ctx, member=member)
+
+
+class SphereLevelSetModal(Modal):
+    def __init__(self, target_member: discord.Member, sphere_id: str, season_name: str):
+        sphere = seasons_data.get("spheres", {}).get(str(sphere_id), {})
+        sphere_name = sphere.get("name", str(sphere_id))
+        current_level = get_user_sphere_level(str(target_member.id), str(sphere_id), season_name)
+        super().__init__(title=f"Изменить уровень: {sphere_name}", timeout=300)
+        self.target_member = target_member
+        self.sphere_id = str(sphere_id)
+        self.sphere_name = sphere_name
+        self.season_name = str(season_name)
+        self.current_level = int(current_level)
+        self.new_level = TextInput(
+            label="Новый уровень (0+)",
+            required=True,
+            default=str(self.current_level),
+            max_length=6,
+        )
+        self.add_item(self.new_level)
+
+    async def on_submit(self, interaction: Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ Только администратор может менять уровни сфер.", ephemeral=True
+            )
+            return
+        try:
+            parsed = int(str(self.new_level.value).strip())
+            if parsed < 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Уровень должен быть целым числом не ниже 0.", ephemeral=True
+            )
+            return
+
+        set_user_sphere_level(
+            str(self.target_member.id),
+            self.sphere_id,
+            parsed,
+            self.season_name,
+        )
+        await interaction.response.send_message(
+            embed=Embed(
+                title="✅ Уровень сферы обновлён",
+                description=(
+                    f"{self.target_member.mention}: **{self.sphere_name}** "
+                    f"(сезон {self.season_name}) — **{self.current_level} → {parsed}**."
+                ),
+                color=0x00FF00,
+            ),
+            ephemeral=True,
+        )
+
+
+class SphereLevelAdminSelect(Select):
+    def __init__(self, actor_id: int, target_member: discord.Member, season_name: str):
+        self.actor_id = int(actor_id)
+        self.target_member = target_member
+        self.season_name = str(season_name)
+        spheres = sorted(
+            get_active_spheres(),
+            key=lambda sp: str(sp.get("name", sp.get("id", ""))).casefold(),
+        )
+        options = [
+            SelectOption(label=sp.get("name", str(sp.get("id"))), value=str(sp.get("id")))
+            for sp in spheres[:25]
+        ]
+        super().__init__(
+            placeholder="Выберите сферу для изменения уровня",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: Interaction):
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message(
+                "Это меню не для вас.", ephemeral=True
+            )
+            return
+        sphere_id = str(self.values[0])
+        await interaction.response.send_modal(
+            SphereLevelSetModal(self.target_member, sphere_id, self.season_name)
+        )
+
+
+class SphereLevelAdminView(View):
+    def __init__(self, actor_id: int, target_member: discord.Member, season_name: str):
+        super().__init__(timeout=300)
+        self.add_item(SphereLevelAdminSelect(actor_id, target_member, season_name))
+
+
+@bot.command(name="уровеньсферы")
+@commands.has_permissions(administrator=True)
+async def уровеньсферы(ctx, member: discord.Member):
     active = seasons_data.get("active_season")
-    progress = get_user_progress_for_season(user_id, active)
-    current = []
-    for sid, level in progress.items():
-        lvl = int(level)
-        if lvl <= 0:
-            continue
-        sp = seasons_data.setdefault("spheres", {}).get(str(sid), {})
-        current.append((str(sid), sp.get("name", str(sid)), lvl))
-    if not current:
+    spheres = get_active_spheres()
+    if not active:
         await ctx.send(
             embed=Embed(
-                title="❌ Ошибка",
-                description="У игрока нет прокачанных сфер.",
-                color=0xFF0000,
+                title="ℹ️ Сферы",
+                description="Активный сезон не установлен (`!установитьсезон`).",
+                color=0x3498DB,
+            )
+        )
+        return
+    if not spheres:
+        await ctx.send(
+            embed=Embed(
+                title="ℹ️ Сферы",
+                description=f"Для сезона {active} сфер пока нет.",
+                color=0x3498DB,
             )
         )
         return
 
-    lines = "\n".join(
-        f"• {name}: {level}"
-        for name, level in sorted(current, key=lambda x: x[0].casefold())
-    )
+    progress = get_user_progress_for_season(str(member.id), active)
+    lines = []
+    for sp in sorted(spheres, key=lambda x: str(x.get("name", x.get("id", ""))).casefold()):
+        sid = str(sp.get("id"))
+        level = int(progress.get(sid, 0))
+        if level > 0:
+            lines.append(f"• **{sp.get('name', sid)}** — {level}")
+    if not lines:
+        lines.append("• Нет прокачанных сфер (все уровни = 0)")
+
+    view = SphereLevelAdminView(ctx.author.id, member, active)
     await ctx.send(
         embed=Embed(
-            title=f"📉 Понижение сфер — {member.display_name}",
+            title=f"🛠 Уровни сфер — {member.display_name}",
             description=(
-                f"Текущие уровни:\n{lines}\n\n"
-                "Введите новое значение в формате: `Сфера:уровень`\n"
-                "Пример: `Здравоохранение: 3`"
+                f"Сезон: **{active}**\n\n"
+                f"Текущие уровни:\n{chr(10).join(lines)}\n\n"
+                "Выберите сферу в меню ниже, чтобы установить новый уровень."
             ),
             color=0x3498DB,
-        )
-    )
-
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel
-
-    try:
-        msg = await bot.wait_for("message", check=check, timeout=180)
-        raw = msg.content.strip()
-        if ":" not in raw:
-            raise ValueError("Неверный формат")
-        sphere_name, level_text = [x.strip() for x in raw.split(":", 1)]
-        sid = resolve_sphere_id_by_name(sphere_name, active)
-        if not sid or sid not in progress:
-            raise ValueError("Сфера не найдена у игрока в активном сезоне")
-        new_level = int(level_text)
-        old_level = int(progress.get(sid, 0))
-        if new_level < 0 or new_level >= old_level:
-            raise ValueError("Новый уровень должен быть меньше текущего и не ниже 0")
-        progress[sid] = new_level
-        save_seasons_data()
-    except Exception as e:
-        await ctx.send(
-            embed=Embed(
-                title="❌ Ошибка",
-                description=f"Не удалось понизить сферу: {e}",
-                color=0xFF0000,
-            )
-        )
-        return
-
-    await ctx.send(
-        embed=Embed(
-            title="✅ Сфера понижена",
-            description=f"{member.mention}: **{sphere_name}** (сезон {active}) → уровень **{new_level}**.",
-            color=0x00FF00,
-        )
+        ),
+        view=view,
     )
 
 
