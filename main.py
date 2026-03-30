@@ -434,10 +434,11 @@ def preserve_item_in_tech_library(item_key: str, item_payload: dict, reason: str
     library = items_data.setdefault("tech_library", {})
     snapshot = json.loads(json.dumps(item_payload))
     active_season = str(seasons_data.get("active_season") or "").strip()
+    item_season = str(item_payload.get("season") or item_payload.get("saved_season") or "").strip()
     snapshot["key"] = item_key
     snapshot["last_removed_at"] = int(time.time())
     snapshot["last_removed_reason"] = reason
-    snapshot["saved_season"] = active_season or "Без сезона"
+    snapshot["saved_season"] = item_season or active_season or "Без сезона"
     library[item_key] = snapshot
 
 
@@ -682,6 +683,8 @@ def ensure_player_state(user_id: str):
             "science": 0,
             "pre_reg_role_ids": [],
             "work_last_at": 0,
+            "autowipe_status": "",
+            "autowipe_requested_at": 0,
         },
     )
     state.setdefault("shield_until", 0)
@@ -697,6 +700,8 @@ def ensure_player_state(user_id: str):
     state.setdefault("science", 0)
     state.setdefault("work_last_at", 0)
     state.setdefault("pre_reg_role_ids", [])
+    state.setdefault("autowipe_status", "")
+    state.setdefault("autowipe_requested_at", 0)
     return state
 
 
@@ -1849,6 +1854,9 @@ async def on_ready():
         for req_id, req in events_data.get("requests", {}).items():
             if isinstance(req, dict) and req.get("status") == "sent":
                 bot.add_view(EventPlayerView(str(req_id), page=0))
+        for user_id, st in player_state.get("users", {}).items():
+            if isinstance(st, dict) and str(st.get("autowipe_status", "")).lower() == "pending":
+                bot.add_view(AutoWipeDecisionView(str(user_id)))
         persistent_views_registered = True
     try:
         await restore_company_request_views()
@@ -1996,6 +2004,73 @@ async def send_message_log_embed(guild: discord.Guild, embed: Embed):
             await channel.send(embed=embed)
         except Exception:
             pass
+
+
+def _can_manage_wipes_member(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return has_custom_command_access(member, "вайп")
+
+
+class AutoWipeDecisionView(View):
+    def __init__(self, user_id: str):
+        super().__init__(timeout=None)
+        self.user_id = str(user_id)
+
+    @discord.ui.button(label="✅ Одобрить автовайп", style=ButtonStyle.danger)
+    async def approve(self, interaction: Interaction, button: Button):
+        if not _can_manage_wipes_member(interaction.user):
+            await interaction.response.send_message("❌ Нет доступа к решению автовайпа.", ephemeral=True)
+            return
+        st = ensure_player_state(self.user_id)
+        if st.get("autowipe_status") != "pending":
+            await interaction.response.send_message("⚠️ Решение уже принято.", ephemeral=True)
+            return
+        st["autowipe_status"] = "approved"
+        st["autowipe_requested_at"] = 0
+        save_player_state()
+        await send_mod_log(
+            interaction.guild,
+            Embed(
+                title="💥 Одобрен запрос на автовайп",
+                description=(
+                    f"**Игрок:** <@{self.user_id}> (`{self.user_id}`)\n"
+                    f"**Модератор:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                    "**Источник:** автозапрос по счастью = 0"
+                ),
+                color=0xE74C3C,
+            ),
+        )
+        wipe_user_data(self.user_id, interaction.guild)
+        await interaction.response.edit_message(
+            embed=Embed(
+                title="💥 Автовайп одобрен",
+                description=f"Игрок <@{self.user_id}> вайпнут после достижения счастья 0.",
+                color=0xE74C3C,
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="❌ Отклонить автовайп", style=ButtonStyle.secondary)
+    async def reject(self, interaction: Interaction, button: Button):
+        if not _can_manage_wipes_member(interaction.user):
+            await interaction.response.send_message("❌ Нет доступа к решению автовайпа.", ephemeral=True)
+            return
+        st = ensure_player_state(self.user_id)
+        if st.get("autowipe_status") != "pending":
+            await interaction.response.send_message("⚠️ Решение уже принято.", ephemeral=True)
+            return
+        st["autowipe_status"] = "rejected"
+        st["autowipe_requested_at"] = 0
+        save_player_state()
+        await interaction.response.edit_message(
+            embed=Embed(
+                title="⛔ Автовайп отклонён",
+                description=f"Игрок <@{self.user_id}> остаётся незарегистрированным с нулевым счастьем.",
+                color=0x95A5A6,
+            ),
+            view=None,
+        )
 
 
 async def resolve_message_deleter(guild: discord.Guild, message: discord.Message):
@@ -6309,7 +6384,7 @@ def verdict_ping_roles_line(guild: discord.Guild):
 
 
 async def _edit_verdict_request_message(
-    guild: discord.Guild, req: dict, status_text: str, color: discord.Color
+    guild: discord.Guild, req: dict, status_text: str, color: discord.Color, view: View | None = None
 ):
     channel_id = req.get("request_channel_id")
     message_id = req.get("request_message_id")
@@ -6347,7 +6422,7 @@ async def _edit_verdict_request_message(
                 name="Ссылка", value=str(req.get("message_link") or "—"), inline=False
             )
             em.add_field(name="Статус", value=status_text, inline=False)
-        await msg.edit(embed=em, view=None)
+        await msg.edit(embed=em, view=view)
     except Exception:
         pass
 
@@ -6674,7 +6749,8 @@ class VerdictReputationModal(Modal):
                 "kind": "reputation",
                 "member_id": uid,
                 "value": val,
-                "label": f"Репутация {mention} -> {val}",
+                "reason": str(self.reason.value or "по вердикту").strip() or "по вердикту",
+                "label": f"Репутация {mention} -> {val} ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
             }
         )
         save_verdicts_data()
@@ -6730,7 +6806,8 @@ class VerdictHappinessModal(Modal):
                 "kind": "happiness",
                 "member_id": uid,
                 "value": val,
-                "label": f"Счастье {mention} -> {val}%",
+                "reason": str(self.reason.value or "по вердикту").strip() or "по вердикту",
+                "label": f"Счастье {mention} -> {val}% ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
             }
         )
         save_verdicts_data()
@@ -6773,7 +6850,8 @@ class VerdictScienceModal(Modal):
                 "kind": "science",
                 "member_id": uid,
                 "value": val,
-                "label": f"Наука {mention} -> {val}",
+                "reason": str(self.reason.value or "по вердикту").strip() or "по вердикту",
+                "label": f"Наука {mention} -> {val} ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
             }
         )
         save_verdicts_data()
@@ -6881,6 +6959,7 @@ class VerdictRejectReasonModal(Modal):
                 "❌ Заявка не найдена.", ephemeral=True
             )
             return
+        await interaction.response.defer(ephemeral=True)
 
         reason = str(self.reason.value).strip()
         req["status"] = "rejected"
@@ -6891,8 +6970,9 @@ class VerdictRejectReasonModal(Modal):
         await _edit_verdict_request_message(
             interaction.guild,
             req,
-            f"❌ Отклонено\nКуратор: {interaction.user.mention}\nПричина: {reason}",
+            f"❌ Заявка #{self.req_id}: отправил <@{req.get('author_id')}>, принял {interaction.user.mention}, отклонил: {reason}",
             discord.Color.red(),
+            view=VerdictResultView(self.req_id),
         )
 
         result_channel = (
@@ -6915,14 +6995,7 @@ class VerdictRejectReasonModal(Modal):
                 )
             )
 
-        await interaction.response.edit_message(
-            embed=Embed(
-                title="❌ Вердикт отклонён",
-                description=f"Заявка #{self.req_id} отклонена. Причина сохранена и отправлена в итог-канал.",
-                color=0xAA0000,
-            ),
-            view=None,
-        )
+        await interaction.followup.send("✅ Отклонение сохранено и отправлено в итог-канал.", ephemeral=True)
 
 
 class VerdictReviewSelect(Select):
@@ -6974,6 +7047,7 @@ class VerdictReviewSelect(Select):
             )
             return
         if choice == "finalize":
+            await interaction.response.defer(ephemeral=True)
             draft = req.get("draft", {})
             ops = draft.get("ops", [])
             for op in ops:
@@ -7015,8 +7089,9 @@ class VerdictReviewSelect(Select):
             await _edit_verdict_request_message(
                 interaction.guild,
                 req,
-                f"✅ Принято\nКуратор: {interaction.user.mention}",
+                f"✅ Заявка #{self.req_id}: отправил <@{req.get('author_id')}>, принял {interaction.user.mention}",
                 discord.Color.green(),
+                view=VerdictResultView(self.req_id),
             )
 
             result_channel = (
@@ -7030,14 +7105,7 @@ class VerdictReviewSelect(Select):
                 await result_channel.send(content=author_mention)
                 for page in pages:
                     await result_channel.send(embed=page)
-            await interaction.response.edit_message(
-                embed=Embed(
-                    title="✅ Вердикт отправлен",
-                    description=f"Заявка #{self.req_id} завершена.",
-                    color=0x00FF00,
-                ),
-                view=None,
-            )
+            await interaction.followup.send("✅ Вердикт принят и отправлен.", ephemeral=True)
             return
 
         if choice == "desc":
@@ -7098,6 +7166,25 @@ class VerdictPanelView(View):
     )
     async def ask(self, interaction: Interaction, button: Button):
         await interaction.response.send_modal(VerdictRequestModal())
+
+
+class VerdictResultView(View):
+    def __init__(self, req_id: str):
+        super().__init__(timeout=None)
+        self.req_id = str(req_id)
+
+    @discord.ui.button(label="📄 Вердикт", style=ButtonStyle.secondary)
+    async def open_result(self, interaction: Interaction, button: Button):
+        req = verdicts_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        pages = build_verdict_pages(req)
+        await interaction.response.send_message(
+            embed=pages[0],
+            view=VerdictPagesView(pages, interaction.user.id),
+            ephemeral=True,
+        )
 
 
 def _can_manage_verdicts_member(member: discord.Member) -> bool:
@@ -13778,9 +13865,6 @@ async def auto_role_income_loop():
 
                 entry["last_run"] = last_run + cycles * cooldown
                 changed = True
-                print(
-                    f"[AUTO_LOOP] Пассивный поток: guild={guild.id} user={user_id} type={entry.get('type', 'income')} delta={int(delta)} cycles={cycles}"
-                )
                 await log_economy_change(
                     guild,
                     user_id,
@@ -14182,7 +14266,66 @@ async def auto_role_income_loop():
                     st["happiness"] = happiness
 
                     if happiness <= 0:
-                        wipe_user_data(user_id, guild)
+                        if st.get("autowipe_status") != "pending":
+                            st["autowipe_status"] = "pending"
+                            st["autowipe_requested_at"] = now_tick
+                            remove_user_registration(user_id)
+                            member = guild.get_member(int(user_id)) if guild and str(user_id).isdigit() else None
+                            em = Embed(
+                                title="⚠️ Запрос на автовайп",
+                                description=(
+                                    f"У игрока {member.mention if member else f'<@{user_id}>'} счастье достигло **0**.\n"
+                                    "Нужно решение куратора: одобрить автoвайп или отклонить.\n"
+                                    "При отклонении игрок остаётся незарегистрированным с нулевым счастьем."
+                                ),
+                                color=0xF39C12,
+                            )
+                            await send_message_log_embed(guild, em)
+                            channel_id = settings.get("message_log_channel")
+                            channel = guild.get_channel(int(channel_id)) if channel_id and guild else None
+                            if channel:
+                                try:
+                                    await channel.send(
+                                        embed=Embed(
+                                            title="🧾 Решение по автовайпу",
+                                            description=f"Игрок: <@{user_id}>",
+                                            color=0xF39C12,
+                                        ),
+                                        view=AutoWipeDecisionView(user_id),
+                                    )
+                                except Exception:
+                                    pass
+                            mod_log_channel_id = moderation_data.get("log_channel")
+                            mod_log_channel = (
+                                guild.get_channel(int(mod_log_channel_id))
+                                if mod_log_channel_id and guild
+                                else None
+                            )
+                            if (
+                                mod_log_channel
+                                and (not channel or int(mod_log_channel.id) != int(channel.id))
+                            ):
+                                try:
+                                    await mod_log_channel.send(
+                                        embed=Embed(
+                                            title="🧾 Запрос на решение автовайпа",
+                                            description=(
+                                                f"Игрок: <@{user_id}> (`{user_id}`)\n"
+                                                "Причина: счастье достигло 0."
+                                            ),
+                                            color=0xF39C12,
+                                        ),
+                                        view=AutoWipeDecisionView(user_id),
+                                    )
+                                except Exception:
+                                    pass
+                        else:
+                            requested_at = int(st.get("autowipe_requested_at", now_tick))
+                            waited = max(0, now_tick - requested_at)
+                            print(
+                                f"[AUTO_WIPE] Ожидание решения: user={user_id} elapsed={format_interval(waited)} happiness=0"
+                            )
+                        state_changed = True
                         continue
 
                     growth_pct = get_population_growth_percent(happiness)
@@ -15541,7 +15684,7 @@ async def инвентарь(ctx, member: discord.Member = None):
             )
             return
 
-        desc = ""
+        lines = []
         for key, amount, source_kind, ttl_txt in category_items:
             info = items_data["items"].get(key)
             if not info:
@@ -15549,7 +15692,14 @@ async def инвентарь(ctx, member: discord.Member = None):
             extra = ""
             if source_kind == "gift":
                 extra = f" *(серверный подарок, ⏳ {ttl_txt})*"
-            desc += f"**{key}** — {amount} шт.{extra}\n{info['description']}\n\n"
+            lines.append(f"**{key}** — {amount} шт.{extra}")
+            lines.append(str(info.get("description") or "—"))
+            lines.append("")
+
+        chunks = chunk_lines_for_embed(lines, limit=3800)
+        desc = chunks[0] if chunks else "Нет предметов в этой категории."
+        if len(chunks) > 1:
+            desc += f"\n\n_Показана только часть списка ({len(chunks)} стр.)._"
 
         await interaction.response.send_message(
             embed=Embed(title=f"🎒 {category_name}", description=desc, color=0x3498DB),
