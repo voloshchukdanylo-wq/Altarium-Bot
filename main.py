@@ -15697,12 +15697,60 @@ async def инвентарь(ctx, member: discord.Member = None):
             lines.append("")
 
         chunks = chunk_lines_for_embed(lines, limit=3800)
-        desc = chunks[0] if chunks else "Нет предметов в этой категории."
-        if len(chunks) > 1:
-            desc += f"\n\n_Показана только часть списка ({len(chunks)} стр.)._"
+        if not chunks:
+            chunks = ["Нет предметов в этой категории."]
+
+        def build_page_embed(page_idx: int) -> Embed:
+            total_pages = len(chunks)
+            em = Embed(
+                title=f"🎒 {category_name}",
+                description=chunks[page_idx],
+                color=0x3498DB,
+            )
+            if total_pages > 1:
+                em.set_footer(text=f"Страница {page_idx + 1}/{total_pages}")
+            return em
+
+        if len(chunks) == 1:
+            await interaction.response.send_message(
+                embed=build_page_embed(0),
+                ephemeral=True,
+            )
+            return
+
+        class InventoryPagesView(View):
+            def __init__(self):
+                super().__init__(timeout=180)
+                self.page = 0
+                self._sync_buttons()
+
+            def _sync_buttons(self):
+                self.prev_button.disabled = self.page == 0
+                self.next_button.disabled = self.page >= len(chunks) - 1
+
+            @discord.ui.button(label="⬅️", style=ButtonStyle.secondary)
+            async def prev_button(self, page_interaction: Interaction, button: Button):
+                if self.page > 0:
+                    self.page -= 1
+                self._sync_buttons()
+                await page_interaction.response.edit_message(
+                    embed=build_page_embed(self.page),
+                    view=self,
+                )
+
+            @discord.ui.button(label="➡️", style=ButtonStyle.secondary)
+            async def next_button(self, page_interaction: Interaction, button: Button):
+                if self.page < len(chunks) - 1:
+                    self.page += 1
+                self._sync_buttons()
+                await page_interaction.response.edit_message(
+                    embed=build_page_embed(self.page),
+                    view=self,
+                )
 
         await interaction.response.send_message(
-            embed=Embed(title=f"🎒 {category_name}", description=desc, color=0x3498DB),
+            embed=build_page_embed(0),
+            view=InventoryPagesView(),
             ephemeral=True,
         )
 
