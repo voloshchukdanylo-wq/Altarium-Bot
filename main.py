@@ -855,6 +855,8 @@ def update_company_derived_fields(company: dict):
     company["income_amount"] = str(income_num)
 
     company.setdefault("min_value", first_invest)
+    if "investment_limit" not in company:
+        company["investment_limit"] = None
     company.setdefault("last_income_at", int(time.time()))
     company.setdefault("last_expense_at", int(time.time()))
     company.setdefault("autobuy", [])
@@ -864,6 +866,17 @@ def update_company_derived_fields(company: dict):
     company.setdefault("active_ad_attack_target", None)
     company.setdefault("active_ad_attack_percent", 0)
     company.setdefault("ad_attack_cooldown_until", 0)
+
+
+def get_company_investment_limit(company: dict) -> int | None:
+    raw = company.get("investment_limit")
+    if raw in (None, "", "None", "none", "null"):
+        return None
+    try:
+        limit = int(raw)
+    except Exception:
+        return None
+    return max(0, limit)
 
 
 def company_estimated_price(company: dict) -> int:
@@ -5252,16 +5265,17 @@ class SphereReviewView(View):
                 "Заявка не найдена или уже обработана.", ephemeral=True
             )
             return
+        await interaction.response.defer(ephemeral=True)
 
         user = ensure_user(str(req["user_id"]))
         sphere = seasons_data["spheres"].get(req["sphere_id"])
         if not sphere:
-            await interaction.response.send_message("Сфера не найдена.", ephemeral=True)
+            await interaction.followup.send("Сфера не найдена.", ephemeral=True)
             return
         level_data = sphere["levels"][req["level"] - 1]
         price = int(level_data["price"])
         if get_available_cash(user) < price:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Недостаточно доступных средств у игрока.", ephemeral=True
             )
             return
@@ -5307,7 +5321,7 @@ class SphereReviewView(View):
         )
         processed_embed.color = discord.Color.green()
         await interaction.message.edit(embed=processed_embed, view=None)
-        await interaction.response.send_message("Заявка принята.", ephemeral=True)
+        await interaction.followup.send("Заявка принята.", ephemeral=True)
 
     @discord.ui.button(label="❌ Отклонить", style=ButtonStyle.danger)
     async def reject(self, interaction: Interaction, button: Button):
@@ -8440,6 +8454,13 @@ class CompanyUpgradeModal(Modal):
             return
         company = matches[0]
         cid = str(company.get("id"))
+        current_rp_year = investments.get("rp_year", {}).get("year")
+        if current_rp_year is not None and str(company.get("last_upgrade_year")) == str(current_rp_year):
+            await interaction.response.send_message(
+                "❌ Вложить деньги в улучшение можно только раз в год.",
+                ephemeral=True,
+            )
+            return
 
         owner = ensure_user(owner_id)
         raw_invest = str(self.invest.value).strip()
@@ -8454,6 +8475,13 @@ class CompanyUpgradeModal(Modal):
 
         if int(invest_amount) <= 0:
             await interaction.response.send_message("❌ Вклад должен быть больше нуля.", ephemeral=True)
+            return
+        company_limit = get_company_investment_limit(company)
+        if company_limit is not None and int(invest_amount) > int(company_limit):
+            await interaction.response.send_message(
+                f"❌ Превышен верхний потолок вложений: лимит {int(company_limit):,}, вы указали {int(invest_amount):,}.",
+                ephemeral=True,
+            )
             return
 
         available_cash = int(owner.get("наличка", 0)) - int(owner.get("заморожено", 0))
@@ -8888,10 +8916,15 @@ COMPANY_CHANGE_LABELS = {
     "advert_level": "Уровень рекламы",
     "min_value": "Оценка цены",
     "science_auto_bonus": "Автонадбавка науки",
+    "investment_limit": "Лимит вложений",
 }
 
 
 def format_company_change_value(key: str, value) -> str:
+    if key == "investment_limit":
+        if str(value).strip().lower() in {"", "none", "null", "безлимит", "unlimited"}:
+            return "Без лимита"
+        return str(value)
     if key in {"income_cooldown", "expense_cooldown"}:
         try:
             return format_interval(max(0, parse_interval(str(value))))
@@ -9026,6 +9059,54 @@ class CompanyScienceBonusChangeModal(Modal):
         _append_company_review_change(req, "science_auto_bonus", str(bonus), "Автонадбавка науки", interaction.user)
         save_companies_data()
         await interaction.response.send_message("✅ Автонадбавка науки сохранена.", ephemeral=True)
+
+
+class CompanyInvestmentLimitChangeModal(Modal):
+    def __init__(self, req_id: str):
+        self.req_id = str(req_id)
+        req = companies_data.get("requests", {}).get(self.req_id, {})
+        company = companies_data.get("companies", {}).get(str(req.get("company_id")), {}) if req else {}
+        super().__init__(title="Сменить лимит вложений", timeout=600)
+        default_value = "безлимит"
+        if req:
+            change_value = req.get("review_changes", {}).get("investment_limit")
+            if change_value is not None:
+                default_value = str(change_value)
+            elif company:
+                company_limit = get_company_investment_limit(company)
+                default_value = "безлимит" if company_limit is None else str(company_limit)
+        self.value = TextInput(
+            label="Новый лимит (число или «безлимит»)",
+            required=True,
+            max_length=100,
+            default=default_value[:100],
+        )
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: Interaction):
+        req = companies_data.get("requests", {}).get(self.req_id)
+        if not req:
+            await interaction.response.send_message("❌ Заявка не найдена.", ephemeral=True)
+            return
+        raw = str(self.value.value).strip()
+        if raw.lower() in {"безлимит", "none", "null", "unlimited", "-"}:
+            stored = "none"
+        else:
+            try:
+                parsed = parse_money_value(raw, 1_000_000_000)
+            except Exception:
+                await interaction.response.send_message(
+                    "❌ Неверный формат лимита. Укажите число (например `500000` или `500к`) либо `безлимит`.",
+                    ephemeral=True,
+                )
+                return
+            if int(parsed) <= 0:
+                await interaction.response.send_message("❌ Лимит должен быть больше нуля или `безлимит`.", ephemeral=True)
+                return
+            stored = str(int(parsed))
+        _append_company_review_change(req, "investment_limit", stored, "Лимит вложений", interaction.user)
+        save_companies_data()
+        await interaction.response.send_message("✅ Лимит вложений сохранён.", ephemeral=True)
 
 
 class CompanyCreatePayloadEditModal(Modal):
@@ -9223,6 +9304,7 @@ class CompanyReviewView(View):
                 "expense_amount": str(max(10000, int(first_invest * 0.01) if first_invest > 0 else 10000)),
                 "expense_cooldown": 3600,
                 "min_value": int(first_invest),
+                "investment_limit": None,
                 "last_income_at": int(time.time()),
                 "last_expense_at": int(time.time()),
                 "created_at": int(time.time()),
@@ -9242,6 +9324,26 @@ class CompanyReviewView(View):
                 company["advert_level"] = max(1, int(str(changes["advert_level"]).strip()))
             if "science_auto_bonus" in changes:
                 company["science_auto_bonus"] = max(0, int(str(changes["science_auto_bonus"]).strip()))
+            if "investment_limit" in changes:
+                raw_limit = str(changes["investment_limit"]).strip().lower()
+                if raw_limit in {"", "none", "null", "безлимит", "unlimited"}:
+                    company["investment_limit"] = None
+                else:
+                    try:
+                        parsed_limit = parse_money_value(str(changes["investment_limit"]), max(1, int(first_invest)))
+                    except Exception:
+                        await interaction.response.send_message(
+                            "❌ Неверный формат `лимита вложений` в изменениях компании.",
+                            ephemeral=True,
+                        )
+                        return
+                    if int(parsed_limit) <= 0:
+                        await interaction.response.send_message(
+                            "❌ Лимит вложений должен быть больше нуля или `безлимит`.",
+                            ephemeral=True,
+                        )
+                        return
+                    company["investment_limit"] = int(parsed_limit)
             update_company_derived_fields(company)
             companies_data.setdefault("companies", {})[company_id] = company
             summary.append(f"Создана компания {company.get('name')}")
@@ -9321,7 +9423,21 @@ class CompanyReviewView(View):
             if not company:
                 await interaction.response.send_message("❌ Компания не найдена.", ephemeral=True)
                 return
+            current_rp_year = investments.get("rp_year", {}).get("year")
+            if current_rp_year is not None and str(company.get("last_upgrade_year")) == str(current_rp_year):
+                await interaction.response.send_message(
+                    "❌ Вложить деньги в улучшение можно только раз в год.",
+                    ephemeral=True,
+                )
+                return
             charged_upgrade = int(req.get("upgrade_invest_charged", 0) or 0)
+            company_limit = get_company_investment_limit(company)
+            if company_limit is not None and charged_upgrade > int(company_limit):
+                await interaction.response.send_message(
+                    f"❌ Превышен верхний потолок вложений: лимит {int(company_limit):,}, запрошено {int(charged_upgrade):,}.",
+                    ephemeral=True,
+                )
+                return
             if charged_upgrade <= 0:
                 owner = ensure_user(author_id)
                 try:
@@ -9334,6 +9450,12 @@ class CompanyReviewView(View):
                     return
                 if int(parsed_upgrade) <= 0:
                     await interaction.response.send_message("❌ Вклад в заявке на улучшение должен быть больше нуля.", ephemeral=True)
+                    return
+                if company_limit is not None and int(parsed_upgrade) > int(company_limit):
+                    await interaction.response.send_message(
+                        f"❌ Превышен верхний потолок вложений: лимит {int(company_limit):,}, запрошено {int(parsed_upgrade):,}.",
+                        ephemeral=True,
+                    )
                     return
                 available_cash = int(owner.get("наличка", 0)) - int(owner.get("заморожено", 0))
                 if int(parsed_upgrade) > available_cash:
@@ -9385,6 +9507,28 @@ class CompanyReviewView(View):
                         ephemeral=True,
                     )
                     return
+            if "investment_limit" in changes:
+                raw_limit = str(changes["investment_limit"]).strip().lower()
+                if raw_limit in {"", "none", "null", "безлимит", "unlimited"}:
+                    company["investment_limit"] = None
+                else:
+                    try:
+                        parsed_limit = parse_money_value(str(changes["investment_limit"]), max(1, int(company.get("min_value", 1) or 1)))
+                    except Exception:
+                        await interaction.response.send_message(
+                            "❌ Неверный формат `лимита вложений` в изменениях компании.",
+                            ephemeral=True,
+                        )
+                        return
+                    if int(parsed_limit) <= 0:
+                        await interaction.response.send_message(
+                            "❌ Лимит вложений должен быть больше нуля или `безлимит`.",
+                            ephemeral=True,
+                        )
+                        return
+                    company["investment_limit"] = int(parsed_limit)
+            if current_rp_year is not None:
+                company["last_upgrade_year"] = int(current_rp_year)
             update_company_derived_fields(company)
             if changes:
                 lines = []
@@ -9396,6 +9540,7 @@ class CompanyReviewView(View):
                     "advert_level",
                     "min_value",
                     "science_auto_bonus",
+                    "investment_limit",
                 ]:
                     if change_key not in changes:
                         continue
@@ -9447,6 +9592,7 @@ class CompanyReviewActionSelect(Select):
             SelectOption(label="Сменить уровень рекламы", value="advert", emoji="📣"),
             SelectOption(label="Сменить оценку цены", value="value", emoji="💎"),
             SelectOption(label="Сменить автонадбавку науки", value="science_bonus", emoji="🔬"),
+            SelectOption(label="Сменить лимит вложений", value="investment_limit", emoji="🧱"),
             SelectOption(label="Добавить стоимость входа", value="entry_fee", emoji="💰"),
             SelectOption(label="Принять заявку", value="approve", emoji="✅"),
             SelectOption(label="Отклонить по причине", value="reject", emoji="❌"),
@@ -9474,7 +9620,7 @@ class CompanyReviewActionSelect(Select):
             return
 
         choice = self.values[0]
-        if choice in {"income", "expense", "advert", "value", "science_bonus"} and str(req.get("type")) not in {"upgrade", "create"}:
+        if choice in {"income", "expense", "advert", "value", "science_bonus", "investment_limit"} and str(req.get("type")) not in {"upgrade", "create"}:
             await interaction.response.send_message(
                 "❌ Ручные изменения параметров доступны только для заявок на создание или улучшение компании.",
                 ephemeral=True,
@@ -9502,6 +9648,9 @@ class CompanyReviewActionSelect(Select):
             return
         if choice == "science_bonus":
             await interaction.response.send_modal(CompanyScienceBonusChangeModal(view.req_id))
+            return
+        if choice == "investment_limit":
+            await interaction.response.send_modal(CompanyInvestmentLimitChangeModal(view.req_id))
             return
         if choice == "entry_fee":
             if str(req.get("type")) != "foreign_entry":
