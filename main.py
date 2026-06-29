@@ -17796,6 +17796,100 @@ async def занятстраны(ctx):
     )
 
 
+FREE_COUNTRY_TYPE_ORDER = [
+    ("Государство", "🏛", "Государства"),
+    ("Регион", "🗺", "Регионы"),
+    ("ЧВК", "⚔️", "ЧВК"),
+    ("Организация", "🏢", "Организации"),
+    ("Повстанцы", "🏴", "Повстанцы"),
+    ("Террористы", "💣", "Террористы"),
+]
+
+FREE_COUNTRY_TYPE_ALIASES = {
+    "Государства": "Государство",
+    "Регионы": "Регион",
+    "Организации": "Организация",
+    "Повстанец": "Повстанцы",
+    "Террорист": "Террористы",
+}
+
+
+def normalize_free_country_type(country_type: str) -> str:
+    raw_type = str(country_type or "Государство").strip() or "Государство"
+    return FREE_COUNTRY_TYPE_ALIASES.get(raw_type, raw_type)
+
+
+def get_free_country_type_meta(country_type: str):
+    normalized_type = normalize_free_country_type(country_type)
+    for type_key, emoji, label in FREE_COUNTRY_TYPE_ORDER:
+        if type_key == normalized_type:
+            return type_key, emoji, label
+    return normalized_type, "📌", normalized_type
+
+
+def build_free_country_groups(active_season: str):
+    country_to_user, _ = get_occupied_country_map(active_season)
+    groups = {type_key: [] for type_key, _, _ in FREE_COUNTRY_TYPE_ORDER}
+
+    for country_name in country_stats.keys():
+        if get_country_population_for_season(country_name, active_season) is None:
+            continue
+        if country_name in country_to_user:
+            continue
+
+        type_key, _, _ = get_free_country_type_meta(get_country_type(country_name))
+        groups.setdefault(type_key, []).append(country_name)
+
+    for country_names in groups.values():
+        country_names.sort(key=lambda x: str(x).casefold())
+
+    return groups
+
+
+def format_free_country_lines(country_names: list[str]) -> list[str]:
+    lines = []
+    current_letter = None
+    for country_name in country_names:
+        first_letter = str(country_name).strip()[:1].upper() or "#"
+        if first_letter != current_letter:
+            if lines:
+                lines.append("")
+            lines.append(f"**{first_letter}**")
+            current_letter = first_letter
+        lines.append(f"• {country_name}")
+    return lines
+
+
+def build_free_country_category_embed(
+    active_season: str,
+    type_key: str,
+    country_names: list[str],
+    page: int = 0,
+    page_size: int = 25,
+):
+    _, emoji, label = get_free_country_type_meta(type_key)
+    total_pages = max(1, math.ceil(len(country_names) / page_size))
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    page_items = country_names[start : start + page_size]
+    desc_lines = format_free_country_lines(page_items)
+    description = (
+        "\n".join(desc_lines)
+        if desc_lines
+        else "В этой категории пока нет свободных регистраций."
+    )
+
+    embed = Embed(
+        title=f"{emoji} Свободные {label.lower()} ({len(country_names)})",
+        description=description,
+        color=0x00AA55,
+    )
+    embed.set_footer(
+        text=f"Сезон: {active_season} • Страница {page + 1}/{total_pages}"
+    )
+    return embed, page, total_pages
+
+
 @bot.command(name="свободстраны")
 async def свободстраны(ctx):
     active_season = get_active_registration_season()
@@ -17809,34 +17903,151 @@ async def свободстраны(ctx):
         )
         return
 
-    country_to_user, _ = get_occupied_country_map(active_season)
-    free = [
-        c
-        for c in country_stats.keys()
-        if get_country_population_for_season(c, active_season) is not None and c not in country_to_user
-    ]
+    class FreeCountriesSelect(Select):
+        def __init__(self, parent_view):
+            self.parent_view = parent_view
+            options = parent_view.build_options()
+            super().__init__(placeholder="Выберите категорию", options=options, row=0)
 
-    if not free:
+        async def callback(self, interaction: Interaction):
+            await self.parent_view.show_category(interaction, self.values[0], page=0)
+
+    class FreeCountriesView(View):
+        def __init__(self, owner_id: int, season_name: str):
+            super().__init__(timeout=300)
+            self.owner_id = owner_id
+            self.season_name = season_name
+            self.groups = build_free_country_groups(season_name)
+            self.selected_type = None
+            self.page = 0
+            self.total_pages = 1
+            self.country_select = FreeCountriesSelect(self)
+            self.add_item(self.country_select)
+            self.update_buttons()
+
+        async def interaction_check(self, interaction: Interaction) -> bool:
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message(
+                    "❌ Это меню открыто другим игроком.", ephemeral=True
+                )
+                return False
+            return True
+
+        def build_options(self):
+            options = []
+            for type_key, emoji, label in FREE_COUNTRY_TYPE_ORDER:
+                count = len(self.groups.get(type_key, []))
+                options.append(
+                    SelectOption(
+                        label=f"{label} ({count})",
+                        value=type_key,
+                        emoji=emoji,
+                    )
+                )
+            extra_types = sorted(
+                set(self.groups.keys())
+                - {type_key for type_key, _, _ in FREE_COUNTRY_TYPE_ORDER},
+                key=lambda x: str(x).casefold(),
+            )
+            for type_key in extra_types[: max(0, 25 - len(options))]:
+                _, emoji, label = get_free_country_type_meta(type_key)
+                options.append(
+                    SelectOption(
+                        label=f"{label} ({len(self.groups.get(type_key, []))})",
+                        value=type_key,
+                        emoji=emoji,
+                    )
+                )
+            return options
+
+        def build_home_embed(self):
+            total = sum(len(items) for items in self.groups.values())
+            summary = []
+            for type_key, emoji, label in FREE_COUNTRY_TYPE_ORDER:
+                summary.append(
+                    f"{emoji} **{label}** — {len(self.groups.get(type_key, []))}"
+                )
+            return Embed(
+                title="🌍 Свободные регистрации",
+                description=(
+                    f"Сезон: **{self.season_name}**\n"
+                    f"Всего свободно: **{total}**\n\n"
+                    "Выберите категорию в меню ниже."
+                    "\n\n" + "\n".join(summary)
+                ),
+                color=0x00AA55,
+            )
+
+        def update_buttons(self):
+            self.back.disabled = self.selected_type is None
+            self.prev_page.disabled = self.selected_type is None or self.total_pages <= 1
+            self.next_page.disabled = self.selected_type is None or self.total_pages <= 1
+
+        async def show_category(
+            self, interaction: Interaction, type_key: str, page: int = 0
+        ):
+            self.selected_type = type_key
+            country_names = self.groups.get(type_key, [])
+            embed, self.page, self.total_pages = build_free_country_category_embed(
+                self.season_name, type_key, country_names, page=page
+            )
+            self.update_buttons()
+            await interaction.response.edit_message(embed=embed, view=self)
+
+        @discord.ui.button(label="◀ Назад", style=ButtonStyle.gray, row=1)
+        async def back(self, interaction: Interaction, button: Button):
+            self.selected_type = None
+            self.page = 0
+            self.total_pages = 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.build_home_embed(), view=self
+            )
+
+        @discord.ui.button(label="⬅️", style=ButtonStyle.gray, row=1)
+        async def prev_page(self, interaction: Interaction, button: Button):
+            if self.selected_type is None:
+                await interaction.response.defer()
+                return
+            await self.show_category(
+                interaction, self.selected_type, page=self.page - 1
+            )
+
+        @discord.ui.button(label="➡️", style=ButtonStyle.gray, row=1)
+        async def next_page(self, interaction: Interaction, button: Button):
+            if self.selected_type is None:
+                await interaction.response.defer()
+                return
+            await self.show_category(
+                interaction, self.selected_type, page=self.page + 1
+            )
+
+        @discord.ui.button(label="🔄 Обновить", style=ButtonStyle.success, row=1)
+        async def refresh(self, interaction: Interaction, button: Button):
+            self.groups = build_free_country_groups(self.season_name)
+            self.country_select.options = self.build_options()
+            if self.selected_type is None:
+                self.page = 0
+                self.total_pages = 1
+                self.update_buttons()
+                await interaction.response.edit_message(
+                    embed=self.build_home_embed(), view=self
+                )
+                return
+            await self.show_category(interaction, self.selected_type, page=self.page)
+
+    view = FreeCountriesView(ctx.author.id, active_season)
+    if sum(len(items) for items in view.groups.values()) == 0:
         await ctx.send(
             embed=Embed(
-                title="🟢 Свободные страны",
-                description=f"Свободных стран в сезоне **{active_season}** нет.",
+                title="🌍 Свободные регистрации",
+                description=f"Свободных регистраций в сезоне **{active_season}** нет.",
                 color=0x00AA55,
             )
         )
         return
 
-    desc = "\n".join(
-        f"• {c}\n↳ *{get_country_type(c)}*"
-        for c in sorted(free, key=lambda x: str(x).casefold())
-    )
-    await ctx.send(
-        embed=Embed(
-            title=f"🟢 Свободные страны сезона {active_season}",
-            description=desc,
-            color=0x00AA55,
-        )
-    )
+    await ctx.send(embed=view.build_home_embed(), view=view)
 
 
 REGISTRATION_TYPE_CONFIG = {
