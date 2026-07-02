@@ -377,6 +377,8 @@ seasons_data.setdefault("seasons", {})
 seasons_data.setdefault("active_season", None)
 seasons_data.setdefault("spheres", {})
 seasons_data.setdefault("season_user_progress", {})
+seasons_data.setdefault("economy_roles", {})
+seasons_data.setdefault("user_economy_levels", {})
 if seasons_data.get("user_progress") and seasons_data.get("active_season"):
     seasons_data["season_user_progress"].setdefault(str(seasons_data.get("active_season")), dict(seasons_data.get("user_progress", {})))
 
@@ -1653,6 +1655,7 @@ SYSTEM_COMMAND_GROUPS = {
         "пасдоходубрать",
         "пасрасходубрать",
         "логэко",
+        "экономика",
     },
 }
 
@@ -4481,6 +4484,101 @@ def set_user_sphere_level(user_id: str, sphere_id: str, level: int, season_name:
     save_seasons_data()
 
 
+def parse_role_ids_from_text(raw: str) -> list[int]:
+    text = str(raw or "").strip()
+    if not text or text.casefold() in {"скип", "нет", "-", "0"}:
+        return []
+    ids: list[int] = []
+    for token in re.split(r"[\s,;]+", text):
+        token = token.strip()
+        if not token:
+            continue
+        match = re.fullmatch(r"<@&([0-9]+)>", token) or re.fullmatch(r"([0-9]+)", token)
+        if not match:
+            raise ValueError("Укажите роли упоминаниями или ID через пробел, либо `скип`.")
+        ids.append(int(match.group(1)))
+    return list(dict.fromkeys(ids))
+
+
+def get_economy_role_settings(season_name: str | None = None) -> dict:
+    season = str(season_name or seasons_data.get("active_season") or "global").strip() or "global"
+    return seasons_data.setdefault("economy_roles", {}).setdefault(season, {})
+
+
+def count_user_spheres_at_level(user_id: str, required_level: int, season_name: str | None = None) -> int:
+    season = str(season_name or seasons_data.get("active_season") or "").strip()
+    progress = get_user_progress_for_season(str(user_id), season)
+    total = 0
+    for sphere in seasons_data.get("spheres", {}).values():
+        if season and str(sphere.get("season")) != season:
+            continue
+        sid = str(sphere.get("id"))
+        try:
+            lvl = int(progress.get(sid, 0))
+        except Exception:
+            lvl = 0
+        if lvl >= int(required_level):
+            total += 1
+    return total
+
+
+def get_qualified_economy_level(user_id: str, season_name: str | None = None) -> int:
+    settings_map = get_economy_role_settings(season_name)
+    qualified = 0
+    for level_text, cfg in settings_map.items():
+        try:
+            econ_level = int(level_text)
+            spheres_required = int(cfg.get("spheres_required", 0))
+            sphere_level = int(cfg.get("sphere_level", 0))
+        except Exception:
+            continue
+        if econ_level < 1 or spheres_required < 1 or sphere_level < 1:
+            continue
+        if count_user_spheres_at_level(user_id, sphere_level, season_name) >= spheres_required:
+            qualified = max(qualified, econ_level)
+    return min(5, qualified)
+
+
+async def sync_member_economy_roles(member: discord.Member, season_name: str | None = None) -> tuple[int, int]:
+    season = str(season_name or seasons_data.get("active_season") or "global").strip() or "global"
+    old_level = int(seasons_data.setdefault("user_economy_levels", {}).setdefault(season, {}).get(str(member.id), 0) or 0)
+    new_level = get_qualified_economy_level(str(member.id), season)
+    settings_map = get_economy_role_settings(season)
+
+    roles_to_add: list[discord.Role] = []
+    roles_to_remove: list[discord.Role] = []
+    for level_text, cfg in settings_map.items():
+        try:
+            econ_level = int(level_text)
+        except Exception:
+            continue
+        add_ids = [int(rid) for rid in cfg.get("add_roles", [])]
+        remove_ids = [int(rid) for rid in cfg.get("remove_roles", [])]
+        if econ_level <= new_level:
+            for rid in add_ids:
+                role = member.guild.get_role(rid)
+                if role and role not in member.roles:
+                    roles_to_add.append(role)
+            for rid in remove_ids:
+                role = member.guild.get_role(rid)
+                if role and role in member.roles:
+                    roles_to_remove.append(role)
+        else:
+            for rid in add_ids:
+                role = member.guild.get_role(rid)
+                if role and role in member.roles:
+                    roles_to_remove.append(role)
+
+    if roles_to_remove:
+        await member.remove_roles(*list(dict.fromkeys(roles_to_remove)), reason="Синхронизация уровня экономики")
+    if roles_to_add:
+        await member.add_roles(*list(dict.fromkeys(roles_to_add)), reason="Синхронизация уровня экономики")
+
+    seasons_data.setdefault("user_economy_levels", {}).setdefault(season, {})[str(member.id)] = new_level
+    save_seasons_data()
+    return old_level, new_level
+
+
 @bot.command(name="создатьсезон")
 @commands.has_permissions(administrator=True)
 async def создатьсезон(ctx):
@@ -5497,6 +5595,7 @@ class SphereReviewView(View):
                 role = guild.get_role(int(rid))
                 if role:
                     await member.add_roles(role)
+            await sync_member_economy_roles(member, sphere.get("season"))
 
         req["status"] = "approved"
         req["processed_by"] = interaction.user.id
@@ -5622,6 +5721,7 @@ async def принять_заявку(ctx, request_id: str):
             role = ctx.guild.get_role(int(rid))
             if role:
                 await member.add_roles(role)
+        await sync_member_economy_roles(member, sphere.get("season"))
 
     req["status"] = "approved"
     req["processed_by"] = ctx.author.id
@@ -5877,12 +5977,16 @@ class SphereLevelSetModal(Modal):
             parsed,
             self.season_name,
         )
+        old_economy_level, new_economy_level = await sync_member_economy_roles(
+            self.target_member, self.season_name
+        )
         await interaction.response.send_message(
             embed=Embed(
                 title="✅ Уровень сферы обновлён",
                 description=(
                     f"{self.target_member.mention}: **{self.sphere_name}** "
-                    f"(сезон {self.season_name}) — **{self.current_level} → {parsed}**."
+                    f"(сезон {self.season_name}) — **{self.current_level} → {parsed}**.\n"
+                    f"Уровень экономики: **{old_economy_level} → {new_economy_level}**."
                 ),
                 color=0x00FF00,
             ),
@@ -5974,6 +6078,151 @@ async def уровеньсферы(ctx, member: discord.Member):
             color=0x3498DB,
         ),
         view=view,
+    )
+
+
+class EconomyLevelModal(Modal):
+    def __init__(self, level: int, season_name: str):
+        self.level = int(level)
+        self.season_name = str(season_name)
+        cfg = get_economy_role_settings(self.season_name).get(str(self.level), {})
+        super().__init__(title=f"Экономика — уровень {self.level}", timeout=600)
+        self.spheres_required = TextInput(
+            label="Сколько сфер требуется",
+            required=True,
+            default=str(cfg.get("spheres_required", "")),
+            max_length=3,
+        )
+        self.sphere_level = TextInput(
+            label="Какого уровня должны быть сферы",
+            required=True,
+            default=str(cfg.get("sphere_level", "")),
+            max_length=3,
+        )
+        self.add_roles = TextInput(
+            label="Роли, которые выдаются",
+            required=False,
+            default=" ".join(f"<@&{rid}>" for rid in cfg.get("add_roles", [])) or "скип",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.remove_roles = TextInput(
+            label="Роли, которые взымаются",
+            required=False,
+            default=" ".join(f"<@&{rid}>" for rid in cfg.get("remove_roles", [])) or "скип",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.add_item(self.spheres_required)
+        self.add_item(self.sphere_level)
+        self.add_item(self.add_roles)
+        self.add_item(self.remove_roles)
+
+    async def on_submit(self, interaction: Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Только администратор может настраивать экономику.", ephemeral=True)
+            return
+        try:
+            spheres_required = int(str(self.spheres_required.value).strip())
+            sphere_level = int(str(self.sphere_level.value).strip())
+            if spheres_required < 1 or sphere_level < 1:
+                raise ValueError
+            add_roles = parse_role_ids_from_text(str(self.add_roles.value))
+            remove_roles = parse_role_ids_from_text(str(self.remove_roles.value))
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"❌ Проверьте форму: {exc or 'числа должны быть не ниже 1.'}", ephemeral=True
+            )
+            return
+
+        settings_map = get_economy_role_settings(self.season_name)
+        settings_map[str(self.level)] = {
+            "spheres_required": spheres_required,
+            "sphere_level": sphere_level,
+            "add_roles": add_roles,
+            "remove_roles": remove_roles,
+        }
+        save_seasons_data()
+        await interaction.response.send_message(
+            embed=Embed(
+                title="✅ Уровень экономики настроен",
+                description=(
+                    f"Сезон: **{self.season_name}**\n"
+                    f"Уровень экономики: **{self.level}**\n"
+                    f"Требование: **{spheres_required}** сфер(ы) уровня **{sphere_level}+**\n"
+                    f"Выдать роли: {' '.join(f'<@&{rid}>' for rid in add_roles) or '—'}\n"
+                    f"Взять роли: {' '.join(f'<@&{rid}>' for rid in remove_roles) or '—'}"
+                ),
+                color=0x00FF00,
+            ),
+            ephemeral=True,
+        )
+
+
+class EconomyLevelSelect(Select):
+    def __init__(self, actor_id: int, season_name: str):
+        self.actor_id = int(actor_id)
+        self.season_name = str(season_name)
+        super().__init__(
+            placeholder="Выберите уровень экономики для настройки",
+            options=[SelectOption(label=f"{level} уровень", value=str(level)) for level in range(1, 6)],
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: Interaction):
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("Это меню не для вас.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EconomyLevelModal(int(self.values[0]), self.season_name))
+
+
+class EconomySettingsView(View):
+    def __init__(self, actor_id: int, season_name: str):
+        super().__init__(timeout=300)
+        self.add_item(EconomyLevelSelect(actor_id, season_name))
+
+
+@bot.command(name="экономика")
+@commands.has_permissions(administrator=True)
+async def экономика(ctx):
+    active = seasons_data.get("active_season")
+    if not active:
+        await ctx.send(
+            embed=Embed(
+                title="ℹ️ Экономика",
+                description="Активный сезон не установлен (`!установитьсезон`).",
+                color=0x3498DB,
+            )
+        )
+        return
+
+    settings_map = get_economy_role_settings(active)
+    lines = []
+    for level in range(1, 6):
+        cfg = settings_map.get(str(level))
+        if not cfg:
+            lines.append(f"• **{level} уровень** — не настроен")
+            continue
+        add_roles = " ".join(f"<@&{rid}>" for rid in cfg.get("add_roles", [])) or "—"
+        remove_roles = " ".join(f"<@&{rid}>" for rid in cfg.get("remove_roles", [])) or "—"
+        lines.append(
+            f"• **{level} уровень** — {cfg.get('spheres_required', 0)} сфер(ы) "
+            f"уровня {cfg.get('sphere_level', 0)}+; выдать: {add_roles}; взять: {remove_roles}"
+        )
+
+    await ctx.send(
+        embed=Embed(
+            title="⚙️ Настройка ролей экономики",
+            description=(
+                f"Сезон: **{active}**\n\n"
+                f"{chr(10).join(lines)}\n\n"
+                "Выберите уровень 1–5 в меню ниже и заполните форму. "
+                "После изменения уровней сфер бот автоматически пересчитает подходящий уровень экономики игрока."
+            ),
+            color=0x3498DB,
+        ),
+        view=EconomySettingsView(ctx.author.id, active),
     )
 
 
