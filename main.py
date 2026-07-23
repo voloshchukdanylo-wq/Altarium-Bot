@@ -2148,6 +2148,7 @@ SYSTEM_COMMAND_GROUPS = {
     "компании": {
         "компании",
         "редакткомпанию",
+        "компанияудалить",
         "компаниироль",
         "заявкикомпаний",
         "итогикомпанийканал",
@@ -3334,6 +3335,7 @@ async def хелп(ctx):
             "партнерства",
             "инвестиции",
             "редакткомпанию",
+            "компанияудалить",
             "рассылка",
         },
         "Регистрация / Страны": {
@@ -3413,6 +3415,7 @@ async def хелп(ctx):
         "партнерство": "Алиас команды !партнерства для выдачи прав на модерацию партнерок.",
         "инвестиции": "Служебная команда для выдачи прав на модерацию инвестиций.",
         "редакткомпанию": "Открывает меню редактирования параметров выбранной компании.",
+        "компанияудалить": "Удаляет компанию по точному или частичному названию.",
         "податьинвестициюканал": "Отправляет панель подачи инвестиционной заявки в выбранный канал.",
         "заявкиинвестиций": "Устанавливает канал, куда отправляются заявки инвестиций.",
         "итогинвестицийканал": "Устанавливает канал итогов по инвестиционным заявкам.",
@@ -12609,6 +12612,64 @@ async def редакткомпанию(ctx):
             color=0x3498DB,
         ),
         view=CompanyEditPickView(ctx.author.id, companies),
+    )
+
+
+@bot.command(name="компанияудалить")
+async def компанияудалить(ctx, *, company_name: str | None = None):
+    if not (ctx.author.guild_permissions.administrator or has_custom_command_access(ctx.author, "компании")):
+        await ctx.send("❌ Нет доступа к удалению компаний.")
+        return
+
+    company_name = str(company_name or "").strip()
+    if not company_name:
+        await ctx.send('❌ Укажите название компании: `!компанияудалить "название"`.')
+        return
+
+    matches = find_companies_by_name(company_name, owner_id=None)
+    if not matches:
+        await ctx.send(embed=Embed(title="❌ Компания не найдена", description=f"По запросу **{company_name}** ничего не найдено.", color=0xE74C3C))
+        return
+    if len(matches) > 1:
+        names = "\n".join(
+            f"• **{c.get('name', 'Без названия')}** (ID: `{c.get('id')}`, владелец: <@{c.get('owner_id')}>)"
+            for c in matches[:10]
+        )
+        suffix = "\n..." if len(matches) > 10 else ""
+        await ctx.send(
+            embed=Embed(
+                title="⚠️ Найдено несколько компаний",
+                description=(
+                    "Уточните название, чтобы команда нашла одну компанию.\n"
+                    f"Найдено совпадений: **{len(matches)}**.\n{names}{suffix}"
+                ),
+                color=0xFFA500,
+            )
+        )
+        return
+
+    company = matches[0]
+    company_id = str(company.get("id"))
+    removed = companies_data.setdefault("companies", {}).pop(company_id, None)
+    if not removed:
+        await ctx.send("❌ Компания уже отсутствует в базе.")
+        return
+
+    for req in companies_data.setdefault("requests", {}).values():
+        if isinstance(req, dict) and str(req.get("company_id")) == company_id and str(req.get("status", "")).startswith("pending"):
+            req["status"] = "cancelled_company_deleted"
+            req["status_text"] = f"🗑️ Отменена: компания удалена модератором {ctx.author.display_name}"
+
+    save_companies_data()
+    await ctx.send(
+        embed=Embed(
+            title="✅ Компания удалена",
+            description=(
+                f"Удалена компания **{removed.get('name', 'Без названия')}** (ID: `{company_id}`).\n"
+                f"Владелец: <@{removed.get('owner_id')}>"
+            ),
+            color=0x2ECC71,
+        )
     )
 
 
