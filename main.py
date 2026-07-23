@@ -8741,7 +8741,8 @@ class VerdictReputationModal(Modal):
         self.req_id = str(req_id)
         req = verdicts_data.get("requests", {}).get(self.req_id, {})
         uid = str(req.get("author_id", ""))
-        current = max(0, min(100, int(ensure_player_state(uid).get("reputation", 50)))) if uid else 50
+        self.current = max(0, min(100, int(ensure_player_state(uid).get("reputation", 50)))) if uid else 50
+        current = self.current
         super().__init__(title="Изменить репутацию", timeout=300)
         self.value = TextInput(
             label="Новая репутация (0-100%)", required=True, default=str(current)
@@ -8781,7 +8782,7 @@ class VerdictReputationModal(Modal):
                 "member_id": uid,
                 "value": val,
                 "reason": str(self.reason.value or "по вердикту").strip() or "по вердикту",
-                "label": f"Репутация {mention}: {current}% → {val}% ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
+                "label": f"Репутация {mention}: {self.current}% → {val}% ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
             }
         )
         save_verdicts_data()
@@ -8798,7 +8799,8 @@ class VerdictHappinessModal(Modal):
         self.req_id = str(req_id)
         req = verdicts_data.get("requests", {}).get(self.req_id, {})
         uid = str(req.get("author_id", ""))
-        current = int(ensure_player_state(uid).get("happiness", 50)) if uid else 50
+        self.current = int(ensure_player_state(uid).get("happiness", 50)) if uid else 50
+        current = self.current
         super().__init__(title="Изменить уровень счастья", timeout=300)
         self.value = TextInput(
             label="Новый уровень счастья (0-100)", required=True, default=str(current)
@@ -8838,7 +8840,7 @@ class VerdictHappinessModal(Modal):
                 "member_id": uid,
                 "value": val,
                 "reason": str(self.reason.value or "по вердикту").strip() or "по вердикту",
-                "label": f"Счастье {mention}: {current}% → {val}% ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
+                "label": f"Счастье {mention}: {self.current}% → {val}% ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
             }
         )
         save_verdicts_data()
@@ -8892,7 +8894,8 @@ class VerdictScienceModal(Modal):
         self.req_id = str(req_id)
         req = verdicts_data.get("requests", {}).get(self.req_id, {})
         uid = str(req.get("author_id", ""))
-        current = int(ensure_player_state(uid).get("science", 0)) if uid else 0
+        self.current = int(ensure_player_state(uid).get("science", 0)) if uid else 0
+        current = self.current
         super().__init__(title="Изменить науку", timeout=300)
         self.value = TextInput(label="Новый уровень науки", required=True, default=str(current))
         self.reason = TextInput(label="Комментарий", required=False, default="по вердикту")
@@ -8919,7 +8922,7 @@ class VerdictScienceModal(Modal):
                 "member_id": uid,
                 "value": val,
                 "reason": str(self.reason.value or "по вердикту").strip() or "по вердикту",
-                "label": f"Наука {mention}: {current} → {val} ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
+                "label": f"Наука {mention}: {self.current} → {val} ({str(self.reason.value or 'по вердикту').strip() or 'по вердикту'})",
             }
         )
         save_verdicts_data()
@@ -9239,11 +9242,11 @@ class VerdictRelationModal(Modal):
         self.mode = mode
         title = "Отношение других к игроку" if mode == "incoming" else "Отношение игрока к другим"
         super().__init__(title=title, timeout=300)
-        self.source = TextInput(label="От кого", required=True)
-        self.target = TextInput(label="К кому", required=True)
+        other_label = "Кто меняет отношение к игроку" if mode == "incoming" else "К кому меняет отношение игрок"
+        self.other = TextInput(label=other_label, required=True)
         self.delta = TextInput(label="Изменение", required=True, placeholder="Например: -15")
         self.reason = TextInput(label="Комментарий", required=False, default="по вердикту", style=discord.TextStyle.paragraph)
-        self.add_item(self.source); self.add_item(self.target); self.add_item(self.delta); self.add_item(self.reason)
+        self.add_item(self.other); self.add_item(self.delta); self.add_item(self.reason)
 
     async def on_submit(self, interaction: Interaction):
         req = verdicts_data.get("requests", {}).get(self.req_id)
@@ -9253,9 +9256,13 @@ class VerdictRelationModal(Modal):
             delta = int(str(self.delta.value).replace("+", "").strip())
         except Exception:
             await interaction.response.send_message("❌ Изменение должно быть числом.", ephemeral=True); return
-        source = relation_subject_key(self.source.value); target = relation_subject_key(self.target.value)
+        author_id = str(req.get("author_id") or "").strip()
+        if not author_id:
+            await interaction.response.send_message("❌ Автор заявки не найден.", ephemeral=True); return
+        other = relation_subject_key(self.other.value)
+        source, target = (other, author_id) if self.mode == "incoming" else (author_id, other)
         for val in (source, target):
-            if not val.isdigit(): relations_data.setdefault("pending_names", {})[val] = val
+            if val and not val.isdigit(): relations_data.setdefault("pending_names", {})[val] = val
         draft = req.setdefault("draft", {})
         draft.setdefault("ops", []).append({"kind": "relation", "source": source, "target": target, "delta": delta, "reason": str(self.reason.value or "по вердикту"), "label": f"Отношения {get_country_display(source)} -> {get_country_display(target)} {delta:+d}"})
         save_relations_data(); save_verdicts_data()
@@ -14120,6 +14127,19 @@ def resolve_country_name(raw_country: str):
     for name in country_stats.keys():
         if str(name).casefold() == q:
             return name
+
+    # Часто страны вводят в падеже (например, «Норвегии» вместо
+    # «Норвегия»). Приводим самые частые русские окончания к именительному,
+    # чтобы отношения не дробились на отдельные записи для одной страны.
+    candidates = []
+    if q.endswith("ии"):
+        candidates.append(f"{q[:-2]}ия")
+    if q.endswith("ии."):
+        candidates.append(f"{q[:-3]}ия")
+    for candidate in candidates:
+        for name in country_stats.keys():
+            if str(name).casefold() == candidate:
+                return name
     return None
 
 
