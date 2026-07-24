@@ -313,6 +313,17 @@ settings.setdefault("status_until", None)
 settings.setdefault("work_cooldown_seconds", 1800)
 settings.setdefault("work_profit_min", 7_000_000)
 settings.setdefault("work_profit_max", 7_000_000)
+settings.setdefault("request_cooldowns", {})
+settings.setdefault("request_last_submit", {})
+for _request_cd_key, _request_cd_default in {
+    "verdicts": 0,
+    "spheres": 0,
+    "companies": 0,
+    "investments": 0,
+    "partnerships": 0,
+    "events": 0,
+}.items():
+    settings["request_cooldowns"].setdefault(_request_cd_key, _request_cd_default)
 settings.setdefault("occupied_registrations_channel", None)
 settings.setdefault("occupied_registrations_message", None)
 settings.setdefault("disabled_systems", {})
@@ -586,6 +597,47 @@ def discord_time(ts: int, style: str = "t") -> str:
 
 def cooldown_ready_time(now_ts: int, seconds_left: int) -> str:
     return discord_time(int(now_ts) + max(0, int(seconds_left)), "t")
+
+
+REQUEST_COOLDOWN_LABELS = {
+    "verdicts": "вердикты",
+    "spheres": "сферы",
+    "companies": "компании",
+    "investments": "инвестиции",
+    "partnerships": "партнёрства",
+    "events": "ивенты",
+}
+
+
+def get_request_cooldown_left(user_id: str, request_type: str, now_ts: int | None = None) -> int:
+    now_ts = int(now_ts or time.time())
+    cooldowns = settings.setdefault("request_cooldowns", {})
+    last_submit = settings.setdefault("request_last_submit", {})
+    cooldown = max(0, int(cooldowns.get(request_type, 0) or 0))
+    if cooldown <= 0:
+        return 0
+    user_map = last_submit.get(str(user_id), {})
+    if not isinstance(user_map, dict):
+        return 0
+    last_ts = int(user_map.get(request_type, 0) or 0)
+    return max(0, cooldown - (now_ts - last_ts))
+
+
+def mark_request_submitted(user_id: str, request_type: str, now_ts: int | None = None):
+    settings.setdefault("request_last_submit", {}).setdefault(str(user_id), {})[request_type] = int(now_ts or time.time())
+    save_json(SETTINGS_FILE, settings)
+
+
+async def deny_if_request_cooldown(interaction: Interaction, request_type: str) -> bool:
+    left = get_request_cooldown_left(str(interaction.user.id), request_type)
+    if left <= 0:
+        return False
+    label = REQUEST_COOLDOWN_LABELS.get(request_type, request_type)
+    await interaction.response.send_message(
+        f"❌ КД на заявки типа **{label}** ещё не прошёл. Повторная подача будет доступна {cooldown_ready_time(int(time.time()), left)}.",
+        ephemeral=True,
+    )
+    return True
 
 
 def fmt_num(value: int | float) -> str:
@@ -4148,10 +4200,12 @@ async def панель(ctx):
         e.add_field(name="3) Каналы бота", value="\n".join(channel_lines), inline=False)
         rp = investments.setdefault("rp_year", {})
         e.add_field(name="4) RP-год", value=f"КД года: **{format_interval(max(60, int(rp.get('cooldown', 86400) or 86400)))}**", inline=False)
-        e.add_field(name="5) Альта боксы", value=format_alt_box_rewards(), inline=False)
-        e.add_field(name="6) Стрики", value="Управление стриками участников", inline=False)
-        e.add_field(name="7) Отношения", value=f"Канал: {channel_mention(relations_data.get('channel_id'), 'не настроен')}", inline=False)
-        e.add_field(name="8) Типы техники", value=f"Настроено типов: **{len(items_data.setdefault('tech_types', {}))}**", inline=False)
+        cd_lines = [f"{REQUEST_COOLDOWN_LABELS.get(k, k)}: **{format_interval(max(0, int(v or 0)))}**" for k, v in settings.setdefault("request_cooldowns", {}).items()]
+        e.add_field(name="5) КД заявок", value="\n".join(cd_lines) or "не настроены", inline=False)
+        e.add_field(name="6) Альта боксы", value=format_alt_box_rewards(), inline=False)
+        e.add_field(name="7) Стрики", value="Управление стриками участников", inline=False)
+        e.add_field(name="8) Отношения", value=f"Канал: {channel_mention(relations_data.get('channel_id'), 'не настроен')}", inline=False)
+        e.add_field(name="9) Типы техники", value=f"Настроено типов: **{len(items_data.setdefault('tech_types', {}))}**", inline=False)
         e.set_footer(text="Выберите раздел ниже — все изменения применяются как команды бота.")
         return e
 
@@ -4194,6 +4248,47 @@ async def панель(ctx):
             settings["work_profit_max"] = p_max
             save_json(SETTINGS_FILE, settings)
             await interaction.response.edit_message(embed=build_panel_embed(), view=panel_view)
+
+    class RequestCooldownsModal(Modal):
+        def __init__(self):
+            super().__init__(title="КД заявок", timeout=600)
+            cooldowns = settings.setdefault("request_cooldowns", {})
+            default = "\n".join(
+                f"{key}={format_interval(max(0, int(cooldowns.get(key, 0) or 0)))}"
+                for key in REQUEST_COOLDOWN_LABELS
+            )
+            self.lines = TextInput(
+                label="КД по типам (0с = выключить)",
+                style=discord.TextStyle.paragraph,
+                required=True,
+                default=default,
+                placeholder="verdicts=1ч\ncompanies=2ч\ninvestments=30м",
+                max_length=1000,
+            )
+            self.add_item(self.lines)
+
+        async def on_submit(self, interaction: Interaction):
+            try:
+                parsed = {}
+                for raw_line in str(self.lines.value).splitlines():
+                    if not raw_line.strip():
+                        continue
+                    if "=" not in raw_line:
+                        raise ValueError(f"Нет `=` в строке: {raw_line}")
+                    key, raw_value = raw_line.split("=", 1)
+                    key = key.strip()
+                    if key not in REQUEST_COOLDOWN_LABELS:
+                        raise ValueError(f"Неизвестный тип заявки: {key}")
+                    parsed[key] = max(0, parse_interval(raw_value.strip()))
+                for key in REQUEST_COOLDOWN_LABELS:
+                    if key in parsed:
+                        settings.setdefault("request_cooldowns", {})[key] = parsed[key]
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+                return
+            save_json(SETTINGS_FILE, settings)
+            await interaction.response.edit_message(embed=build_panel_embed(), view=panel_view)
+
 
     class TechLibraryView(View):
         def __init__(self, owner_id: int):
@@ -4516,10 +4611,11 @@ async def панель(ctx):
                 SelectOption(label="2) Библиотека техники", value="library", emoji="📚"),
                 SelectOption(label="3) Каналы бота", value="channels", emoji="📌"),
                 SelectOption(label="4) КД RP-года", value="rp_year_cd", emoji="🕰️"),
-                SelectOption(label="5) Альта боксы", value="alt_boxes", emoji="🎁"),
-                SelectOption(label="6) Стрики", value="streaks", emoji="🔥"),
-                SelectOption(label="7) Отношения", value="relations", emoji="🌐"),
-                SelectOption(label="8) Типы техники", value="tech_types", emoji="🚜"),
+                SelectOption(label="5) КД заявок", value="request_cds", emoji="⏳"),
+                SelectOption(label="6) Альта боксы", value="alt_boxes", emoji="🎁"),
+                SelectOption(label="7) Стрики", value="streaks", emoji="🔥"),
+                SelectOption(label="8) Отношения", value="relations", emoji="🌐"),
+                SelectOption(label="9) Типы техники", value="tech_types", emoji="🚜"),
             ]
             super().__init__(placeholder="Выберите раздел панели", min_values=1, max_values=1, options=options)
 
@@ -4530,6 +4626,9 @@ async def панель(ctx):
                 return
             if choice == "rp_year_cd":
                 await interaction.response.send_modal(RPYearCooldownModal())
+                return
+            if choice == "request_cds":
+                await interaction.response.send_modal(RequestCooldownsModal())
                 return
             if choice == "alt_boxes":
                 view = View(timeout=180)
@@ -4947,6 +5046,7 @@ async def balance(ctx, *, target: str = None):
     if incomes:
         if passive_lines:
             passive_lines.append("")
+        passive_lines.append("**Доходы:**")
         for idx, entry in enumerate(incomes, start=1):
             expires_at = entry.get("expires_at")
             ttl_text = (
@@ -4959,6 +5059,27 @@ async def balance(ctx, *, target: str = None):
                 f"  ↳ {entry.get('description', 'без описания')}\n"
                 f"  ↳ действует: {ttl_text}"
             )
+
+
+    stat_passives = ensure_player_state(user_id).get("stat_passives", [])
+    stat_lines = []
+    if isinstance(stat_passives, list):
+        for idx, entry in enumerate(stat_passives, start=1):
+            stat = "репутация" if entry.get("stat") == "reputation" else "счастье"
+            amount = int(entry.get("amount", 0) or 0)
+            sign = "+" if amount > 0 else ""
+            expires_at = entry.get("expires_at")
+            ttl_text = "∞" if expires_at is None else format_seconds_left(int(expires_at) - int(time.time()))
+            stat_lines.append(
+                f"- **{idx}. {stat}:** {sign}{amount}% раз в {format_interval(int(entry.get('cooldown', 0) or 0))}\n"
+                f"  ↳ {entry.get('description', 'без описания')}\n"
+                f"  ↳ действует: {ttl_text}"
+            )
+    if stat_lines:
+        if passive_lines:
+            passive_lines.append("")
+        passive_lines.append("**Счастье/репутация:**")
+        passive_lines.extend(stat_lines)
 
     extra_pages: list[tuple[str, str]] = []
     if passive_lines:
@@ -6742,6 +6863,8 @@ class SpherePurchaseModal(Modal, title="Заявка на сферу"):
         self.level = level
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "spheres"):
+            return
         channel_id = sphere_requests.get("channel_id")
         if not channel_id:
             await interaction.response.send_message(
@@ -6884,6 +7007,7 @@ class SpherePurchaseModal(Modal, title="Заявка на сферу"):
         sphere_requests["requests"][req_id]["review_channel_id"] = review_channel.id
         sphere_requests["requests"][req_id]["review_message_id"] = review_message.id
         save_sphere_requests()
+        mark_request_submitted(str(interaction.user.id), "spheres")
         await interaction.response.send_message(
             embed=Embed(
                 title="✅ Заявка отправлена",
@@ -8543,6 +8667,8 @@ class VerdictRequestModal(Modal):
         self.add_item(self.link_input)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "verdicts"):
+            return
         active_id, _ = _find_active_verdict_by_author(str(interaction.user.id))
         if active_id is not None:
             await interaction.response.send_message(
@@ -8591,6 +8717,7 @@ class VerdictRequestModal(Modal):
         verdicts_data["requests"][str(req_id)]["request_channel_id"] = req_channel.id
         save_verdicts_data()
 
+        mark_request_submitted(str(interaction.user.id), "verdicts")
         await interaction.response.send_message("✅ Заявка отправлена.", ephemeral=True)
 
 
@@ -9926,6 +10053,8 @@ class PartnershipRequestModal(Modal):
         self.add_item(self.description)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "partnerships"):
+            return
         if not interaction.guild:
             await interaction.response.send_message("❌ Команда доступна только на сервере.", ephemeral=True)
             return
@@ -9998,6 +10127,7 @@ class PartnershipRequestModal(Modal):
         req["request_channel_id"] = req_channel.id
         save_partnership_data()
 
+        mark_request_submitted(str(interaction.user.id), "partnerships")
         await interaction.followup.send(
             f"✅ Заявка #{req_id} отправлена в канал модерации партнерок.",
             ephemeral=True,
@@ -10334,6 +10464,8 @@ class InvestmentRequestModal(Modal):
         self.add_item(self.amount)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "investments"):
+            return
         req_id = int(investments.get("next_id", 1))
         investments["next_id"] = req_id + 1
         req = {
@@ -10360,6 +10492,7 @@ class InvestmentRequestModal(Modal):
         req["request_channel_id"] = msg.channel.id
         req["request_message_id"] = msg.id
         save_investments()
+        mark_request_submitted(str(interaction.user.id), "investments")
         await interaction.response.send_message(f"✅ Заявка #{req_id} отправлена.", ephemeral=True)
 
 
@@ -10704,6 +10837,8 @@ class CompanyCreateModal(Modal):
         self.add_item(self.first_invest)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "companies"):
+            return
         author_id = str(interaction.user.id)
         required_role_id = companies_data.get("create_role_id")
         if required_role_id:
@@ -10796,6 +10931,7 @@ class CompanyCreateModal(Modal):
         req["request_channel_id"] = msg.channel.id
         req["request_message_id"] = msg.id
         save_companies_data()
+        mark_request_submitted(author_id, "companies")
         await interaction.response.send_message(f"✅ Заявка #{req_id} отправлена.", ephemeral=True)
 
 
@@ -10810,6 +10946,8 @@ class CompanyBuyModal(Modal):
             self.add_item(item)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "companies"):
+            return
         buyer_id = str(interaction.user.id)
         if not is_registered_player(buyer_id):
             await interaction.response.send_message("❌ Купить компанию могут только зарегистрированные игроки.", ephemeral=True)
@@ -10866,6 +11004,7 @@ class CompanyBuyModal(Modal):
             except Exception:
                 pass
 
+        mark_request_submitted(buyer_id, "companies")
         await interaction.response.send_message("✅ Предложение отправлено владельцу компании в ЛС.", ephemeral=True)
 
 
@@ -10881,6 +11020,8 @@ class CompanySellModal(Modal):
             self.add_item(item)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "companies"):
+            return
         owner_id = str(interaction.user.id)
         matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
         if not matches:
@@ -10936,6 +11077,7 @@ class CompanySellModal(Modal):
                 pass
 
         save_companies_data()
+        mark_request_submitted(owner_id, "companies")
         await interaction.response.send_message("✅ Предложение отправлено второй стороне в ЛС.", ephemeral=True)
 
 
@@ -10949,6 +11091,8 @@ class CompanyUpgradeModal(Modal):
             self.add_item(item)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "companies"):
+            return
         owner_id = str(interaction.user.id)
         matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
         if not matches:
@@ -11039,6 +11183,7 @@ class CompanyUpgradeModal(Modal):
             req["request_message_id"] = msg.id
             save_companies_data()
 
+        mark_request_submitted(owner_id, "companies")
         await interaction.response.send_message("✅ Заявка на улучшение отправлена.", ephemeral=True)
 
 
@@ -11360,6 +11505,8 @@ class CompanyForeignEntryRequestModal(Modal):
         self.add_item(self.target_owner)
 
     async def on_submit(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "companies"):
+            return
         owner_id = str(interaction.user.id)
         matches = find_companies_by_name(str(self.company_name.value), owner_id=owner_id)
         if not matches:
@@ -11414,6 +11561,7 @@ class CompanyForeignEntryRequestModal(Modal):
             req["request_channel_id"] = msg.channel.id
             req["request_message_id"] = msg.id
             save_companies_data()
+        mark_request_submitted(owner_id, "companies")
         await interaction.response.send_message(f"✅ Заявка #{req_id} на вход отправлена модераторам.", ephemeral=True)
 
 
@@ -11872,17 +12020,37 @@ class CompanyReviewView(View):
             req["status_text"] = "⏳ Модерация приняла: ожидается решение целевой страны"
             increment_admin_counter(interaction.user.id, "companies_accepted")
             member = interaction.guild.get_member(int(target_owner_id)) if interaction.guild and target_owner_id.isdigit() else None
+            decision_view = CompanyCountryDecisionView(str(req.get('id')))
+            decision_sent = False
             if member:
                 try:
                     dm_msg = await member.send(
                         content=f"📩 Запрос на вход компании **{company.get('name')}** в вашу страну **{target_country}**.",
                         embed=build_company_request_embed(req),
-                        view=CompanyCountryDecisionView(str(req.get('id'))),
+                        view=decision_view,
                     )
                     req["decision_channel_id"] = dm_msg.channel.id
                     req["decision_message_id"] = dm_msg.id
-                except Exception:
-                    pass
+                    decision_sent = True
+                except (discord.Forbidden, discord.HTTPException):
+                    decision_sent = False
+            if not decision_sent:
+                fallback_channel = await get_channel_safe(companies_data.get("result_channel") or req.get("request_channel_id") or companies_data.get("requests_channel"))
+                if fallback_channel:
+                    fallback = build_company_request_embed(req)
+                    fallback.add_field(
+                        name="ЛС недоступны",
+                        value="Бот не смог написать владельцу страны в ЛС. Кнопки ниже доступны только ему.",
+                        inline=False,
+                    )
+                    fallback_msg = await fallback_channel.send(
+                        content=f"<@{target_owner_id}>",
+                        embed=fallback,
+                        view=CompanyCountryDecisionView(str(req.get('id'))),
+                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                    )
+                    req["decision_channel_id"] = fallback_msg.channel.id
+                    req["decision_message_id"] = fallback_msg.id
             summary.append(f"Заявка на вход компании {company.get('name')} отправлена владельцу страны {target_country}")
             req["summary"] = "\n".join(summary)
             save_companies_data()
@@ -20607,11 +20775,12 @@ async def рег(ctx, member: discord.Member, country: str, year: str):
             ]
         now_ts = int(time.time())
         state["shield_until"] = now_ts + 2 * 24 * 3600
-        state["happiness"] = 50
+        if not use_archived_stats:
+            state["happiness"] = 50
+            state["last_happiness_tick"] = now_ts
         state["happiness_pause_until"] = max(
             int(state.get("happiness_pause_until", 0)), state["shield_until"]
         )
-        state["last_happiness_tick"] = now_ts
         save_player_state()
 
         manual_reg_type = {
@@ -21466,7 +21635,14 @@ async def finalize_registration_request(req: dict, moderator: discord.abc.User):
     if occupied_by and str(occupied_by) != str(member.id):
         return False, f"**{entity_name}** уже занято другим игроком в сезоне **{req.get('season')}**."
 
-    ensure_user(str(member.id))
+    archive_key = country_archive_key(entity_name, str(req.get("season")))
+    archived_snapshot = country_owners.setdefault("orphaned_country_stats", {}).pop(archive_key, None)
+    restored_archived_stats = isinstance(archived_snapshot, dict)
+    if restored_archived_stats:
+        apply_archived_country_stats(str(member.id), archived_snapshot)
+        save_country_owners()
+    else:
+        ensure_user(str(member.id))
     population_data = load_json(POPULATION_FILE, {})
     players = load_json(PLAYER_STATS_FILE, {})
     population_value = req.get("population")
@@ -21485,9 +21661,10 @@ async def finalize_registration_request(req: dict, moderator: discord.abc.User):
         ]
     now_ts = int(time.time())
     state["shield_until"] = now_ts + 2 * 24 * 3600
-    state["happiness"] = 50
+    if not restored_archived_stats:
+        state["happiness"] = 50
+        state["last_happiness_tick"] = now_ts
     state["happiness_pause_until"] = max(int(state.get("happiness_pause_until", 0)), state["shield_until"])
-    state["last_happiness_tick"] = now_ts
     save_player_state()
 
     set_user_registration(
@@ -22384,6 +22561,8 @@ class EventOptionsFillView(View):
         )
 
     async def send_event(self, interaction: Interaction):
+        if await deny_if_request_cooldown(interaction, "events"):
+            return
         if not interaction.guild:
             await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
             return
@@ -22437,6 +22616,7 @@ class EventOptionsFillView(View):
             req["dm_channel_id"] = dm_message.channel.id
             req["dm_message_id"] = dm_message.id
             increment_admin_counter(interaction.user.id, "dm_events_done")
+            mark_request_submitted(str(interaction.user.id), "events")
             save_events_data()
         except Exception:
             req["status"] = "dm_failed"
