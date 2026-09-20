@@ -14,6 +14,22 @@ from discord import ButtonStyle, Embed, Interaction, SelectOption
 from discord.ext import commands, tasks
 from discord.ui import Button, Modal, Select, TextInput, UserSelect, View
 
+
+# ``silent`` is valid when sending an interaction response, but is not a
+# parameter accepted by InteractionResponse.edit_message in discord.py.  Some
+# page builders share their response payload between initial sends and edits,
+# so discard it for edits instead of letting a button callback fail with a
+# TypeError.
+_ORIGINAL_INTERACTION_RESPONSE_EDIT_MESSAGE = discord.InteractionResponse.edit_message
+
+
+async def _safe_interaction_response_edit_message(self, *args, **kwargs):
+    kwargs.pop("silent", None)
+    return await _ORIGINAL_INTERACTION_RESPONSE_EDIT_MESSAGE(self, *args, **kwargs)
+
+
+discord.InteractionResponse.edit_message = _safe_interaction_response_edit_message
+
 LayoutViewBase = getattr(discord.ui, "LayoutView", View)
 V2Container = getattr(discord.ui, "Container", None)
 V2TextDisplay = getattr(discord.ui, "TextDisplay", None)
