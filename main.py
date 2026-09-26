@@ -286,6 +286,11 @@ def build_ai_system_prompt() -> str:
     return (
         "Ты — полезный помощник Discord-сервера. Отвечай по-русски, если "
         "пользователь не попросил другой язык. Отвечай на сам вопрос. "
+        "Последнее сообщение пользователя — это единственный текущий запрос: "
+        "не отвечай повторно на вопросы из истории и не продолжай их по "
+        "умолчанию. История нужна только как память и справка; используй её "
+        "лишь когда пользователь прямо ссылается на прошлый разговор или "
+        "когда без неё невозможно понять текущий запрос. "
         "Правила сервера ниже передаются как справочные данные: используй "
         "их, когда они помогают ответить на вопрос, и не выдумывай сведения, "
         "которых в них нет."
@@ -4216,20 +4221,28 @@ async def restore_verdict_request_views():
 
         try:
             msg = await ch.fetch_message(int(mid))
-            is_unreviewed = _is_unreviewed_verdict(req)
+            # A draft must always regain its editing controls after a restart.
+            # Result controls are restored only after a final verdict or a
+            # published rejection result.
+            has_result = verdict_has_result(req)
+            is_editable = _is_unreviewed_verdict(req)
             if container_components_available():
                 blocks = build_verdict_request_message_blocks(
                     req, getattr(ch, "guild", None), verdict_request_status_text(req)
                 )
-                view = make_container_view(
-                    blocks,
-                    view_cls=VerdictReviewView if is_unreviewed else VerdictResultView,
-                    view_args=(str(req_id),),
-                    timeout=None,
+                view = (
+                    make_container_view(
+                        blocks,
+                        view_cls=VerdictResultView if has_result else VerdictReviewView,
+                        view_args=(str(req_id),),
+                        timeout=None,
+                    )
+                    if has_result or is_editable
+                    else make_container_view(blocks)
                 )
                 await msg.edit(content=None, embed=None, view=view)
             else:
-                view = VerdictReviewView(str(req_id)) if is_unreviewed else VerdictResultView(str(req_id))
+                view = VerdictResultView(str(req_id)) if has_result else VerdictReviewView(str(req_id)) if is_editable else None
                 await msg.edit(view=view)
         except Exception:
             pass
@@ -4440,6 +4453,7 @@ async def verdict_request_watchdog():
             req.pop("claimed_by", None)
             req.pop("claim_until", None)
             req.pop("status_text", None)
+            # An abandoned review is returned to the queue as a clean draft.
             req["draft"] = {"verdict_text": "", "ops": []}
             guild = bot.get_guild(ALLOWED_GUILD)
             if guild:
@@ -13812,9 +13826,15 @@ def _can_manage_verdicts_member(member: discord.Member) -> bool:
     return has_custom_command_access(member, "вердикты")
 
 
+def verdict_has_result(req: dict) -> bool:
+    """Whether the request has an explicitly published final outcome."""
+    return str(req.get("status") or "pending").strip().lower() in {"finalized", "rejected"}
+
+
 def _is_unreviewed_verdict(req: dict) -> bool:
     status = str(req.get("status", "pending")).strip().lower()
-    # Любой статус, который ещё не завершён/отклонён, считаем активной заявкой.
+    # Only finalised and rejected requests are closed.  In particular, a saved
+    # draft with text or operations remains editable until "Отправить итог".
     return status not in {"finalized", "rejected", "approved", "done", "closed"}
 
 
@@ -20482,6 +20502,9 @@ async def топ_админов(ctx):
         content=None if container_components_available() else view.build_content(),
         embed=None,
         view=view,
+        # Keep the mentions visible in the leaderboard while preventing
+        # notification delivery to every listed administrator.
+        allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
     )
 
 @bot.command()
